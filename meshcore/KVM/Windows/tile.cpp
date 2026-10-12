@@ -83,9 +83,9 @@ LPVOID tilebuffer = NULL;
 unsigned int tilebuffersize = 0;
 
 #ifdef _TURBOJPEG
-// JPEG chroma subsampling used by TurboJPEG. TJSAMP_444 gives sharper colored text, but larger tiles.
+// JPEG chroma subsampling used by TurboJPEG. TJSAMP_444 keeps colored text sharp, TJSAMP_420 gives smaller tiles.
 #ifndef KVM_TJ_SUBSAMP
-#define KVM_TJ_SUBSAMP TJSAMP_420
+#define KVM_TJ_SUBSAMP TJSAMP_444
 #endif
 tjhandle tjCompressor = NULL;
 #endif
