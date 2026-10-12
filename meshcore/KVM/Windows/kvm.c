@@ -1013,6 +1013,8 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 	// Loop and send only when a tile changes.
 	while (!g_shutdown)
 	{
+		DWORD frameStart = timeGetTime();
+		int sentTiles = 0;
 		KVMDEBUG("kvm_server_mainloop / loop1", (int)GetCurrentThreadId());
 
 		// Reset all the flags to TILE_TODO
@@ -1154,6 +1156,7 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 					}
 					if (buf && !g_shutdown)
 					{
+						sentTiles = 1;
 						KVMDEBUG2("Writing JPEG: %llu bytes", tilesize);
 						switch (writeHandler((char *)buf, (int)tilesize, reserved))
 						{
@@ -1185,7 +1188,13 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 		KVMDEBUG("kvm_server_mainloop / loop3", (int)GetCurrentThreadId());
 
 		// We can't go full speed here, we need to slow this down.
+		// When tiles were sent, the time spent capturing and encoding counts towards the frame rate timer.
 		height = FRAME_RATE_TIMER;
+		if (sentTiles)
+		{
+			DWORD elapsed = timeGetTime() - frameStart;
+			height = (elapsed >= (DWORD)FRAME_RATE_TIMER) ? 0 : (FRAME_RATE_TIMER - (int)elapsed);
+		}
 		while (!g_shutdown && height > 0)
 		{
 			if (height > 50)
