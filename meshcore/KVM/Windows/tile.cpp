@@ -1048,6 +1048,13 @@ void teardown_gdiplus()
 	hDesktopDC = NULL;
 }
 
+// Releases the screen DC, it must be released on the thread that got it.
+void release_desktop_dc()
+{
+	if (hDesktopDC) ReleaseDC(NULL, hDesktopDC);
+	hDesktopDC = NULL;
+}
+
 // Forces the capture bitmap to be re-created on the next frame (e.g. after a desktop switch).
 void reset_capture_bitmap()
 {

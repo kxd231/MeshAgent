@@ -130,6 +130,7 @@ int kvm_relay_restart(int paused, void *pipeMgr, char *exePath, ILibKVM_WriteHan
 HANDLE hStdOut = INVALID_HANDLE_VALUE;
 HANDLE hStdIn = INVALID_HANDLE_VALUE;
 int ThreadRunning = 0;
+int gGeometryGeneration = 0; // Incremented by kvm_server_SetResolution(), frames captured with an older geometry are dropped.
 int kvmConsoleMode = 0;
 
 ILibQueue gPendingPackets = NULL;
@@ -800,6 +801,7 @@ void kvm_server_SetResolution(ILibKVM_WriteHandler writeHandler, void *reserved)
 	}
 
 	// Setup scaling
+	gGeometryGeneration++;
 	SCALING_FACTOR = SCALING_FACTOR_NEW;
 	SCALED_WIDTH = (SCREEN_WIDTH * SCALING_FACTOR) / 1024;
 	SCALED_HEIGHT = (SCREEN_HEIGHT * SCALING_FACTOR) / 1024;
@@ -908,6 +910,154 @@ DWORD WINAPI kvm_mainloopinput(LPVOID Param)
 }
 #endif
 
+// Screen capture runs on its own thread: while the screen is changing, the next frame is captured (GDI capture
+// is paced by DWM composition) while the current one is encoded and sent. The capture thread only runs between
+// kvm_capture_start() and kvm_capture_wait(); the geometry (resolution, scaling, desktop) is only changed by the
+// main loop while the capture thread is idle.
+typedef struct KVM_CaptureState
+{
+	HANDLE thread;
+	HANDLE startEvent;
+	HANDLE doneEvent;
+	HDESK desktop;
+	volatile int quit;
+	long mouseMove[3];
+	void *buffer;
+	long long bufferSize;
+	int result;
+	int generation;
+} KVM_CaptureState;
+KVM_CaptureState gCapture;
+
+// Moves the capture thread to the current input desktop (UAC prompt, lock screen...)
+void kvm_capture_switch_desktop()
+{
+	HDESK desktop = OpenInputDesktop(0, TRUE, DESKTOP_CREATEMENU | DESKTOP_CREATEWINDOW | DESKTOP_ENUMERATE | DESKTOP_HOOKCONTROL | DESKTOP_WRITEOBJECTS | DESKTOP_READOBJECTS | DESKTOP_SWITCHDESKTOP | GENERIC_WRITE);
+	if (desktop == NULL) return;
+	if (SetThreadDesktop(desktop) == 0) { CloseDesktop(desktop); return; }
+	if (gCapture.desktop != NULL) CloseDesktop(gCapture.desktop);
+	gCapture.desktop = desktop;
+}
+
+DWORD WINAPI kvm_capture_thread(LPVOID parm)
+{
+	UNREFERENCED_PARAMETER(parm);
+	while (WaitForSingleObject(gCapture.startEvent, INFINITE) == WAIT_OBJECT_0 && !gCapture.quit)
+	{
+		kvm_capture_switch_desktop();
+		gCapture.buffer = NULL;
+		gCapture.bufferSize = 0;
+		gCapture.result = get_desktop_buffer(&gCapture.buffer, &gCapture.bufferSize, gCapture.mouseMove);
+		SetEvent(gCapture.doneEvent);
+	}
+	release_desktop_dc(); // A DC must be released on the thread that got it
+	return 0;
+}
+
+void kvm_capture_start(long *mouseMove)
+{
+	memcpy(gCapture.mouseMove, mouseMove, sizeof(gCapture.mouseMove));
+	gCapture.generation = gGeometryGeneration;
+	SetEvent(gCapture.startEvent);
+}
+
+// Waits for the frame started by kvm_capture_start(). Returns the desktop buffer, or NULL if the capture failed.
+void* kvm_capture_wait(long long *bufferSize, int *generation)
+{
+	WaitForSingleObject(gCapture.doneEvent, INFINITE);
+	*bufferSize = gCapture.bufferSize;
+	*generation = gCapture.generation;
+	return (gCapture.result == 0) ? gCapture.buffer : NULL;
+}
+
+// Handles desktop and resolution changes and the pending mouse packets before a capture. Returns 0 on shutdown.
+int kvm_prepare_capture(ILibKVM_WriteHandler writeHandler, void *reserved, long *mouseMove, int *sentHideCursor)
+{
+	char *tmoBuffer;
+
+	CheckDesktopSwitch(1, writeHandler, reserved);
+	if (g_shutdown)
+		return 0;
+
+	// Enter Alertable State, so we can dispatch any packets if necessary.
+	// We are doing it here, in case we need to merge any data with the bitmaps
+	SleepEx(0, TRUE);
+	mouseMove[0] = 0;
+	while ((tmoBuffer = ILibQueue_DeQueue(gPendingPackets)) != NULL)
+	{
+		if (ntohs(((unsigned short *)tmoBuffer)[0]) == MNG_KVM_MOUSE_MOVE)
+		{
+			if (SCREEN_SEL_TARGET == 0)
+			{
+				mouseMove[0] = 1;
+				mouseMove[1] = ((long *)tmoBuffer)[1] - VSCREEN_X;
+				mouseMove[2] = ((long *)tmoBuffer)[2] - VSCREEN_Y;
+			}
+			else
+			{
+				if (((long *)tmoBuffer)[1] >= SCREEN_X && ((long *)tmoBuffer)[1] <= (SCREEN_X + SCREEN_WIDTH) &&
+					((long *)tmoBuffer)[2] >= SCREEN_Y && ((long *)tmoBuffer)[2] <= (SCREEN_Y + SCREEN_HEIGHT))
+				{
+					mouseMove[0] = 1;
+					mouseMove[1] = ((long *)tmoBuffer)[1] - SCREEN_X;
+					mouseMove[2] = ((long *)tmoBuffer)[2] - SCREEN_Y;
+				}
+			}
+		}
+		else
+		{
+			if (ntohs(((unsigned short *)tmoBuffer)[0]) != MNG_KVM_MOUSE_CURSOR || *sentHideCursor == 0)
+			{
+				writeHandler(tmoBuffer, (int)ILibMemory_Size(tmoBuffer), reserved);
+			}
+		}
+		ILibMemory_Free(tmoBuffer);
+	}
+	if (mouseMove[0] == 0 && (gRemoteMouseRenderDefault != 0 || gRemoteMouseMoved == 0))
+	{
+		mouseMove[0] = 1;
+		CURSORINFO info = {0};
+		info.cbSize = sizeof(info);
+		GetCursorInfo(&info);
+
+		if (SCREEN_SEL_TARGET == 0)
+		{
+			mouseMove[1] = info.ptScreenPos.x - VSCREEN_X;
+			mouseMove[2] = info.ptScreenPos.y - VSCREEN_Y;
+		}
+		else
+		{
+			mouseMove[1] = info.ptScreenPos.x - SCREEN_X;
+			mouseMove[2] = info.ptScreenPos.y - SCREEN_Y;
+		}
+	}
+	if (mouseMove[0] != 0)
+	{
+		if (*sentHideCursor == 0)
+		{
+			*sentHideCursor = 1;
+			char tmpBuffer[5];
+			((unsigned short *)tmpBuffer)[0] = (unsigned short)htons((unsigned short)MNG_KVM_MOUSE_CURSOR); // Write the type
+			((unsigned short *)tmpBuffer)[1] = (unsigned short)htons((unsigned short)5);					// Write the size
+			tmpBuffer[4] = (char)KVM_MouseCursor_NONE;														// Cursor Type
+			writeHandler(tmpBuffer, 5, reserved);
+		}
+	}
+	else
+	{
+		if (*sentHideCursor != 0)
+		{
+			*sentHideCursor = 0;
+			char tmpBuffer[5];
+			((unsigned short *)tmpBuffer)[0] = (unsigned short)htons((unsigned short)MNG_KVM_MOUSE_CURSOR); // Write the type
+			((unsigned short *)tmpBuffer)[1] = (unsigned short)htons((unsigned short)5);					// Write the size
+			tmpBuffer[4] = (char)gCurrentCursor;															// Cursor Type
+			writeHandler(tmpBuffer, 5, reserved);
+		}
+	}
+	return 1;
+}
+
 // This is the main KVM pooling loop. It will look at the display and see if any changes occur. [Runs as daemon if Windows Service]
 DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 {
@@ -925,6 +1075,7 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 	char *tmoBuffer;
 	long mouseMove[3] = {0, 0, 0};
 	int sentHideCursor = 0;
+	int captureInFlight = 0, lastSentTiles = 0, frameGeneration = 0, dropFrame = 0;
 
 	gPendingPackets = ILibQueue_Create();
 	KVM_InitMouseCursors(gPendingPackets);
@@ -1007,6 +1158,17 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 	Sleep(100); // Pausing here seems to fix connection issues, especially with WebRTC. TODO: Investigate why.
 	KVMDEBUG("kvm_server_mainloop / start3", (int)GetCurrentThreadId());
 
+	// Start the capture thread. It gets its own screen DC.
+	release_desktop_dc();
+	ZeroMemory(&gCapture, sizeof(gCapture));
+	if ((gCapture.startEvent = CreateEvent(NULL, FALSE, FALSE, NULL)) == NULL ||
+		(gCapture.doneEvent = CreateEvent(NULL, FALSE, FALSE, NULL)) == NULL ||
+		(gCapture.thread = CreateThread(NULL, 0, kvm_capture_thread, NULL, 0, NULL)) == NULL)
+	{
+		KVMDEBUG("Unable to start the capture thread", 0);
+		g_shutdown = 1;
+	}
+
 	// Use 1ms timer resolution, otherwise Sleep(FRAME_RATE_TIMER) is rounded up to the 15.6ms system tick.
 	timeBeginPeriod(1);
 
@@ -1028,89 +1190,17 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 #endif
 			}
 		}
-		CheckDesktopSwitch(1, writeHandler, reserved);
-		if (g_shutdown)
-			break;
-
-		// Enter Alertable State, so we can dispatch any packets if necessary.
-		// We are doing it here, in case we need to merge any data with the bitmaps
-		SleepEx(0, TRUE);
-		mouseMove[0] = 0;
-		while ((tmoBuffer = ILibQueue_DeQueue(gPendingPackets)) != NULL)
+		if (!captureInFlight)
 		{
-			if (ntohs(((unsigned short *)tmoBuffer)[0]) == MNG_KVM_MOUSE_MOVE)
-			{
-				if (SCREEN_SEL_TARGET == 0)
-				{
-					mouseMove[0] = 1;
-					mouseMove[1] = ((long *)tmoBuffer)[1] - VSCREEN_X;
-					mouseMove[2] = ((long *)tmoBuffer)[2] - VSCREEN_Y;
-				}
-				else
-				{
-					if (((long *)tmoBuffer)[1] >= SCREEN_X && ((long *)tmoBuffer)[1] <= (SCREEN_X + SCREEN_WIDTH) &&
-						((long *)tmoBuffer)[2] >= SCREEN_Y && ((long *)tmoBuffer)[2] <= (SCREEN_Y + SCREEN_HEIGHT))
-					{
-						mouseMove[0] = 1;
-						mouseMove[1] = ((long *)tmoBuffer)[1] - SCREEN_X;
-						mouseMove[2] = ((long *)tmoBuffer)[2] - SCREEN_Y;
-					}
-				}
-			}
-			else
-			{
-				if (ntohs(((unsigned short *)tmoBuffer)[0]) != MNG_KVM_MOUSE_CURSOR || sentHideCursor == 0)
-				{
-					writeHandler(tmoBuffer, (int)ILibMemory_Size(tmoBuffer), reserved);
-				}
-			}
-			ILibMemory_Free(tmoBuffer);
-		}
-		if (mouseMove[0] == 0 && (gRemoteMouseRenderDefault != 0 || gRemoteMouseMoved == 0))
-		{
-			mouseMove[0] = 1;
-			CURSORINFO info = {0};
-			info.cbSize = sizeof(info);
-			GetCursorInfo(&info);
-
-			if (SCREEN_SEL_TARGET == 0)
-			{
-				mouseMove[1] = info.ptScreenPos.x - VSCREEN_X;
-				mouseMove[2] = info.ptScreenPos.y - VSCREEN_Y;
-			}
-			else
-			{
-				mouseMove[1] = info.ptScreenPos.x - SCREEN_X;
-				mouseMove[2] = info.ptScreenPos.y - SCREEN_Y;
-			}
-		}
-		if (mouseMove[0] != 0)
-		{
-			if (sentHideCursor == 0)
-			{
-				sentHideCursor = 1;
-				char tmpBuffer[5];
-				((unsigned short *)tmpBuffer)[0] = (unsigned short)htons((unsigned short)MNG_KVM_MOUSE_CURSOR); // Write the type
-				((unsigned short *)tmpBuffer)[1] = (unsigned short)htons((unsigned short)5);					// Write the size
-				tmpBuffer[4] = (char)KVM_MouseCursor_NONE;														// Cursor Type
-				writeHandler(tmpBuffer, 5, reserved);
-			}
-		}
-		else
-		{
-			if (sentHideCursor != 0)
-			{
-				sentHideCursor = 0;
-				char tmpBuffer[5];
-				((unsigned short *)tmpBuffer)[0] = (unsigned short)htons((unsigned short)MNG_KVM_MOUSE_CURSOR); // Write the type
-				((unsigned short *)tmpBuffer)[1] = (unsigned short)htons((unsigned short)5);					// Write the size
-				tmpBuffer[4] = (char)gCurrentCursor;															// Cursor Type
-				writeHandler(tmpBuffer, 5, reserved);
-			}
+			if (!kvm_prepare_capture(writeHandler, reserved, mouseMove, &sentHideCursor))
+				break;
+			kvm_capture_start(mouseMove);
 		}
 
-		// Scan the desktop
-		if (get_desktop_buffer(&desktop, &desktopsize, mouseMove) == 1 || desktop == NULL)
+		// Get the captured desktop
+		desktop = kvm_capture_wait(&desktopsize, &frameGeneration);
+		captureInFlight = 0;
+		if (desktop == NULL)
 		{
 #ifdef _WINSERVICE
 			if (!kvmConsoleMode)
@@ -1123,8 +1213,18 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 		}
 		else
 		{
+			// While the screen is changing, start capturing the next frame now so it overlaps with encoding this one.
+			if (lastSentTiles && kvm_prepare_capture(writeHandler, reserved, mouseMove, &sentHideCursor))
+			{
+				kvm_capture_start(mouseMove);
+				captureInFlight = 1;
+			}
+
+			// Drop the frame if the resolution or scaling changed after it was captured
+			dropFrame = (frameGeneration != gGeometryGeneration);
+
 			bmpInfo = get_bmp_info(TILE_WIDTH, TILE_HEIGHT);
-			for (row = 0; row < TILE_HEIGHT_COUNT; row++)
+			for (row = 0; !dropFrame && row < TILE_HEIGHT_COUNT; row++)
 			{
 				for (col = 0; col < TILE_WIDTH_COUNT; col++)
 				{
@@ -1186,6 +1286,7 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 		}
 
 		KVMDEBUG("kvm_server_mainloop / loop3", (int)GetCurrentThreadId());
+		lastSentTiles = sentTiles;
 
 		// We can't go full speed here, we need to slow this down.
 		// When tiles were sent, the time spent capturing and encoding counts towards the frame rate timer.
@@ -1212,6 +1313,24 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 	}
 
 	timeEndPeriod(1);
+
+	// Stop the capture thread
+	if (captureInFlight)
+	{
+		void *pending = kvm_capture_wait(&desktopsize, &frameGeneration);
+		if (pending != NULL) free(pending);
+	}
+	if (gCapture.thread != NULL)
+	{
+		gCapture.quit = 1;
+		SetEvent(gCapture.startEvent);
+		WaitForSingleObject(gCapture.thread, INFINITE);
+		CloseHandle(gCapture.thread);
+	}
+	if (gCapture.startEvent != NULL) CloseHandle(gCapture.startEvent);
+	if (gCapture.doneEvent != NULL) CloseHandle(gCapture.doneEvent);
+	if (gCapture.desktop != NULL) CloseDesktop(gCapture.desktop);
+	ZeroMemory(&gCapture, sizeof(gCapture));
 
 	KVMDEBUG("kvm_server_mainloop / end3", (int)GetCurrentThreadId());
 	KVMDEBUG("kvm_server_mainloop / end2", (int)GetCurrentThreadId());
