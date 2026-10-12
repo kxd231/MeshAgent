@@ -2,7 +2,10 @@
 
 1. `kvm.c`: the capture loop runs with `timeBeginPeriod(1)`, so the frame-rate
    pause is not rounded up to the 15.6 ms system tick (links `winmm.lib`).
-2. `tile.cpp`: the capture bitmap is reused between frames. `KVM_STRETCH_MODE`
+2. `tile.cpp`: the capture bitmap is reused between frames. When scaling, the
+   screen is captured at full resolution into a DIB section (no `GetDIBits`) and
+   downscaled on the CPU with an area-average filter; `StretchBlt` is only a fallback.
+   The frame work time is subtracted from the frame-rate timer (`kvm.c`). `KVM_STRETCH_MODE`
    selects the `StretchBlt` mode used when scaling (default `HALFTONE`;
    `COLORONCOLOR` is faster but makes text unreadable at 75%).
 3. `tile.cpp`: on x64, JPEG tiles (types 1 and 4) are encoded with the

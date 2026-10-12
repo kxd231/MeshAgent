@@ -17,6 +17,7 @@ limitations under the License.
 #if defined(_LINKVM)
 
 #include <stdio.h>
+#include <math.h>
 #include "tile.h"
 #include <gdiplus.h>
 #include "meshcore/meshdefines.h"
@@ -116,6 +117,20 @@ int GetEncoderClsid(const WCHAR* format, CLSID* pClsid)
 	return -1;
 }
 
+// When scaling, the screen is captured at full resolution into a DIB section and downscaled on the CPU
+// with an area-average filter (similar quality to HALFTONE, but much faster than StretchBlt).
+typedef struct scale_span { int start; int count; } scale_span;
+HDC hFullDC = NULL;
+HBITMAP hFullBitmap = NULL;
+HGDIOBJ hFullDCDefaultBitmap = NULL;
+unsigned char *fullBits = NULL;
+int fullWidth = 0, fullHeight = 0;
+scale_span *scaleXSpan = NULL, *scaleYSpan = NULL;
+unsigned short *scaleXW = NULL, *scaleYW = NULL;
+unsigned int *scaleAcc = NULL;
+int scaleKX = 0, scaleKY = 0;
+int scaleSrcW = 0, scaleSrcH = 0, scaleDstW = 0, scaleDstH = 0;
+
 // StretchBlt() mode used when scaling. HALFTONE gives better text quality, COLORONCOLOR is much faster.
 #ifndef KVM_STRETCH_MODE
 #define KVM_STRETCH_MODE HALFTONE
@@ -127,6 +142,164 @@ int adjust_screen_size(int pixles)
 	int extra = pixles % TILE_WIDTH; // Assuming tile width and height will remain the same.
 	if (extra != 0) return pixles + TILE_WIDTH - extra;
 	return pixles;
+}
+
+// Builds the area-average weights (sum = 16384) mapping src pixels to dst pixels along one axis.
+int build_scale_table(int src, int dst, scale_span **spans, unsigned short **weights, int *k)
+{
+	double s = (double)src / (double)dst;
+	int kk = (int)ceil(s) + 1;
+	scale_span *sp = (scale_span*)malloc(sizeof(scale_span) * dst);
+	unsigned short *w = (unsigned short*)malloc(sizeof(unsigned short) * dst * kk);
+	if (sp == NULL || w == NULL) { if (sp) free(sp); if (w) free(w); return 1; }
+
+	for (int i = 0; i < dst; i++)
+	{
+		double a = i * s, b = (i + 1) * s;
+		int first = (int)floor(a), last = (int)ceil(b) - 1, total = 0, maxj = 0;
+		if (last > src - 1) last = src - 1;
+		if (last - first + 1 > kk) last = first + kk - 1;
+		sp[i].start = first;
+		sp[i].count = last - first + 1;
+		for (int j = 0; j < sp[i].count; j++)
+		{
+			double lo = (a > first + j) ? a : (double)(first + j);
+			double hi = (b < first + j + 1) ? b : (double)(first + j + 1);
+			int wt = (int)(((hi - lo) / s) * 16384.0 + 0.5);
+			w[i * kk + j] = (unsigned short)wt;
+			total += wt;
+			if (wt > w[i * kk + maxj]) maxj = j;
+		}
+		w[i * kk + maxj] = (unsigned short)(w[i * kk + maxj] + (16384 - total)); // Rounding error goes to the largest weight
+	}
+
+	if (*spans) free(*spans);
+	if (*weights) free(*weights);
+	*spans = sp;
+	*weights = w;
+	*k = kk;
+	return 0;
+}
+
+void free_scale_tables()
+{
+	if (scaleXSpan) free(scaleXSpan);
+	if (scaleYSpan) free(scaleYSpan);
+	if (scaleXW) free(scaleXW);
+	if (scaleYW) free(scaleYW);
+	if (scaleAcc) free(scaleAcc);
+	scaleXSpan = scaleYSpan = NULL;
+	scaleXW = scaleYW = NULL;
+	scaleAcc = NULL;
+	scaleSrcW = scaleSrcH = scaleDstW = scaleDstH = 0;
+}
+
+#pragma optimize("t", on)
+// Downscales a 32bpp image with an area-average filter. Both images have the same row order (bottom-up DIBs).
+void scale_area(const unsigned char *src, int srcW, unsigned char *dst, int dstW, int dstH)
+{
+	int srcStride = srcW * 4;
+	for (int y = 0; y < dstH; y++)
+	{
+		const scale_span *ys = &scaleYSpan[y];
+		const unsigned short *yw = &scaleYW[y * scaleKY];
+		unsigned char *out = dst + ((size_t)y * dstW * 4);
+
+		// Vertical pass: weighted sum of the source rows (fits in 22 bits)
+		const unsigned char *row = src + ((size_t)ys->start * srcStride);
+		unsigned int w = yw[0];
+		for (int i = 0; i < srcStride; i++) { scaleAcc[i] = row[i] * w; }
+		for (int j = 1; j < ys->count; j++)
+		{
+			row = src + ((size_t)(ys->start + j) * srcStride);
+			w = yw[j];
+			for (int i = 0; i < srcStride; i++) { scaleAcc[i] += row[i] * w; }
+		}
+
+		// Horizontal pass
+		for (int x = 0; x < dstW; x++)
+		{
+			const scale_span *xs = &scaleXSpan[x];
+			const unsigned short *xw = &scaleXW[x * scaleKX];
+			const unsigned int *p = scaleAcc + (xs->start * 4);
+			unsigned int b = 0, g = 0, r = 0;
+			for (int j = 0; j < xs->count; j++, p += 4)
+			{
+				w = xw[j];
+				b += (p[0] >> 6) * w;
+				g += (p[1] >> 6) * w;
+				r += (p[2] >> 6) * w;
+			}
+			out[0] = (unsigned char)((b + (1 << 21)) >> 22);
+			out[1] = (unsigned char)((g + (1 << 21)) >> 22);
+			out[2] = (unsigned char)((r + (1 << 21)) >> 22);
+			out[3] = 0;
+			out += 4;
+		}
+	}
+}
+#pragma optimize("", on)
+
+void free_full_capture()
+{
+	if (hFullBitmap)
+	{
+		if (hFullDCDefaultBitmap) SelectObject(hFullDC, hFullDCDefaultBitmap);
+		DeleteObject(hFullBitmap);
+	}
+	hFullBitmap = NULL;
+	hFullDCDefaultBitmap = NULL;
+	fullBits = NULL;
+	fullWidth = fullHeight = 0;
+}
+
+// Captures the screen at full resolution and downscales it to the scaled size. Returns 0 on success.
+int get_scaled_desktop_buffer(void **buffer, long long *bufferSize)
+{
+	int sw = adjust_screen_size(SCREEN_WIDTH), sh = adjust_screen_size(SCREEN_HEIGHT);
+	int dw = adjust_screen_size(SCALED_WIDTH), dh = adjust_screen_size(SCALED_HEIGHT);
+
+	if (hFullBitmap == NULL || fullWidth != sw || fullHeight != sh)
+	{
+		BITMAPINFO bi;
+		void *bits = NULL;
+		free_full_capture();
+		if (hFullDC == NULL && (hFullDC = CreateCompatibleDC(hDesktopDC)) == NULL) { KVMDEBUG("CreateCompatibleDC() failed", 0); return 1; }
+		ZeroMemory(&bi, sizeof(BITMAPINFO));
+		bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+		bi.bmiHeader.biWidth = sw;
+		bi.bmiHeader.biHeight = sh; // Bottom-up, same as the GetDIBits() output
+		bi.bmiHeader.biPlanes = 1;
+		bi.bmiHeader.biBitCount = 32;
+		bi.bmiHeader.biCompression = BI_RGB;
+		if ((hFullBitmap = CreateDIBSection(hDesktopDC, &bi, DIB_RGB_COLORS, &bits, NULL, 0)) == NULL || bits == NULL) { KVMDEBUG("CreateDIBSection() failed", 0); free_full_capture(); return 1; }
+		fullBits = (unsigned char*)bits;
+		hFullDCDefaultBitmap = SelectObject(hFullDC, hFullBitmap);
+		fullWidth = sw;
+		fullHeight = sh;
+	}
+
+	if (scaleSrcW != sw || scaleSrcH != sh || scaleDstW != dw || scaleDstH != dh)
+	{
+		free_scale_tables();
+		if ((scaleAcc = (unsigned int*)malloc(sizeof(unsigned int) * sw * 4)) == NULL ||
+			build_scale_table(sw, dw, &scaleXSpan, &scaleXW, &scaleKX) != 0 ||
+			build_scale_table(sh, dh, &scaleYSpan, &scaleYW, &scaleKY) != 0)
+		{
+			free_scale_tables();
+			return 1;
+		}
+		scaleSrcW = sw; scaleSrcH = sh; scaleDstW = dw; scaleDstH = dh;
+	}
+
+	if (BitBlt(hFullDC, 0, 0, sw, sh, hDesktopDC, SCREEN_X, SCREEN_Y, SRCCOPY) == FALSE) { KVMDEBUG("BitBlt() returned FALSE", 0); return 1; }
+	GdiFlush();
+
+	*bufferSize = (long long)dw * dh * 4;
+	if ((*buffer = malloc((size_t)*bufferSize)) == NULL) { KVMDEBUG("malloc() failed", 0); *bufferSize = 0; return 1; }
+	PIXEL_SIZE = 4;
+	scale_area(fullBits, sw, (unsigned char*)*buffer, dw, dh);
+	return 0;
 }
 
 // Extracts the required tile buffer from the desktop buffer
@@ -570,6 +743,14 @@ int get_desktop_buffer(void **buffer, long long *bufferSize, long* mouseMove)
 
 	if (hDesktopDC) ReleaseDC(NULL, hDesktopDC);
 	if ((hDesktopDC = GetDC(NULL)) == NULL) { KVMDEBUG("GetDC(NULL) returned NULL", 0); return 1; } // We need to do this incase the current desktop changes.
+
+	// Downscaling: capture at full resolution and scale on the CPU. Falls back to StretchBlt() if that fails.
+	if (SCALING_FACTOR != 1024 && adjust_screen_size(SCALED_WIDTH) <= adjust_screen_size(SCREEN_WIDTH) && adjust_screen_size(SCALED_HEIGHT) <= adjust_screen_size(SCREEN_HEIGHT))
+	{
+		if (get_scaled_desktop_buffer(buffer, bufferSize) == 0) return 0;
+		*buffer = NULL;
+		*bufferSize = 0;
+	}
 	if (hCapturedBitmap == NULL || hCapturedBitmapWidth != adjust_screen_size(SCALED_WIDTH) || hCapturedBitmapHeight != adjust_screen_size(SCALED_HEIGHT))
 	{
 		if (hCapturedBitmap)
@@ -727,6 +908,9 @@ void teardown_gdiplus()
 	DeleteObject(hCapturedBitmap);
 	hCapturedBitmap = NULL;
 	hCapturedBitmapWidth = hCapturedBitmapHeight = 0;
+	free_full_capture();
+	if (hFullDC) { DeleteDC(hFullDC); hFullDC = NULL; }
+	free_scale_tables();
 	if (hDesktopDC) ReleaseDC(NULL, hDesktopDC);
 	hDesktopDC = NULL;
 }
@@ -735,6 +919,7 @@ void teardown_gdiplus()
 void reset_capture_bitmap()
 {
 	hCapturedBitmapWidth = hCapturedBitmapHeight = 0;
+	free_full_capture();
 }
 
 void set_tile_compression(int type, int level)
