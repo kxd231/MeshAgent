@@ -119,6 +119,12 @@ int GetEncoderClsid(const WCHAR* format, CLSID* pClsid)
 
 // When scaling, the screen is captured at full resolution into a DIB section and downscaled on the CPU
 // with an area-average filter (similar quality to HALFTONE, but much faster than StretchBlt).
+// The visible screen area (SCREEN_WIDTH x SCREEN_HEIGHT) is mapped to the visible scaled area
+// (SCALED_WIDTH x SCALED_HEIGHT), the padding up to the tile size is black.
+#if defined(_M_X64) || defined(_M_IX86)
+#include <emmintrin.h>
+#define KVM_SSE2 1
+#endif
 typedef struct scale_span { int start; int count; } scale_span;
 HDC hFullDC = NULL;
 HBITMAP hFullBitmap = NULL;
@@ -128,8 +134,10 @@ int fullWidth = 0, fullHeight = 0;
 scale_span *scaleXSpan = NULL, *scaleYSpan = NULL;
 unsigned short *scaleXW = NULL, *scaleYW = NULL;
 unsigned int *scaleAcc = NULL;
+unsigned char *scaleTmp = NULL;
 int scaleKX = 0, scaleKY = 0;
 int scaleSrcW = 0, scaleSrcH = 0, scaleDstW = 0, scaleDstH = 0;
+volatile LONG captureResetPending = 0;	// Set by reset_capture_bitmap() (any thread), handled by the capture thread.
 
 // StretchBlt() mode used when scaling. HALFTONE gives better text quality, COLORONCOLOR is much faster.
 #ifndef KVM_STRETCH_MODE
@@ -188,32 +196,37 @@ void free_scale_tables()
 	if (scaleXW) free(scaleXW);
 	if (scaleYW) free(scaleYW);
 	if (scaleAcc) free(scaleAcc);
+	if (scaleTmp) free(scaleTmp);
 	scaleXSpan = scaleYSpan = NULL;
 	scaleXW = scaleYW = NULL;
 	scaleAcc = NULL;
+	scaleTmp = NULL;
 	scaleSrcW = scaleSrcH = scaleDstW = scaleDstH = 0;
 }
 
+// The scalers below work on top-down rows: srcTop/dstTop point to the top row and the strides are negative for
+// bottom-up DIBs. Pixels are 32bpp BGRX.
 #pragma optimize("t", on)
-// Downscales a 32bpp image with an area-average filter. Both images have the same row order (bottom-up DIBs).
-void scale_area(const unsigned char *src, int srcW, unsigned char *dst, int dstW, int dstH)
+
+// Generic area-average downscale using the tables built by build_scale_table().
+void scale_area(const unsigned char *srcTop, ptrdiff_t srcStride, int srcW, unsigned char *dstTop, ptrdiff_t dstStride, int dstW, int dstH)
 {
-	int srcStride = srcW * 4;
+	int rowBytes = srcW * 4;
 	for (int y = 0; y < dstH; y++)
 	{
 		const scale_span *ys = &scaleYSpan[y];
 		const unsigned short *yw = &scaleYW[y * scaleKY];
-		unsigned char *out = dst + ((size_t)y * dstW * 4);
+		unsigned char *out = dstTop + (y * dstStride);
 
 		// Vertical pass: weighted sum of the source rows (fits in 22 bits)
-		const unsigned char *row = src + ((size_t)ys->start * srcStride);
+		const unsigned char *row = srcTop + (ys->start * srcStride);
 		unsigned int w = yw[0];
-		for (int i = 0; i < srcStride; i++) { scaleAcc[i] = row[i] * w; }
+		for (int i = 0; i < rowBytes; i++) { scaleAcc[i] = row[i] * w; }
 		for (int j = 1; j < ys->count; j++)
 		{
-			row = src + ((size_t)(ys->start + j) * srcStride);
+			row = srcTop + ((ys->start + j) * srcStride);
 			w = yw[j];
-			for (int i = 0; i < srcStride; i++) { scaleAcc[i] += row[i] * w; }
+			for (int i = 0; i < rowBytes; i++) { scaleAcc[i] += row[i] * w; }
 		}
 
 		// Horizontal pass
@@ -238,6 +251,94 @@ void scale_area(const unsigned char *src, int srcW, unsigned char *dst, int dstW
 		}
 	}
 }
+
+// Exact 2:1 downscale (average of 2x2 pixels).
+void scale_half(const unsigned char *srcTop, ptrdiff_t srcStride, unsigned char *dstTop, ptrdiff_t dstStride, int dstW, int dstH)
+{
+	for (int y = 0; y < dstH; y++)
+	{
+		const unsigned char *r0 = srcTop + ((2 * y) * srcStride);
+		const unsigned char *r1 = r0 + srcStride;
+		unsigned char *out = dstTop + (y * dstStride);
+		int x = 0;
+#ifdef KVM_SSE2
+		const __m128i zero = _mm_setzero_si128(), two = _mm_set1_epi16(2);
+		for (; x + 4 <= dstW; x += 4) // 8 source pixels per row -> 4 pixels
+		{
+			__m128i a0 = _mm_loadu_si128((const __m128i*)(r0 + (x * 8)));
+			__m128i a1 = _mm_loadu_si128((const __m128i*)(r0 + (x * 8) + 16));
+			__m128i b0 = _mm_loadu_si128((const __m128i*)(r1 + (x * 8)));
+			__m128i b1 = _mm_loadu_si128((const __m128i*)(r1 + (x * 8) + 16));
+			__m128i s0 = _mm_add_epi16(_mm_unpacklo_epi8(a0, zero), _mm_unpacklo_epi8(b0, zero)); // pixels 0,1
+			__m128i s1 = _mm_add_epi16(_mm_unpackhi_epi8(a0, zero), _mm_unpackhi_epi8(b0, zero)); // pixels 2,3
+			__m128i s2 = _mm_add_epi16(_mm_unpacklo_epi8(a1, zero), _mm_unpacklo_epi8(b1, zero)); // pixels 4,5
+			__m128i s3 = _mm_add_epi16(_mm_unpackhi_epi8(a1, zero), _mm_unpackhi_epi8(b1, zero)); // pixels 6,7
+			__m128i h0 = _mm_add_epi16(_mm_unpacklo_epi64(s0, s1), _mm_unpackhi_epi64(s0, s1));     // 0+1, 2+3
+			__m128i h1 = _mm_add_epi16(_mm_unpacklo_epi64(s2, s3), _mm_unpackhi_epi64(s2, s3));     // 4+5, 6+7
+			h0 = _mm_srli_epi16(_mm_add_epi16(h0, two), 2);
+			h1 = _mm_srli_epi16(_mm_add_epi16(h1, two), 2);
+			_mm_storeu_si128((__m128i*)(out + (x * 4)), _mm_packus_epi16(h0, h1));
+		}
+#endif
+		for (; x < dstW; x++)
+		{
+			for (int c = 0; c < 4; c++)
+			{
+				out[(x * 4) + c] = (unsigned char)((r0[(x * 8) + c] + r0[(x * 8) + 4 + c] + r1[(x * 8) + c] + r1[(x * 8) + 4 + c] + 2) >> 2);
+			}
+		}
+	}
+}
+
+#ifdef KVM_SSE2
+// 4:3 downscale (75%), area-average weights 3/4+1/4, 1/2+1/2, 1/4+3/4 computed with byte averages (error <= 1).
+// Vertical: 4 source rows -> 3 rows in scaleTmp, then horizontal: 4 pixels -> 3 pixels.
+void scale_three_quarter(const unsigned char *srcTop, ptrdiff_t srcStride, int srcW, unsigned char *dstTop, ptrdiff_t dstStride, int dstW, int dstH)
+{
+	int rowBytes = srcW * 4;
+	unsigned char *t0 = scaleTmp, *t1 = scaleTmp + rowBytes, *t2 = scaleTmp + (2 * rowBytes);
+	const __m128i lane1 = _mm_set_epi32(0, 0, -1, 0);
+
+	for (int g = 0; g < dstH / 3; g++)
+	{
+		const unsigned char *a = srcTop + ((4 * g) * srcStride);
+		const unsigned char *b = a + srcStride, *c = b + srcStride, *d = c + srcStride;
+		int i = 0;
+		for (; i + 16 <= rowBytes; i += 16)
+		{
+			__m128i va = _mm_loadu_si128((const __m128i*)(a + i)), vb = _mm_loadu_si128((const __m128i*)(b + i));
+			__m128i vc = _mm_loadu_si128((const __m128i*)(c + i)), vd = _mm_loadu_si128((const __m128i*)(d + i));
+			_mm_storeu_si128((__m128i*)(t0 + i), _mm_avg_epu8(va, _mm_avg_epu8(va, vb)));
+			_mm_storeu_si128((__m128i*)(t1 + i), _mm_avg_epu8(vb, vc));
+			_mm_storeu_si128((__m128i*)(t2 + i), _mm_avg_epu8(vd, _mm_avg_epu8(vc, vd)));
+		}
+		for (; i < rowBytes; i++)
+		{
+			t0[i] = (unsigned char)((3 * a[i] + b[i] + 2) >> 2);
+			t1[i] = (unsigned char)((b[i] + c[i] + 1) >> 1);
+			t2[i] = (unsigned char)((c[i] + 3 * d[i] + 2) >> 2);
+		}
+
+		for (int r = 0; r < 3; r++)
+		{
+			const unsigned char *t = (r == 0) ? t0 : ((r == 1) ? t1 : t2);
+			unsigned char *out = dstTop + (((3 * g) + r) * dstStride);
+			for (int x = 0; x + 3 <= dstW; x += 3) // pixels 4n..4n+3 -> 3n..3n+2
+			{
+				__m128i v = _mm_loadu_si128((const __m128i*)(t + ((x / 3) * 16)));        // p0 p1 p2 p3
+				__m128i p = _mm_shuffle_epi32(v, _MM_SHUFFLE(3, 3, 1, 0));                 // p0 p1 p3 p3
+				__m128i q = _mm_shuffle_epi32(v, _MM_SHUFFLE(2, 2, 2, 1));                 // p1 p2 p2 p2
+				__m128i m = _mm_avg_epu8(p, q);                                             // p0p1 p1p2 p2p3 p2p3
+				__m128i e = _mm_shuffle_epi32(v, _MM_SHUFFLE(3, 3, 0, 0));                 // p0 p0 p3 p3
+				e = _mm_or_si128(_mm_andnot_si128(lane1, e), _mm_and_si128(lane1, m));      // p0 p1p2 p3
+				__m128i res = _mm_avg_epu8(e, m);
+				_mm_storel_epi64((__m128i*)(out + (x * 4)), res);
+				*(int*)(out + (x * 4) + 8) = _mm_cvtsi128_si32(_mm_srli_si128(res, 8));
+			}
+		}
+	}
+}
+#endif
 #pragma optimize("", on)
 
 void free_full_capture()
@@ -258,7 +359,9 @@ int get_scaled_desktop_buffer(void **buffer, long long *bufferSize)
 {
 	int sw = adjust_screen_size(SCREEN_WIDTH), sh = adjust_screen_size(SCREEN_HEIGHT);
 	int dw = adjust_screen_size(SCALED_WIDTH), dh = adjust_screen_size(SCALED_HEIGHT);
+	int mode;
 
+	if (InterlockedExchange(&captureResetPending, 0) != 0) free_full_capture();
 	if (hFullBitmap == NULL || fullWidth != sw || fullHeight != sh)
 	{
 		BITMAPINFO bi;
@@ -279,26 +382,56 @@ int get_scaled_desktop_buffer(void **buffer, long long *bufferSize)
 		fullHeight = sh;
 	}
 
-	if (scaleSrcW != sw || scaleSrcH != sh || scaleDstW != dw || scaleDstH != dh)
+	// Pick the scaler: exact 2:1, exact 4:3 (SSE2 only) or the generic area-average filter.
+	if (SCREEN_WIDTH == 2 * SCALED_WIDTH && SCREEN_HEIGHT == 2 * SCALED_HEIGHT) { mode = 2; }
+#ifdef KVM_SSE2
+	else if (SCREEN_WIDTH * 3 == SCALED_WIDTH * 4 && SCREEN_HEIGHT * 3 == SCALED_HEIGHT * 4) { mode = 3; }
+#endif
+	else { mode = 1; }
+
+	if (scaleSrcW != SCREEN_WIDTH || scaleSrcH != SCREEN_HEIGHT || scaleDstW != SCALED_WIDTH || scaleDstH != SCALED_HEIGHT)
 	{
 		free_scale_tables();
-		if ((scaleAcc = (unsigned int*)malloc(sizeof(unsigned int) * sw * 4)) == NULL ||
-			build_scale_table(sw, dw, &scaleXSpan, &scaleXW, &scaleKX) != 0 ||
-			build_scale_table(sh, dh, &scaleYSpan, &scaleYW, &scaleKY) != 0)
+		if ((scaleAcc = (unsigned int*)malloc(sizeof(unsigned int) * SCREEN_WIDTH * 4)) == NULL ||
+			(scaleTmp = (unsigned char*)malloc((size_t)SCREEN_WIDTH * 4 * 3 + 16)) == NULL ||
+			build_scale_table(SCREEN_WIDTH, SCALED_WIDTH, &scaleXSpan, &scaleXW, &scaleKX) != 0 ||
+			build_scale_table(SCREEN_HEIGHT, SCALED_HEIGHT, &scaleYSpan, &scaleYW, &scaleKY) != 0)
 		{
 			free_scale_tables();
 			return 1;
 		}
-		scaleSrcW = sw; scaleSrcH = sh; scaleDstW = dw; scaleDstH = dh;
+		scaleSrcW = SCREEN_WIDTH; scaleSrcH = SCREEN_HEIGHT; scaleDstW = SCALED_WIDTH; scaleDstH = SCALED_HEIGHT;
 	}
 
-	if (BitBlt(hFullDC, 0, 0, sw, sh, hDesktopDC, SCREEN_X, SCREEN_Y, SRCCOPY) == FALSE) { KVMDEBUG("BitBlt() returned FALSE", 0); return 1; }
+	if (BitBlt(hFullDC, 0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, hDesktopDC, SCREEN_X, SCREEN_Y, SRCCOPY) == FALSE) { KVMDEBUG("BitBlt() returned FALSE", 0); return 1; }
 	GdiFlush();
 
 	*bufferSize = (long long)dw * dh * 4;
 	if ((*buffer = malloc((size_t)*bufferSize)) == NULL) { KVMDEBUG("malloc() failed", 0); *bufferSize = 0; return 1; }
 	PIXEL_SIZE = 4;
-	scale_area(fullBits, sw, (unsigned char*)*buffer, dw, dh);
+
+	{
+		// Both buffers are bottom-up: the top row is the last one in memory.
+		const unsigned char *srcTop = fullBits + ((size_t)(sh - 1) * sw * 4);
+		unsigned char *dstTop = (unsigned char*)*buffer + ((size_t)(dh - 1) * dw * 4);
+		ptrdiff_t srcStride = -(ptrdiff_t)sw * 4, dstStride = -(ptrdiff_t)dw * 4;
+
+		switch (mode)
+		{
+			case 2: scale_half(srcTop, srcStride, dstTop, dstStride, SCALED_WIDTH, SCALED_HEIGHT); break;
+#ifdef KVM_SSE2
+			case 3: scale_three_quarter(srcTop, srcStride, SCREEN_WIDTH, dstTop, dstStride, SCALED_WIDTH, SCALED_HEIGHT); break;
+#endif
+			default: scale_area(srcTop, srcStride, SCREEN_WIDTH, dstTop, dstStride, SCALED_WIDTH, SCALED_HEIGHT); break;
+		}
+
+		// Black padding: right of the visible area, and the rows below it (the first rows in memory).
+		if (dw > SCALED_WIDTH)
+		{
+			for (int y = 0; y < SCALED_HEIGHT; y++) { memset(dstTop + (y * dstStride) + (SCALED_WIDTH * 4), 0, (size_t)(dw - SCALED_WIDTH) * 4); }
+		}
+		if (dh > SCALED_HEIGHT) { memset(*buffer, 0, (size_t)(dh - SCALED_HEIGHT) * dw * 4); }
+	}
 	return 0;
 }
 
@@ -919,7 +1052,7 @@ void teardown_gdiplus()
 void reset_capture_bitmap()
 {
 	hCapturedBitmapWidth = hCapturedBitmapHeight = 0;
-	free_full_capture();
+	InterlockedExchange(&captureResetPending, 1); // May be called from the input thread, the capture thread re-creates the DIB section
 }
 
 void set_tile_compression(int type, int level)
