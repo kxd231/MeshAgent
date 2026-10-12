@@ -20,6 +20,9 @@ limitations under the License.
 #include "tile.h"
 #include <gdiplus.h>
 #include "meshcore/meshdefines.h"
+#ifdef _TURBOJPEG
+#include <turbojpeg.h>
+#endif
 using namespace Gdiplus;
 
 #if defined(WIN32) && !defined(_WIN32_WCE) && !defined(_MINCORE)
@@ -74,9 +77,18 @@ HGDIOBJ hCaptureDCDefaultBitmap = NULL;	// Original bitmap of hCaptureDC, a bitm
 //HDC hdc;
 CLSID encoderClsid;
 ULONG encCompression = 50; // Image compression
+int encType = 1; // 1 = JPEG, 2 = PNG, 3 = TIFF, 4 = WEBP (encoded as JPEG)
 EncoderParameters encParam;
 LPVOID tilebuffer = NULL;
 unsigned int tilebuffersize = 0;
+
+#ifdef _TURBOJPEG
+// JPEG chroma subsampling used by TurboJPEG. TJSAMP_444 gives sharper colored text, but larger tiles.
+#ifndef KVM_TJ_SUBSAMP
+#define KVM_TJ_SUBSAMP TJSAMP_420
+#endif
+tjhandle tjCompressor = NULL;
+#endif
 
 // Used to obtain the GUID for the image encoder.
 int GetEncoderClsid(const WCHAR* format, CLSID* pClsid)
@@ -139,16 +151,98 @@ int tile_crc(int x, int y, void *desktop, int tilewidth, int tileheight)
 	return crc;
 }
 
+// Allocates a tile packet for an encoded image of jpegSize bytes and writes its header. The image goes at the returned offset.
+char* alloc_tile_packet(int x, int y, DWORD jpegSize, long long *bufferSize, int *headerSize)
+{
+	char* Tile;
+	*headerSize = (jpegSize > 65500 ? 16 : 8);
+	*bufferSize = jpegSize + *headerSize;
+	if ((Tile = (char*)ILibMemory_Allocate((int)*bufferSize, 0, NULL, NULL)) == NULL) return NULL;
+
+	// Place the header
+	if (jpegSize > 65500)
+	{
+		((unsigned short*)Tile)[0] = (unsigned short)htons((unsigned short)MNG_JUMBO);			// Write the type
+		((unsigned short*)Tile)[1] = (unsigned short)htons((unsigned short)8);					// Write the size
+		((unsigned int*)Tile)[1]   = (unsigned int)htonl(jpegSize + 8);						// Size of the Next Packet
+		((unsigned short*)Tile)[4] = (unsigned short)htons((unsigned short)MNG_KVM_PICTURE);	// Write the type
+		((unsigned short*)Tile)[5] = 0;														// RESERVED
+		((unsigned short*)Tile)[6] = (unsigned short)htons((unsigned short)x);				// X position
+		((unsigned short*)Tile)[7] = (unsigned short)htons((unsigned short)y);				// Y position
+	}
+	else
+	{
+		((unsigned short*)Tile)[0] = (unsigned short)htons((unsigned short)MNG_KVM_PICTURE);	// Write the type
+		((unsigned short*)Tile)[1] = (unsigned short)htons((unsigned short)*bufferSize);		// Write the size
+		((unsigned short*)Tile)[2] = (unsigned short)htons((unsigned short)x);				// X position
+		((unsigned short*)Tile)[3] = (unsigned short)htons((unsigned short)y);				// Y position
+	}
+	return Tile;
+}
+
+#ifdef _TURBOJPEG
+// Encodes the tile as JPEG directly from the bottom-up desktop buffer using TurboJPEG. Returns 0 on success.
+int calc_opt_compr_send_turbo(int x, int y, int captureWidth, int captureHeight, void* desktop, void ** buffer, long long *bufferSize)
+{
+	unsigned char *jpegBuf = NULL;
+	size_t jpegSize = 0;
+	int pitch = adjust_screen_size(SCALED_WIDTH) * PIXEL_SIZE;
+	int headerSize;
+	char* Tile;
+
+	// The desktop buffer is bottom-up, so the first row in memory is the bottom row of the tile (same rows as get_tile_buffer).
+	unsigned char *src = (unsigned char*)desktop + ((size_t)(adjust_screen_size(SCALED_HEIGHT) - y - captureHeight) * pitch) + ((size_t)x * PIXEL_SIZE);
+
+	if (tjCompressor == NULL && (tjCompressor = tj3Init(TJINIT_COMPRESS)) == NULL) { KVMDEBUG("tj3Init() failed", 0); return 1; }
+	if (tj3Set(tjCompressor, TJPARAM_QUALITY, (int)encCompression) != 0 ||
+		tj3Set(tjCompressor, TJPARAM_SUBSAMP, KVM_TJ_SUBSAMP) != 0 ||
+		tj3Set(tjCompressor, TJPARAM_FASTDCT, 1) != 0 ||
+		tj3Set(tjCompressor, TJPARAM_BOTTOMUP, 1) != 0)
+	{
+		KVMDEBUG("tj3Set() failed", 0);
+		return 1;
+	}
+
+	if (tj3Compress8(tjCompressor, src, captureWidth, pitch, captureHeight, PIXEL_SIZE == 4 ? TJPF_BGRX : TJPF_BGR, &jpegBuf, &jpegSize) != 0)
+	{
+		KVMDEBUG("tj3Compress8() failed", 0);
+		tj3Free(jpegBuf);
+		return 1;
+	}
+
+	if ((Tile = alloc_tile_packet(x, y, (DWORD)jpegSize, bufferSize, &headerSize)) == NULL)
+	{
+		tj3Free(jpegBuf);
+		*bufferSize = 0;
+		return 1;
+	}
+	memcpy_s(Tile + headerSize, (size_t)jpegSize, jpegBuf, (size_t)jpegSize);
+	tj3Free(jpegBuf);
+
+	*buffer = (unsigned char*)Tile;
+	return 0;
+}
+#endif
+
 // This function returns 0 and *buffer != NULL if everything was good. retval = jpegsize if the captured image was too large.
 int calc_opt_compr_send(int x, int y, int captureWidth, int captureHeight, void* desktop, void ** buffer, long long *bufferSize) 
 {
 	BITMAPINFO bmpInfo;
 	LARGE_INTEGER Offset;
 	BITMAPFILEHEADER bmpFileHeader;
+	int headerSize;
 	*buffer = NULL;
 	*bufferSize = 0;
 
 	KVMDEBUG("calc_opt_compr_send()", 0);
+
+#ifdef _TURBOJPEG
+	// JPEG is encoded with TurboJPEG, if that fails we fall back to GDI+ below.
+	if ((encType == 1 || encType == 4) && (PIXEL_SIZE == 4 || PIXEL_SIZE == 3))
+	{
+		if (calc_opt_compr_send_turbo(x, y, captureWidth, captureHeight, desktop, buffer, bufferSize) == 0) return 0;
+	}
+#endif
 
 	// Get the bmpInfo structure
 	bmpInfo = get_bmp_info(captureWidth, captureHeight);
@@ -258,12 +352,13 @@ int calc_opt_compr_send(int x, int y, int captureWidth, int captureHeight, void*
 	//}
 
 	// Save the image stream in memory.
-	char* Tile = (char*)ILibMemory_Allocate(jpegSize > 65500 ? (jpegSize + 16):(jpegSize + 8), 0, NULL, NULL);
-	if (jpegStream->Read(Tile + (jpegSize > 65500 ? 16 : 8), jpegSize, NULL) != S_OK)
+	char* Tile = alloc_tile_packet(x, y, jpegSize, bufferSize, &headerSize);
+	if (Tile == NULL || jpegStream->Read(Tile + headerSize, jpegSize, NULL) != S_OK)
 	{
 		KVMDEBUG("jpegStream->Read() failed", 0);
 		delete DIBImage;
-		free(Tile);
+		if (Tile != NULL) free(Tile);
+		*bufferSize = 0;
 		bmpStream->Release();
 		jpegStream->Release();
 		ILibCriticalLog(NULL, __FILE__, __LINE__, 252, GetLastError());
@@ -276,26 +371,6 @@ int calc_opt_compr_send(int x, int y, int captureWidth, int captureHeight, void*
 	jpegStream->Release();
 
 	*buffer = (unsigned char*)Tile;
-	*bufferSize = jpegSize + (jpegSize > 65500 ? 16 : 8);
-
-	// Place the header
-	if (jpegSize > 65500)
-	{
-		((unsigned short*)*buffer)[0] = (unsigned short)htons((unsigned short)MNG_JUMBO);		// Write the type
-		((unsigned short*)*buffer)[1] = (unsigned short)htons((unsigned short)8);				// Write the size
-		((unsigned int*)*buffer)[1]   = (unsigned int)htonl(jpegSize + 8);						// Size of the Next Packet
-		((unsigned short*)*buffer)[4] = (unsigned short)htons((unsigned short)MNG_KVM_PICTURE);	// Write the type
-		((unsigned short*)*buffer)[5] = 0;														// RESERVED
-		((unsigned short*)*buffer)[6] = (unsigned short)htons((unsigned short)x);				// X position
-		((unsigned short*)*buffer)[7] = (unsigned short)htons((unsigned short)y);				// Y position
-	}
-	else
-	{
-		((unsigned short*)*buffer)[0] = (unsigned short)htons((unsigned short)MNG_KVM_PICTURE);	// Write the type
-		((unsigned short*)*buffer)[1] = (unsigned short)htons((unsigned short)*bufferSize);		// Write the size
-		((unsigned short*)*buffer)[2] = (unsigned short)htons((unsigned short)x);				// X position
-		((unsigned short*)*buffer)[3] = (unsigned short)htons((unsigned short)y);				// Y position
-	}
 	return 0;
 }
 
@@ -627,6 +702,7 @@ short initialize_gdiplus()
 	if ((hCaptureDCDefaultBitmap = SelectObject(hCaptureDC, hCapturedBitmap)) == NULL) { KVMDEBUG("SelectObject() failed", 0); }
 	
 	// Find encoder and setup encoder parameters
+	encType = 1;
 	GetEncoderClsid(L"image/jpeg", &encoderClsid);
 	encParam.Count = 1;
 	encParam.Parameter[0].Guid = EncoderQuality;
@@ -642,6 +718,9 @@ void teardown_gdiplus()
 	if (tilebuffer) free(tilebuffer);
 	tilebuffersize = 0;
 	tilebuffer = NULL;
+#ifdef _TURBOJPEG
+	if (tjCompressor != NULL) { tj3Destroy(tjCompressor); tjCompressor = NULL; }
+#endif
 	GdiplusShutdown(gdiplusToken);
 	DeleteDC(hCaptureDC);
 	hCaptureDCDefaultBitmap = NULL;
@@ -663,7 +742,8 @@ void set_tile_compression(int type, int level)
 	encCompression = level;
 	if (encCompression < 1) { encCompression = 1; } // Guard against bad values.
 	if (encCompression > 90) { encCompression = 90; }
-	if (tilebuffer == NULL) { KVMDEBUG("set_tile_compression(), tilebuffer == NULL.", 0); return; }
+	if (type >= 1 && type <= 4) { encType = type; }
+	// Note: no early return when tilebuffer == NULL, with TurboJPEG the tile buffer is never allocated for JPEG.
 	KVMDEBUG("set_tile_compression() type", type);
 	KVMDEBUG("set_tile_compression() level", level);
 
