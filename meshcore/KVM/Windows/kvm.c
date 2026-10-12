@@ -384,6 +384,7 @@ void CheckDesktopSwitch(int checkres, ILibKVM_WriteHandler writeHandler, void *r
 				KVMDEBUG("DESKTOP NAME CHANGE DETECTED, switching session", 0);
 				ILibRemoteLogging_printf(gKVMRemoteLogging, ILibRemoteLogging_Modules_Agent_KVM, ILibRemoteLogging_Flags_VerbosityLevel_1, "KVM [SLAVE]: Desktop switched to: %s (UAC/Lock screen detected)", name);
 				kvm_server_currentDesktopname = ((int *)name)[0];
+				reset_capture_bitmap();
 				// Force screen refresh after desktop switch
 				if (checkres != 0)
 				{

@@ -43,6 +43,7 @@ int get_tile_at(int x, int y, void** buffer, long long *bufferSize, void *deskto
 int get_desktop_buffer(void **buffer, long long *bufferSize, long*);
 BITMAPINFO get_bmp_info(int width, int height);
 void set_tile_compression(int type, int level);
+void reset_capture_bitmap();
 void switch_to_desktop_context();
 
 #if defined(_cplus_plus) || defined(__cplusplus) || defined(_cplusplus)

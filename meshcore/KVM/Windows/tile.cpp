@@ -68,6 +68,9 @@ ULONG_PTR gdiplusToken;
 HDC hDesktopDC;
 HDC hCaptureDC;
 HBITMAP hCapturedBitmap;
+int hCapturedBitmapWidth = 0;	// Size of hCapturedBitmap, it is only re-created when this changes.
+int hCapturedBitmapHeight = 0;
+HGDIOBJ hCaptureDCDefaultBitmap = NULL;	// Original bitmap of hCaptureDC, a bitmap can't be deleted while it is selected into a DC.
 //HDC hdc;
 CLSID encoderClsid;
 ULONG encCompression = 50; // Image compression
@@ -100,6 +103,11 @@ int GetEncoderClsid(const WCHAR* format, CLSID* pClsid)
 	free(pImageCodecInfo);
 	return -1;
 }
+
+// StretchBlt() mode used when scaling. HALFTONE gives better text quality, COLORONCOLOR is much faster.
+#ifndef KVM_STRETCH_MODE
+#define KVM_STRETCH_MODE HALFTONE
+#endif
 
 // Adjusts the screen size(width or height) to be exactly divisible by TILE_WIDTH
 int adjust_screen_size(int pixles) 
@@ -487,11 +495,22 @@ int get_desktop_buffer(void **buffer, long long *bufferSize, long* mouseMove)
 
 	if (hDesktopDC) ReleaseDC(NULL, hDesktopDC);
 	if ((hDesktopDC = GetDC(NULL)) == NULL) { KVMDEBUG("GetDC(NULL) returned NULL", 0); return 1; } // We need to do this incase the current desktop changes.
-	if (hCapturedBitmap) DeleteObject(hCapturedBitmap);	
-	if ((hCapturedBitmap = CreateCompatibleBitmap(hDesktopDC, adjust_screen_size(SCALED_WIDTH), adjust_screen_size(SCALED_HEIGHT))) == NULL)
+	if (hCapturedBitmap == NULL || hCapturedBitmapWidth != adjust_screen_size(SCALED_WIDTH) || hCapturedBitmapHeight != adjust_screen_size(SCALED_HEIGHT))
 	{
-		KVMDEBUG("CreateCompatibleBitmap() returned NULL", 0);
-		return 1;
+		if (hCapturedBitmap)
+		{
+			if (hCaptureDCDefaultBitmap) SelectObject(hCaptureDC, hCaptureDCDefaultBitmap);
+			DeleteObject(hCapturedBitmap);
+			hCapturedBitmap = NULL;
+		}
+		hCapturedBitmapWidth = hCapturedBitmapHeight = 0;
+		if ((hCapturedBitmap = CreateCompatibleBitmap(hDesktopDC, adjust_screen_size(SCALED_WIDTH), adjust_screen_size(SCALED_HEIGHT))) == NULL)
+		{
+			KVMDEBUG("CreateCompatibleBitmap() returned NULL", 0);
+			return 1;
+		}
+		hCapturedBitmapWidth = adjust_screen_size(SCALED_WIDTH);
+		hCapturedBitmapHeight = adjust_screen_size(SCALED_HEIGHT);
 	}
 	
 	if (SelectObject(hCaptureDC, hCapturedBitmap) == NULL) { KVMDEBUG("SelectObject() failed", 0); return(1); }
@@ -535,7 +554,7 @@ int get_desktop_buffer(void **buffer, long long *bufferSize, long* mouseMove)
 	}
 	else
 	{
-		if (SetStretchBltMode(hCaptureDC, HALFTONE) == 0) { KVMDEBUG("SetStretchBltMode() failed", 0); return(1); }
+		if (SetStretchBltMode(hCaptureDC, KVM_STRETCH_MODE) == 0) { KVMDEBUG("SetStretchBltMode() failed", 0); return(1); }
 		if (StretchBlt(hCaptureDC, 0, 0, adjust_screen_size(SCALED_WIDTH), adjust_screen_size(SCALED_HEIGHT), hDesktopDC, SCREEN_X, SCREEN_Y, adjust_screen_size(SCREEN_WIDTH), adjust_screen_size(SCREEN_HEIGHT), SRCCOPY) == FALSE)
 		{
 			KVMDEBUG("StretchBlt() returned FALSE", 0);
@@ -603,7 +622,9 @@ short initialize_gdiplus()
 	if ((hDesktopDC = GetDC(NULL)) == NULL) { KVMDEBUG("GetDC() failed", 0); return 0; }
 	if ((hCaptureDC = CreateCompatibleDC(hDesktopDC)) == NULL) { KVMDEBUG("CreateCompatibleDC() failed", 0); return 0; }
 	if ((hCapturedBitmap = CreateCompatibleBitmap(hDesktopDC, SCALED_WIDTH, SCALED_HEIGHT)) == NULL) { KVMDEBUG("CreateCompatibleBitmap() failed", 0); return 0; }
-	if (SelectObject(hCaptureDC, hCapturedBitmap) == NULL) { KVMDEBUG("SelectObject() failed", 0); }
+	hCapturedBitmapWidth = SCALED_WIDTH;
+	hCapturedBitmapHeight = SCALED_HEIGHT;
+	if ((hCaptureDCDefaultBitmap = SelectObject(hCaptureDC, hCapturedBitmap)) == NULL) { KVMDEBUG("SelectObject() failed", 0); }
 	
 	// Find encoder and setup encoder parameters
 	GetEncoderClsid(L"image/jpeg", &encoderClsid);
@@ -623,9 +644,18 @@ void teardown_gdiplus()
 	tilebuffer = NULL;
 	GdiplusShutdown(gdiplusToken);
 	DeleteDC(hCaptureDC);
+	hCaptureDCDefaultBitmap = NULL;
 	DeleteObject(hCapturedBitmap);
+	hCapturedBitmap = NULL;
+	hCapturedBitmapWidth = hCapturedBitmapHeight = 0;
 	if (hDesktopDC) ReleaseDC(NULL, hDesktopDC);
 	hDesktopDC = NULL;
+}
+
+// Forces the capture bitmap to be re-created on the next frame (e.g. after a desktop switch).
+void reset_capture_bitmap()
+{
+	hCapturedBitmapWidth = hCapturedBitmapHeight = 0;
 }
 
 void set_tile_compression(int type, int level)
