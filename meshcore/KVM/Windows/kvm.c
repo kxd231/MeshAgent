@@ -30,6 +30,8 @@ limitations under the License.
 #include "microstack/ILibProcessPipe.h"
 #include "microstack/ILibRemoteLogging.h"
 #include <sas.h>
+#include <timeapi.h>
+#pragma comment(lib, "winmm.lib")
 
 #if defined(WIN32) && !defined(_WIN32_WCE) && !defined(_MINCORE)
 #define _CRTDBG_MAP_ALLOC
@@ -1004,6 +1006,9 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 	Sleep(100); // Pausing here seems to fix connection issues, especially with WebRTC. TODO: Investigate why.
 	KVMDEBUG("kvm_server_mainloop / start3", (int)GetCurrentThreadId());
 
+	// Use 1ms timer resolution, otherwise Sleep(FRAME_RATE_TIMER) is rounded up to the 15.6ms system tick.
+	timeBeginPeriod(1);
+
 	// Loop and send only when a tile changes.
 	while (!g_shutdown)
 	{
@@ -1195,6 +1200,8 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 			SleepEx(0, TRUE);
 		}
 	}
+
+	timeEndPeriod(1);
 
 	KVMDEBUG("kvm_server_mainloop / end3", (int)GetCurrentThreadId());
 	KVMDEBUG("kvm_server_mainloop / end2", (int)GetCurrentThreadId());
