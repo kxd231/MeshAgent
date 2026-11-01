@@ -355,7 +355,7 @@ void free_full_capture()
 }
 
 // Captures the screen at full resolution and downscales it to the scaled size. Returns 0 on success.
-int get_scaled_desktop_buffer(void **buffer, long long *bufferSize)
+int get_scaled_desktop_buffer(void **buffer, long long *bufferSize, int *pixelSize)
 {
 	int sw = adjust_screen_size(SCREEN_WIDTH), sh = adjust_screen_size(SCREEN_HEIGHT);
 	int dw = adjust_screen_size(SCALED_WIDTH), dh = adjust_screen_size(SCALED_HEIGHT);
@@ -408,7 +408,7 @@ int get_scaled_desktop_buffer(void **buffer, long long *bufferSize)
 
 	*bufferSize = (long long)dw * dh * 4;
 	if ((*buffer = malloc((size_t)*bufferSize)) == NULL) { KVMDEBUG("malloc() failed", 0); *bufferSize = 0; return 1; }
-	PIXEL_SIZE = 4;
+	*pixelSize = 4;
 
 	{
 		// Both buffers are bottom-up: the top row is the last one in memory.
@@ -866,13 +866,16 @@ int get_tile_at(int x, int y, void** buffer, long long *bufferSize, void *deskto
 	return retval;
 }
 
-// This function captures the entire desktop buffer to scan.
-int get_desktop_buffer(void **buffer, long long *bufferSize, long* mouseMove)
+// This function captures the entire desktop buffer to scan. It runs on the capture thread while the main thread may
+// still encode the previous frame, so it reports the bytes per pixel of this frame in *pixelSize instead of changing
+// PIXEL_SIZE; the main loop sets PIXEL_SIZE when it starts encoding this frame.
+int get_desktop_buffer(void **buffer, long long *bufferSize, long* mouseMove, int *pixelSize)
 {
 	BITMAPINFO bmpInfo;
 
 	*buffer = NULL; // If anything fails, this will be the indication.
 	*bufferSize = 0;
+	*pixelSize = 0;
 
 	if (hDesktopDC) ReleaseDC(NULL, hDesktopDC);
 	if ((hDesktopDC = GetDC(NULL)) == NULL) { KVMDEBUG("GetDC(NULL) returned NULL", 0); return 1; } // We need to do this incase the current desktop changes.
@@ -880,7 +883,7 @@ int get_desktop_buffer(void **buffer, long long *bufferSize, long* mouseMove)
 	// Downscaling: capture at full resolution and scale on the CPU. Falls back to StretchBlt() if that fails.
 	if (SCALING_FACTOR != 1024 && adjust_screen_size(SCALED_WIDTH) <= adjust_screen_size(SCREEN_WIDTH) && adjust_screen_size(SCALED_HEIGHT) <= adjust_screen_size(SCREEN_HEIGHT))
 	{
-		if (get_scaled_desktop_buffer(buffer, bufferSize) == 0) return 0;
+		if (get_scaled_desktop_buffer(buffer, bufferSize, pixelSize) == 0) return 0;
 		*buffer = NULL;
 		*bufferSize = 0;
 	}
@@ -968,13 +971,20 @@ int get_desktop_buffer(void **buffer, long long *bufferSize, long* mouseMove)
 	}
 
 	*bufferSize = bmpInfo.bmiHeader.biSizeImage;
-	PIXEL_SIZE = bmpInfo.bmiHeader.biBitCount / 8;
+	*pixelSize = bmpInfo.bmiHeader.biBitCount / 8;
 	if ((*buffer = malloc((size_t)*bufferSize)) == NULL) { KVMDEBUG("malloc() failed", 0); return 1; }
 	
 	bmpInfo.bmiHeader.biCompression = BI_RGB;
 	if (GetDIBits(hDesktopDC, hCapturedBitmap, 0, bmpInfo.bmiHeader.biHeight, *buffer, &bmpInfo, DIB_RGB_COLORS) == 0) { KVMDEBUG("GetDIBits() failed", 0); free(*buffer); return(1); }
 
 	return 0;
+}
+
+// Checks that a captured frame holds at least the area the tile code reads with the given bytes per pixel.
+int desktop_buffer_fits(long long bufferSize, int pixelSize)
+{
+	if (pixelSize < 1 || pixelSize > 4) return 0;
+	return bufferSize >= (long long)adjust_screen_size(SCALED_WIDTH) * adjust_screen_size(SCALED_HEIGHT) * pixelSize;
 }
 
 // Creates a BITMAPINFO object with required width and height

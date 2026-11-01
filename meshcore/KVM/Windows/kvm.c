@@ -924,6 +924,7 @@ typedef struct KVM_CaptureState
 	long mouseMove[3];
 	void *buffer;
 	long long bufferSize;
+	int pixelSize;
 	int result;
 	int generation;
 } KVM_CaptureState;
@@ -947,7 +948,7 @@ DWORD WINAPI kvm_capture_thread(LPVOID parm)
 		kvm_capture_switch_desktop();
 		gCapture.buffer = NULL;
 		gCapture.bufferSize = 0;
-		gCapture.result = get_desktop_buffer(&gCapture.buffer, &gCapture.bufferSize, gCapture.mouseMove);
+		gCapture.result = get_desktop_buffer(&gCapture.buffer, &gCapture.bufferSize, gCapture.mouseMove, &gCapture.pixelSize);
 		SetEvent(gCapture.doneEvent);
 	}
 	release_desktop_dc(); // A DC must be released on the thread that got it
@@ -962,11 +963,12 @@ void kvm_capture_start(long *mouseMove)
 }
 
 // Waits for the frame started by kvm_capture_start(). Returns the desktop buffer, or NULL if the capture failed.
-void* kvm_capture_wait(long long *bufferSize, int *generation)
+void* kvm_capture_wait(long long *bufferSize, int *generation, int *pixelSize)
 {
 	WaitForSingleObject(gCapture.doneEvent, INFINITE);
 	*bufferSize = gCapture.bufferSize;
 	*generation = gCapture.generation;
+	*pixelSize = gCapture.pixelSize;
 	return (gCapture.result == 0) ? gCapture.buffer : NULL;
 }
 
@@ -1075,7 +1077,7 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 	char *tmoBuffer;
 	long mouseMove[3] = {0, 0, 0};
 	int sentHideCursor = 0;
-	int captureInFlight = 0, lastSentTiles = 0, frameGeneration = 0, dropFrame = 0;
+	int captureInFlight = 0, lastSentTiles = 0, frameGeneration = 0, framePixelSize = 0, dropFrame = 0;
 
 	gPendingPackets = ILibQueue_Create();
 	KVM_InitMouseCursors(gPendingPackets);
@@ -1198,7 +1200,7 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 		}
 
 		// Get the captured desktop
-		desktop = kvm_capture_wait(&desktopsize, &frameGeneration);
+		desktop = kvm_capture_wait(&desktopsize, &frameGeneration, &framePixelSize);
 		captureInFlight = 0;
 		if (desktop == NULL)
 		{
@@ -1220,8 +1222,10 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 				captureInFlight = 1;
 			}
 
-			// Drop the frame if the resolution or scaling changed after it was captured
-			dropFrame = (frameGeneration != gGeometryGeneration);
+			// Drop the frame if the resolution or scaling changed after it was captured, or if the buffer is
+			// smaller than what the tile code reads at this frame's color depth.
+			PIXEL_SIZE = framePixelSize;
+			dropFrame = (frameGeneration != gGeometryGeneration) || !desktop_buffer_fits(desktopsize, PIXEL_SIZE);
 
 			bmpInfo = get_bmp_info(TILE_WIDTH, TILE_HEIGHT);
 			for (row = 0; !dropFrame && row < TILE_HEIGHT_COUNT; row++)
@@ -1317,7 +1321,7 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 	// Stop the capture thread
 	if (captureInFlight)
 	{
-		void *pending = kvm_capture_wait(&desktopsize, &frameGeneration);
+		void *pending = kvm_capture_wait(&desktopsize, &frameGeneration, &framePixelSize);
 		if (pending != NULL) free(pending);
 	}
 	if (gCapture.thread != NULL)
