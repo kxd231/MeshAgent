@@ -1,0 +1,66 @@
+name: KVM perf build (Windows x64)
+
+# Builds MeshService64.exe from this branch with TurboJPEG and attaches it to the release.
+# Runs only when approved: when a release is published, or started by hand (Actions -> Run workflow).
+on:
+  release:
+    types: [ published ]
+  workflow_dispatch:
+
+permissions:
+  contents: write # upload the binary to the release
+
+env:
+  # Official libjpeg-turbo release asset and its published SHA-256 digest
+  TURBOJPEG_URL: https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/3.2.0/libjpeg-turbo-3.2.0-vc-x64.exe
+  TURBOJPEG_SHA256: 662761d8ba8dae04aec74023ebaeceb856c2b56b9b59cfd180759d26300dda42
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Install libjpeg-turbo (verified)
+        shell: pwsh
+        run: |
+          $exe = "$env:RUNNER_TEMP\libjpeg-turbo.exe"
+          Invoke-WebRequest -Uri $env:TURBOJPEG_URL -OutFile $exe
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne $env:TURBOJPEG_SHA256) { throw "libjpeg-turbo checksum mismatch: $hash" }
+          Start-Process -FilePath $exe -ArgumentList '/S','/D=C:\libjpeg-turbo64' -Wait
+          if (-not (Test-Path 'C:\libjpeg-turbo64\lib\turbojpeg-static.lib')) { throw 'turbojpeg-static.lib not installed' }
+
+      - name: Build Release x64
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\amd64\MSBuild.exe' | Select-Object -First 1
+          & $vs MeshAgent-2022.sln /m /p:Configuration=Release /p:Platform=x64 /p:TurboJpegDir=C:\libjpeg-turbo64 /v:minimal
+          if ($LASTEXITCODE -ne 0) { throw "MSBuild failed: $LASTEXITCODE" }
+
+      - name: Size and hashes
+        id: info
+        shell: pwsh
+        run: |
+          $f = Get-ChildItem -Recurse -Filter MeshService64.exe | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item $f.FullName out\MeshService64.exe
+          $size = (Get-Item out\MeshService64.exe).Length
+          $sha384 = (Get-FileHash out\MeshService64.exe -Algorithm SHA384).Hash.ToLower()
+          $sha256 = (Get-FileHash out\MeshService64.exe -Algorithm SHA256).Hash.ToLower()
+          "MeshService64.exe size=$size`nsha384=$sha384`nsha256=$sha256`ncommit=$env:GITHUB_SHA" | Tee-Object out\MeshService64.exe.txt
+          "## MeshService64.exe`n`n- commit: $env:GITHUB_SHA`n- size: $size`n- sha384: $sha384`n- sha256: $sha256" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: MeshService64
+          path: out/
+
+      - name: Attach to release
+        if: github.event_name == 'release'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$env:GITHUB_REF_NAME" out\MeshService64.exe out\MeshService64.exe.txt --clobber -R "$env:GITHUB_REPOSITORY"
