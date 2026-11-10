@@ -147,6 +147,7 @@ int KVM_GetCursorHash(HCURSOR hc, char *buffer, size_t bufferLen)
 	BITMAP bm;
 	ICONINFO ii;
 	
+	ZeroMemory(&ii, sizeof(ii));
 	GetIconInfo(hc, &ii);
 	
 	if (GetObject(ii.hbmMask, sizeof(bm), &bm) == sizeof(bm))
@@ -179,10 +180,14 @@ int KVM_GetCursorHash(HCURSOR hc, char *buffer, size_t bufferLen)
 				SelectObject(hdcMem, hbmold);
 			}
 			if (hbmCanvas != NULL) { DeleteObject(hbmCanvas); }
-			if (hdcMem != NULL) { ReleaseDC(NULL, hdcMem); }
-			if (hdcScreen != NULL) { ReleaseDC(NULL, hdcScreen); }
+			if (hdcMem != NULL) { DeleteDC(hdcMem); }
+			ReleaseDC(NULL, hdcScreen);
 		}
 	}
+
+	// GetIconInfo() hands over copies of the cursor bitmaps, the caller has to delete them.
+	if (ii.hbmMask != NULL) { DeleteObject(ii.hbmMask); }
+	if (ii.hbmColor != NULL) { DeleteObject(ii.hbmColor); }
 
 	return(crc);
 }

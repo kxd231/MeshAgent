@@ -919,6 +919,7 @@ int get_desktop_buffer(void **buffer, long long *bufferSize, long* mouseMove, in
 			BITMAP bm;
 			ICONINFO ii;
 			info.cbSize = sizeof(info);
+			ZeroMemory(&ii, sizeof(ii));
 			GetCursorInfo(&info);
 			GetIconInfo(info.hCursor, &ii);
 			if (GetObject(ii.hbmMask, sizeof(bm), &bm) == sizeof(bm))
@@ -938,10 +939,13 @@ int get_desktop_buffer(void **buffer, long long *bufferSize, long* mouseMove, in
 						SelectObject(hdcMem, hbmold);
 					}
 					if (hbmCanvas != NULL) { DeleteObject(hbmCanvas); }
-					if (hdcMem != NULL) { ReleaseDC(NULL, hdcMem); }
-					if (hdcScreen != NULL) { ReleaseDC(NULL, hdcScreen); }
+					if (hdcMem != NULL) { DeleteDC(hdcMem); }
+					ReleaseDC(NULL, hdcScreen);
 				}
 			}
+			// GetIconInfo() hands over copies of the cursor bitmaps, the caller has to delete them.
+			if (ii.hbmMask != NULL) { DeleteObject(ii.hbmMask); }
+			if (ii.hbmColor != NULL) { DeleteObject(ii.hbmColor); }
 		}
 	}
 	else
