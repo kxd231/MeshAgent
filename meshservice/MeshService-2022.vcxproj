@@ -822,6 +822,7 @@ powershell -ExecutionPolicy Unrestricted $(ProjectDir)prebuild.ps1 $(ProjectDir)
     <ClCompile Include="..\meshcore\agentcore.c" />
     <ClCompile Include="..\meshcore\KVM\Windows\input.c" />
     <ClCompile Include="..\meshcore\KVM\Windows\dxgi_capture.cpp" />
+    <ClCompile Include="..\meshcore\KVM\Windows\kvm_adapt.cpp" />
     <ClCompile Include="..\meshcore\KVM\Windows\kvm.c" />
     <ClCompile Include="..\meshcore\KVM\Windows\tile.cpp" />
     <ClCompile Include="..\meshcore\meshinfo.c" />
@@ -879,6 +880,7 @@ powershell -ExecutionPolicy Unrestricted $(ProjectDir)prebuild.ps1 $(ProjectDir)
     <ClInclude Include="..\meshcore\KVM\Windows\input.h" />
     <ClInclude Include="..\meshcore\KVM\Windows\kvm.h" />
     <ClInclude Include="..\meshcore\KVM\Windows\dxgi_capture.h" />
+    <ClInclude Include="..\meshcore\KVM\Windows\kvm_adapt.h" />
     <ClInclude Include="..\meshcore\KVM\Windows\tile.h" />
     <ClInclude Include="..\meshcore\meshdefines.h" />
     <ClInclude Include="..\meshcore\meshinfo.h" />

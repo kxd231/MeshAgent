@@ -628,6 +628,7 @@ static int kvm_dxgi_frame(void **buffer, long long *bufferSize, long *mouseMove,
 	char desk[64];
 	int sw, sh, want, changed = 0, gotImage = 0, fed = 0, kind, drawn = 0;
 	int forceFull = (flags & KVM_CAPTURE_FORCE_FULL) != 0;
+	int wantImage = (flags & KVM_CAPTURE_WANT_IMAGE) != 0; // WA-2: a picture is needed although nothing changed (sharpening); the capture still waits the normal timeout for a new frame
 	unsigned int timeout;
 	double acquireStart, acquireMs, outStart;
 	dxgi_result r;
@@ -834,7 +835,7 @@ static int kvm_dxgi_frame(void **buffer, long long *bufferSize, long *mouseMove,
 		fed = 1;
 	}
 
-	if (!gotImage && !fed && !changed && !forceFull)
+	if (!gotImage && !fed && !changed && !forceFull && !wantImage)
 	{
 #ifdef KVM_STATS_LOG
 		// Safety net of the measurement branch, see dx_stale_compare()
@@ -1021,7 +1022,7 @@ char* alloc_tile_packet(int x, int y, DWORD jpegSize, long long *bufferSize, int
 
 #ifdef _TURBOJPEG
 // Encodes the tile as JPEG directly from the bottom-up desktop buffer using TurboJPEG. Returns 0 on success.
-int calc_opt_compr_send_turbo(int x, int y, int captureWidth, int captureHeight, void* desktop, void ** buffer, long long *bufferSize)
+int calc_opt_compr_send_turbo(int x, int y, int captureWidth, int captureHeight, void* desktop, void ** buffer, long long *bufferSize, int quality, int subsamp)
 {
 	unsigned char *jpegBuf = NULL;
 	size_t jpegSize = 0;
@@ -1033,8 +1034,8 @@ int calc_opt_compr_send_turbo(int x, int y, int captureWidth, int captureHeight,
 	unsigned char *src = (unsigned char*)desktop + ((size_t)(adjust_screen_size(SCALED_HEIGHT) - y - captureHeight) * pitch) + ((size_t)x * PIXEL_SIZE);
 
 	if (tjCompressor == NULL && (tjCompressor = tj3Init(TJINIT_COMPRESS)) == NULL) { KVMDEBUG("tj3Init() failed", 0); return 1; }
-	if (tj3Set(tjCompressor, TJPARAM_QUALITY, (int)encCompression) != 0 ||
-		tj3Set(tjCompressor, TJPARAM_SUBSAMP, KVM_TJ_SUBSAMP) != 0 ||
+	if (tj3Set(tjCompressor, TJPARAM_QUALITY, quality) != 0 ||
+		tj3Set(tjCompressor, TJPARAM_SUBSAMP, subsamp) != 0 ||
 		tj3Set(tjCompressor, TJPARAM_FASTDCT, 1) != 0 ||
 		tj3Set(tjCompressor, TJPARAM_BOTTOMUP, 1) != 0)
 	{
@@ -1064,7 +1065,7 @@ int calc_opt_compr_send_turbo(int x, int y, int captureWidth, int captureHeight,
 #endif
 
 // This function returns 0 and *buffer != NULL if everything was good. retval = jpegsize if the captured image was too large.
-int calc_opt_compr_send(int x, int y, int captureWidth, int captureHeight, void* desktop, void ** buffer, long long *bufferSize) 
+int calc_opt_compr_send(int x, int y, int captureWidth, int captureHeight, void* desktop, void ** buffer, long long *bufferSize, int quality, int subsamp) 
 {
 	BITMAPINFO bmpInfo;
 	LARGE_INTEGER Offset;
@@ -1079,7 +1080,7 @@ int calc_opt_compr_send(int x, int y, int captureWidth, int captureHeight, void*
 	// JPEG is encoded with TurboJPEG, if that fails we fall back to GDI+ below.
 	if ((encType == 1 || encType == 4) && (PIXEL_SIZE == 4 || PIXEL_SIZE == 3))
 	{
-		if (calc_opt_compr_send_turbo(x, y, captureWidth, captureHeight, desktop, buffer, bufferSize) == 0) return 0;
+		if (calc_opt_compr_send_turbo(x, y, captureWidth, captureHeight, desktop, buffer, bufferSize, quality, subsamp) == 0) return 0;
 	}
 #endif
 
@@ -1217,6 +1218,23 @@ int calc_opt_compr_send(int x, int y, int captureWidth, int captureHeight, void*
 extern "C"
 {
 
+// Quality and chroma subsampling for a tile class (kvm_adapt.h). Without WA-2 every tile gets the quality of the user and the normal subsampling.
+#ifdef _TURBOJPEG
+#define KVM_FULL_SUBSAMP ((int)KVM_TJ_SUBSAMP)
+#else
+#define KVM_FULL_SUBSAMP 0
+#endif
+static void tile_encode_params(int cls, int *quality, int *subsamp)
+{
+#ifdef KVM_ADAPT_ENABLED
+	kvm_adapt_params(cls, (int)TJSAMP_420, KVM_FULL_SUBSAMP, quality, subsamp);
+#else
+	(void)cls;
+	*quality = (int)encCompression;
+	*subsamp = KVM_FULL_SUBSAMP;
+#endif
+}
+
 //Fetches the encoded jpeg tile at the given location. The neighboring tiles are coalesed to form a larger jpeg before returning.
 int get_tile_at(int x, int y, void** buffer, long long *bufferSize, void *desktop, int row, int col)
 {	
@@ -1227,6 +1245,7 @@ int get_tile_at(int x, int y, void** buffer, long long *bufferSize, void *deskto
 	int r_y = y;
 	int captureWidth = TILE_WIDTH;
 	int captureHeight = TILE_HEIGHT;
+	int startClass, quality, subsamp;
 
 	*buffer = NULL;			// If anything fails, this will be the indication.
 	*bufferSize = 0;
@@ -1234,11 +1253,14 @@ int get_tile_at(int x, int y, void** buffer, long long *bufferSize, void *deskto
 	if (tileInfo[row][col].flags == (char)TILE_TODO) // First check whether the tile-crc needs to be calcualted or not.
 	{ 
 		// Compute CRC on the contents of the bitmap; Proceed with image encoding only if the CRC is different.
-		if ((CRC = tile_crc(x, y, desktop, TILE_WIDTH, TILE_HEIGHT)) == tileInfo[row][col].crc) return 0;
+		CRC = tile_crc(x, y, desktop, TILE_WIDTH, TILE_HEIGHT);
+		kvm_adapt_note_crc(&tileInfo[row][col], CRC); // WA-2: the content of the tile was looked at (tileInfo.crc still has the old value)
+		if (CRC == tileInfo[row][col].crc) return 0;
 		tileInfo[row][col].crc = CRC; // Update the tile CRC in the global data structure.
 	}
 
 	tileInfo[row][col].flags = (char)TILE_MARKED_NOT_SENT;
+	startClass = kvm_adapt_class(&tileInfo[row][col]); // Only tiles of the same class are coalesced into one rectangle (one quality)
 
 
 	// COALESCING SECTION
@@ -1254,11 +1276,19 @@ int get_tile_at(int x, int y, void** buffer, long long *bufferSize, void *deskto
 		if (tileInfo[row][rightcol].flags == (char)TILE_TODO) {
 			// Compute CRC on the contents of the bitmap.
 			CRC = tile_crc(r_x, y, desktop, TILE_WIDTH, TILE_HEIGHT);
+			kvm_adapt_note_crc(&tileInfo[row][rightcol], CRC);
 		}
 
 		if (CRC != tileInfo[row][rightcol].crc || tileInfo[row][rightcol].flags == (char)TILE_MARKED_NOT_SENT) // If the tile has changed, increment the capturewidth.
 		{
 			tileInfo[row][rightcol].crc = CRC; 
+			if (kvm_adapt_class(&tileInfo[row][rightcol]) != startClass)
+			{
+				// Changed, but another quality: it is sent by itself later (marked, not "don't send": the change must not get lost)
+				tileInfo[row][rightcol].flags = (char)TILE_MARKED_NOT_SENT;
+				--rightcol;
+				break;
+			}
 			// Here we check whether the size of the coalesced bitmap is greater than the threshold (65500)
 			//if ((captureWidth + TILE_WIDTH) * TILE_HEIGHT * PIXEL_SIZE / COMPRESSION_RATIO > 65500) { 
 			//	tileInfo[row][rightcol].flags = (char)TILE_MARKED_NOT_SENT;
@@ -1297,12 +1327,20 @@ int get_tile_at(int x, int y, void** buffer, long long *bufferSize, void *deskto
 			{
 				// Compute CRC on the contents of the bitmap; Proceed with image encoding only if the CRC is different.
 				CRC = tile_crc(r_x, r_y, desktop, TILE_WIDTH, TILE_HEIGHT);
+				kvm_adapt_note_crc(&tileInfo[botrow][rcol], CRC);
 			}
 
 			if (CRC != tileInfo[botrow][rcol].crc || tileInfo[botrow][rcol].flags == (char)TILE_MARKED_NOT_SENT)
 			{
 				tileInfo[botrow][rcol].flags = (char)TILE_MARKED_NOT_SENT;
 				tileInfo[botrow][rcol].crc = CRC;
+				if (kvm_adapt_class(&tileInfo[botrow][rcol]) != startClass)
+				{
+					// Changed, but another quality: this row does not join the rectangle; the tile stays marked and is sent by itself later
+					fail = 1;
+					botrow--;
+					break;
+				}
 				r_x += TILE_WIDTH;
 			}
 			else
@@ -1356,7 +1394,8 @@ int get_tile_at(int x, int y, void** buffer, long long *bufferSize, void *deskto
 	// This loop is used to adjust the COMPRESSION_RATIO. This loop runs only once most of the time.
 	do {
 		// retval here is 0 if everything was good. It is > 0 if it contains the size of the jpeg that was created and not sent.
-		retval = calc_opt_compr_send(x, y, captureWidth, captureHeight, desktop, buffer, bufferSize);
+		tile_encode_params(startClass, &quality, &subsamp);
+		retval = calc_opt_compr_send(x, y, captureWidth, captureHeight, desktop, buffer, bufferSize, quality, subsamp);
 		if (retval == 0 && *bufferSize == 0) break;
 		if (retval != 0)
 		{
@@ -1394,10 +1433,20 @@ int get_tile_at(int x, int y, void** buffer, long long *bufferSize, void *deskto
 				tileInfo[r][c].flags = (char)TILE_SENT;
 			}
 		}
+		kvm_adapt_sent(row, col, botrow, rightcol, startClass, quality, subsamp != KVM_FULL_SUBSAMP, *bufferSize);
 	}
 
 	return retval;
 }
+
+#ifdef KVM_ADAPT_ENABLED
+// WA-2 sharpening: encodes tiles of the current picture with the quality of the user and the normal subsampling. Returns 0 and a packet in *buffer on success.
+int kvm_adapt_encode_sharp(int x, int y, int w, int h, void *desktop, void **buffer, long long *bufferSize, int *quality)
+{
+	*quality = (encCompression < 1) ? 1 : (encCompression > 90 ? 90 : (int)encCompression);
+	return (calc_opt_compr_send(x, y, w, h, desktop, buffer, bufferSize, *quality, KVM_FULL_SUBSAMP) == 0 && *buffer != NULL) ? 0 : 1;
+}
+#endif
 
 // This function captures the entire desktop buffer to scan. It runs on the capture thread while the main thread may
 // still encode the previous frame, so it reports the bytes per pixel of this frame in *pixelSize instead of changing

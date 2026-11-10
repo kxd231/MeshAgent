@@ -627,6 +627,7 @@ int kvm_server_inputdata(char *block, int blocklen, ILibKVM_WriteHandler writeHa
 			{
 				if ((tileInfo[row] = (struct tileInfo_t *)malloc(TILE_WIDTH_COUNT * sizeof(struct tileInfo_t))) == NULL)
 					ILIBCRITICALEXIT(254);
+				for (col = 0; col < TILE_WIDTH_COUNT; col++) { kvm_tile_init(&tileInfo[row][col]); }
 			}
 		}
 		for (row = 0; row < TILE_HEIGHT_COUNT; row++)
@@ -837,8 +838,7 @@ void kvm_server_SetResolution(ILibKVM_WriteHandler writeHandler, void *reserved)
 	{
 		for (col = 0; col < TILE_WIDTH_COUNT; col++)
 		{
-			tileInfo[row][col].crc = 0xFF;
-			tileInfo[row][col].flags = 0;
+			kvm_tile_init(&tileInfo[row][col]);
 		}
 	}
 	InterlockedExchange(&gKvmFullFrame, 1); // The next frame has to check every tile
@@ -1037,6 +1037,7 @@ static void kvm_stats_flush(int final)
 	gStats.frames = gStats.full = gStats.partial = gStats.unchanged = gStats.gdi = gStats.dxgi = gStats.tiles = gStats.moveFrames = gStats.captureFrames = gStats.copyFrames = gStats.outFrames = gStats.staleChecks = gStats.staleSuspects = 0;
 	gStats.bytes = gStats.writeUs = gStats.dirtyRects = gStats.dirtyArea = gStats.moveRects = gStats.moveArea = gStats.moveMaxArea = gStats.captureUs = gStats.copyUs = gStats.outUs = gStats.staleUs = 0;
 	gStats.periodStart = now;
+	kvm_adapt_stats_flush(final);
 }
 
 static void kvm_stats_start(void)
@@ -1131,6 +1132,7 @@ void kvm_capture_start(long *mouseMove)
 	memcpy(gCapture.mouseMove, mouseMove, sizeof(gCapture.mouseMove));
 	gCapture.generation = gGeometryGeneration;
 	gCapture.flags = InterlockedExchange(&gKvmFullFrame, 0) ? KVM_CAPTURE_FORCE_FULL : 0;
+	if (kvm_adapt_want_image()) { gCapture.flags |= KVM_CAPTURE_WANT_IMAGE; } // lossy tiles are due for sharpening: a picture is needed even if nothing changed
 	SetEvent(gCapture.startEvent);
 }
 
@@ -1260,7 +1262,7 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 	int sentHideCursor = 0;
 	int captureInFlight = 0, lastSentTiles = 0, frameGeneration = 0, framePixelSize = 0, dropFrame = 0;
 	kvm_frame_info frameInfo;
-	int captureResult = 0, idleWait = 0, aborted = 0;
+	int captureResult = 0, idleWait = 0, aborted = 0, frameTimer = 0;
 
 	gPendingPackets = ILibQueue_Create();
 	KVM_InitMouseCursors(gPendingPackets);
@@ -1340,6 +1342,7 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 #ifdef KVM_STATS_LOG
 	kvm_stats_start();
 #endif
+	kvm_adapt_session_start();
 
 	// Send the list of displays
 	kvm_send_display_list(writeHandler, reserved);
@@ -1384,6 +1387,7 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 #endif
 			}
 		}
+		kvm_adapt_iteration(); // WA-2: regulator window, tiles due for sharpening
 		if (!captureInFlight)
 		{
 			if (!kvm_prepare_capture(writeHandler, reserved, mouseMove, &sentHideCursor))
@@ -1423,6 +1427,7 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 				PIXEL_SIZE = framePixelSize;
 				dropFrame = (frameGeneration != gGeometryGeneration) || !desktop_buffer_fits(desktopsize, PIXEL_SIZE);
 				aborted = 0;
+				if (!dropFrame) { kvm_adapt_frame_begin(); }
 
 				// A partial frame lists the tiles that can have changed, the others are not checked.
 				if (!dropFrame && frameInfo.kind == KVM_FRAME_PARTIAL && frameInfo.tileDirty != NULL)
@@ -1496,6 +1501,7 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 							statTiles++;
 							statBytes += tilesize;
 							statWriteUs += ((w1.QuadPart - w0.QuadPart) * 1000000LL) / kvm_qpc_frequency();
+							kvm_adapt_note_write((unsigned int)(((w1.QuadPart - w0.QuadPart) * 1000000LL) / kvm_qpc_frequency()), tilesize);
 #endif
 							free(buf);
 						}
@@ -1503,6 +1509,36 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 						{
 							free(buf); // The session is closing
 						}
+					}
+				}
+
+				// WA-2: tiles that were sent with a lower quality while they moved and have been still for a while are sent again in full quality
+				// (an ordinary picture command). Only after a frame that was processed to the end.
+				if (!dropFrame && !aborted && !g_shutdown)
+				{
+					long long sharpenBudget = kvm_adapt_sharpen_budget();
+					void *sharpBuf = NULL;
+					long long sharpSize = 0;
+					while (sharpenBudget > 0 && !g_shutdown && kvm_adapt_sharpen_next(desktop, sharpenBudget, &sharpBuf, &sharpSize))
+					{
+						int sharpResult;
+#ifdef KVM_STATS_LOG
+						LARGE_INTEGER sw0, sw1;
+						QueryPerformanceCounter(&sw0);
+#endif
+						sharpResult = writeHandler((char *)sharpBuf, (int)sharpSize, reserved);
+#ifdef KVM_STATS_LOG
+						QueryPerformanceCounter(&sw1);
+						statTiles++;
+						statBytes += sharpSize;
+						statWriteUs += ((sw1.QuadPart - sw0.QuadPart) * 1000000LL) / kvm_qpc_frequency();
+						kvm_adapt_note_write((unsigned int)(((sw1.QuadPart - sw0.QuadPart) * 1000000LL) / kvm_qpc_frequency()), sharpSize);
+#endif
+						free(sharpBuf);
+						sharpBuf = NULL;
+						sharpenBudget -= sharpSize;
+						if (sharpResult == ILibTransport_DoneState_INCOMPLETE) { g_pause = 1; break; }
+						if (sharpResult == ILibTransport_DoneState_ERROR) { g_shutdown = 1; break; }
 					}
 				}
 
@@ -1531,11 +1567,12 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 
 		// We can't go full speed here, we need to slow this down.
 		// When tiles were sent, the time spent capturing and encoding counts towards the frame rate timer.
-		height = FRAME_RATE_TIMER;
+		frameTimer = kvm_adapt_frame_pause(FRAME_RATE_TIMER); // WA-2: stretched while the link is congested
+		height = frameTimer;
 		if (sentTiles)
 		{
 			DWORD elapsed = timeGetTime() - frameStart;
-			height = (elapsed >= (DWORD)FRAME_RATE_TIMER) ? 0 : (FRAME_RATE_TIMER - (int)elapsed);
+			height = (elapsed >= (DWORD)frameTimer) ? 0 : (frameTimer - (int)elapsed);
 		}
 		if (idleWait)
 		{
@@ -1561,6 +1598,7 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 #ifdef KVM_STATS_LOG
 	kvm_stats_flush(1);
 #endif
+	kvm_adapt_session_end();
 
 	// Stop the capture thread
 	if (captureInFlight)

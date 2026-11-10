@@ -160,6 +160,8 @@ static int gdi_grab(const RECT &rc, dib_t *d)
 struct cmp_t
 {
 	long long mismatch, mismatchBox, maxDelta, a3gdiZero, a3gdiNonZero, a3dxZero, a3dxNonZero;
+	long long hist[4];					// differing pixels by the largest channel delta: 1, 2-8, 9-64, over 64
+	int bx0, by0, bx1, by1;				// rectangle that contains all differences (bx0 > bx1: none)
 	int nfirst, fx[10], fy[10];
 	unsigned int fgdi[10], fdx[10];
 };
@@ -168,6 +170,7 @@ struct cmp_t
 static void compare_dibs(const dib_t *g, const dib_t *d, int cx, int cy, int box, cmp_t *r)
 {
 	memset(r, 0, sizeof(*r));
+	r->bx0 = g->w; r->by0 = g->h; r->bx1 = -1; r->by1 = -1;
 	for (int m = 0; m < g->h; m++)
 	{
 		int y = g->h - 1 - m;
@@ -189,12 +192,17 @@ static void compare_dibs(const dib_t *g, const dib_t *d, int cx, int cy, int box
 					r->nfirst++;
 				}
 				r->mismatch++;
+				if (x < r->bx0) { r->bx0 = x; } if (x > r->bx1) { r->bx1 = x; }
+				if (y < r->by0) { r->by0 = y; } if (y > r->by1) { r->by1 = y; }
+				long long pm = 0;
 				for (int c = 0; c < 3; c++)
 				{
 					long long dl = (long long)pg[c] - pd[c];
 					if (dl < 0) { dl = -dl; }
 					if (dl > r->maxDelta) { r->maxDelta = dl; }
+					if (dl > pm) { pm = dl; }
 				}
+				r->hist[pm <= 1 ? 0 : (pm <= 8 ? 1 : (pm <= 64 ? 2 : 3))]++;
 			}
 		}
 	}
@@ -204,6 +212,7 @@ static void print_cmp(const cmp_t *r)
 {
 	printf("\"mismatch\":%lld,\"mismatch_cursor_box\":%lld,\"max_delta\":%lld,", r->mismatch, r->mismatchBox, r->maxDelta);
 	printf("\"alpha_gdi\":{\"zero\":%lld,\"nonzero\":%lld},\"alpha_dxgi\":{\"zero\":%lld,\"nonzero\":%lld},", r->a3gdiZero, r->a3gdiNonZero, r->a3dxZero, r->a3dxNonZero);
+	printf("\"diff_rect\":[%d,%d,%d,%d],\"delta_hist\":{\"d1\":%lld,\"d2_8\":%lld,\"d9_64\":%lld,\"d65_255\":%lld},", r->bx1 < 0 ? 0 : r->bx0, r->bx1 < 0 ? 0 : r->by0, r->bx1 < 0 ? 0 : r->bx1, r->bx1 < 0 ? 0 : r->by1, r->hist[0], r->hist[1], r->hist[2], r->hist[3]);
 	printf("\"first\":[");
 	for (int i = 0; i < r->nfirst; i++)
 	{
@@ -522,16 +531,18 @@ static int mode_compare(int monitor)
 	if (idx < 0) { printf("{\"mode\":\"compare\",\"error\":\"no such monitor\"}\n"); return 2; }
 	RECT rc = g_mon[idx].rc;
 	int w = rc.right - rc.left, h = rc.bottom - rc.top;
-	dib_t gdi, dx;
-	cmp_t cmp;
+	dib_t gdi, dx, gdi2;
+	cmp_t cmp, cmp2;
 	dxgi_frame f;
 	dxgi_info di;
 	POINT pt = { 0, 0 };
 	HWND hwnd;
 	HRESULT initHr, acqHr = S_OK;
-	int ok = 0;
+	int ok = 0, extraImages = 0, haveGdi2 = 0;
 
 	memset(&cmp, 0, sizeof(cmp));
+	memset(&cmp2, 0, sizeof(cmp2));
+	memset(&gdi2, 0, sizeof(gdi2));
 	memset(&f, 0, sizeof(f));
 	g_animate = 0;
 	hwnd = create_test_window(rc);
@@ -545,10 +556,30 @@ static int mode_compare(int monitor)
 	{
 		ra = acquire_image(hwnd, &dx, 4000, &f);
 		acqHr = dxgi_capture_last_hr();
+		// The first image can be taken before the window has been painted completely (background first, text later): keep taking the
+		// changes for 300 ms (the module applies them to the same image), then compare. A second BitBlt 200 ms later shows content that still changes.
+		if (ra == DXGI_CAP_OK)
+		{
+			unsigned long long until = now_ms() + 300;
+			dxgi_frame f2;
+			while (now_ms() < until)
+			{
+				pump();
+				memset(&f2, 0, sizeof(f2));
+				if (dxgi_capture_acquire(50, dib_top(&dx), -(ptrdiff_t)dx.w * 4, 0, &f2) == DXGI_CAP_OK) { extraImages++; }
+			}
+		}
 		pump_for(100);
 		gdi_grab(rc, &gdi);
 		GetCursorPos(&pt);
 		compare_dibs(&gdi, &dx, pt.x - rc.left, pt.y - rc.top, 32, &cmp);
+		if (dib_create(&gdi2, w, h))
+		{
+			pump_for(200);
+			gdi_grab(rc, &gdi2);
+			compare_dibs(&gdi, &gdi2, pt.x - rc.left, pt.y - rc.top, 32, &cmp2);
+			haveGdi2 = 1;
+		}
 		ok = (ra == DXGI_CAP_OK && cmp.mismatch == 0);
 	}
 	printf("{\"mode\":\"compare\",\"monitor\":");
@@ -556,8 +587,10 @@ static int mode_compare(int monitor)
 	printf(",\"size\":\"%dx%d\",\"init\":\"%s\",\"init_hr\":\"0x%08x\",\"acquire\":\"%s\",\"acquire_hr\":\"0x%08x\",\"full_copy\":%d,\"copy_us\":%u,\"sysmem\":%d,\"cursor\":{\"x\":%ld,\"y\":%ld},",
 		w, h, dxgi_result_name(ri), (unsigned int)initHr, dxgi_result_name(ra), (unsigned int)acqHr, f.fullCopy, f.copyUs, di.systemMemory, pt.x - rc.left, pt.y - rc.top);
 	if (ri == DXGI_CAP_OK && ra == DXGI_CAP_OK) { print_cmp(&cmp); } else { printf("\"mismatch\":-1"); }
+	printf(",\"extra_images_300ms\":%d,\"gdi_second_blit_diff\":%lld,\"gdi_second_blit_rect\":[%d,%d,%d,%d]", extraImages, haveGdi2 ? cmp2.mismatch : -1, cmp2.bx1 < 0 ? 0 : cmp2.bx0, cmp2.bx1 < 0 ? 0 : cmp2.by0, cmp2.bx1 < 0 ? 0 : cmp2.bx1, cmp2.bx1 < 0 ? 0 : cmp2.by1);
 	printf(",\"pass\":%d}\n", ok);
 	dxgi_capture_shutdown();
+	dib_free(&gdi2);
 	dib_free(&gdi);
 	dib_free(&dx);
 	destroy_test_window(hwnd);

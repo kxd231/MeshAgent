@@ -19,6 +19,7 @@ limitations under the License.
 #include <Windows.h>
 #include <tchar.h>
 #include "dxgi_capture.h" // KVM_STATS_LOG / KVM_DXGI_ENABLED, and the capture module interface on x64
+#include "kvm_adapt.h"   // KVM_ADAPT_ENABLED and the WA-2 interface (stubs elsewhere)
 
 #if defined(_cplus_plus) || defined(__cplusplus) || defined(_cplusplus)
 extern "C"
@@ -28,7 +29,29 @@ extern "C"
 struct tileInfo_t {
 	int crc;
 	char flags; // See TILE_FLAGS_ENUM
+#ifdef KVM_ADAPT_ENABLED
+	// WA-2 (kvm_adapt.cpp). crc means "what the viewer has" (0xFF after a refresh); contentCrc is the content last seen, a refresh does not touch it.
+	unsigned char sentQ;		// JPEG quality of the last send, 0 = never sent, 100 = not lossy
+	unsigned char sentSub;		// 1 = the last send was chroma subsampled below the normal subsampling
+	unsigned char streak;		// changes of the content in a row, each at most KVM_ADAPT_MOTION_MS after the previous one
+	unsigned char noted;		// low byte of the frame stamp: the content of this frame was already looked at
+	unsigned char refresh;		// the tile is sent only because of a refresh / new geometry (the content did not change)
+	int contentCrc;
+	unsigned int lastChange;	// timeGetTime() of the last change of the content
+#endif
 };
+
+// Initial state of a tile: the viewer has nothing yet (crc 0xFF), WA-2 state empty.
+static __inline void kvm_tile_init(struct tileInfo_t *t)
+{
+	t->crc = 0xFF;
+	t->flags = 0;
+#ifdef KVM_ADAPT_ENABLED
+	t->sentQ = 0; t->sentSub = 0; t->streak = 0; t->noted = 0; t->refresh = 0;
+	t->contentCrc = 0x7FFFFFFF;
+	t->lastChange = 0;
+#endif
+}
 
 enum TILE_FLAGS_ENUM {
 	TILE_TODO,				// The tile CRC needs to be calculated.

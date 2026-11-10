@@ -161,3 +161,47 @@ The number of GDI objects of the `-kvm` process stays flat (6-8; the old build g
 the images were read from the mapped system memory surface. The GPU path (staging texture, `CopyResource`/`CopySubresourceRegion`, `Map` with `RowPitch`, the bounding-box copy) and the copying of the
 destinations of moved rectangles were **never executed in practice** (`move_rects` was always 0). Before DXGI is used on machines with a GPU, run `kvm-dxgi-check compare` and `rects`
 (`copy_path` must say `staging`, `bbox_tested` and `o2_tested` must be 1, `verified` 1) on such a machine.
+
+## 6. Quality that depends on motion, sharpening and the congestion regulator (WA-2)
+
+Files: `kvm_adapt.h`, `kvm_adapt.cpp` (new), hooks in `tile.cpp`, `tile.h`, `kvm.c`; the protocol and the server are not changed (a sharpened tile is an ordinary picture command).
+Active only in the x64 `MeshService` build with TurboJPEG (`KVM_ADAPT_ENABLED` = `_TURBOJPEG` && `KVM_STATS_LOG` && not `KVM_ADAPT_DISABLE`), for JPEG types 1 and 4 with 24/32 bit pixels.
+In every other build (x86, ARM64, MeshConsole, GDI+ without TurboJPEG) the functions are stubs: every tile is "full class", nothing is sharpened, the frame pause is the frame-rate timer, i.e. the behaviour of WA-1.
+
+**Behaviour.**
+1. *Motion class.* A tile whose content changed in at least `KVM_ADAPT_MOTION_STREAK` (2) frames in a row, each change at most `KVM_ADAPT_MOTION_MS` (250 ms) after the previous one, while at least
+   `KVM_ADAPT_MOTION_TILES` (16) tiles changed in the previous frame, is sent with JPEG quality `min(quality of the user, KVM_ADAPT_Q_MOTION = 50)` and 4:2:0 chroma subsampling. Typing and a blinking cursor stay in the full class (sharp).
+   `get_tile_at` joins neighbouring tiles into one rectangle only within one class; a changed neighbour of another class is marked for sending by itself (never "don't send": a change must not get lost).
+2. *Sharpening.* A tile that was sent lossy (motion class) and has not changed for `KVM_ADAPT_SETTLE_MS` (150 ms) is encoded again from the current picture with the quality of the user and the normal subsampling, in runs of up to `KVM_ADAPT_SHARPEN_RUN` (8) tiles of a row,
+   at most `KVM_ADAPT_SHARPEN_BYTES` (96 KiB) per frame (a quarter at regulator level >= 4, a half at levels 1-3). When the content of the screen has not changed for `KVM_ADAPT_SETTLE_MS` and a lossy tile is due, the capture is asked for an image (`KVM_CAPTURE_WANT_IMAGE`): it waits for a new frame as usual (`KVM_DXGI_TIMEOUT_MS`) and, if none comes, returns the unchanged persistent image with an empty change map, so that an idle screen is still sharpened (about 0.2-0.25 s after the last change of the screen). While the screen changes the flag is not set. A tile that changes again before it is sharpened is simply handled as a normal change.
+3. *Congestion regulator* (one per KVM session of the process, i.e. one for all viewers of that desktop). The signal is the share of the time the loop is blocked in the write to the pipe, in windows of `KVM_ADAPT_WINDOW_MS` (500 ms): at or above `KVM_ADAPT_CONGEST_PCT` (15 %) the level goes up (max 5),
+   after `KVM_ADAPT_CALM_WINDOWS` (3) windows at or below `KVM_ADAPT_CALM_PCT` (3 %) it goes down. Level 1-3: motion quality 40 / 30 / 20 (step `KVM_ADAPT_Q_STEP` 10, floor `KVM_ADAPT_Q_MOTION_MIN` 20), and a tile that is only sent again after a refresh (REFRESH, new geometry) is also sent in the motion class and sharpened later.
+   Level 4-5: additionally the frame pause is multiplied by 2 / 4 (at most `KVM_ADAPT_MAX_PAUSE_MS` 250 ms) and, while the output of the loop exceeds `KVM_ADAPT_RATE_FRACTION_PCT` (70 %) of the rate that the link accepted while it was saturated (a token bucket, measured from the write-block windows), the pause is stretched, at most to `KVM_ADAPT_MAX_PAUSE_MS`. This does not cap the output at 70 %: the capture still runs at least 4 times a second and a debt of more than 2 s of tokens is forgiven, so that a full refresh can never be starved.
+
+**Switches.** `/DKVM_ADAPT_DISABLE` (compile time; workflow input `extra_cl`) builds the WA-1 behaviour (the log stays). `MESH_KVM_ADAPT=0` in the environment of the service (same registry value as `MESH_KVM_FORCE_GDI`, then restart the service) switches it off at run time. Every threshold above can be overridden with `/D<NAME>=<value>`.
+
+**Log** (same file as WA-1): `adapt start enabled=<0|1> reason=<on|env> q_user=.. type=.. q_motion=.. motion_ms=.. settle_ms=..` (`q_user` is the quality before the settings of the viewer arrive; the quality used is the live one),
+`adapt level from=.. to=.. block=<x.y>% accept_kbps=.. q_motion=.. since_start_ms=..`, `adapt rate_cap kbps=..`, and one `adapt stats` line after every `stats` line:
+`level_end level_max q_motion rects_motion rects_full bytes_motion bytes_full sharpen_rects sharpen_tiles sharpen_bytes want_image lossy_end settle_ms_avg settle_ms_max block_pct_max accept_kbps pause_mult rate_skips`
+(a separate line instead of extra fields of `stats`, so that the WA-1 line keeps its format). With `MESH_KVM_ADAPT=0` the levels are still computed and logged, but have no effect.
+
+**Measured** (same machines and settings as section 5: JPEG q80, 100 %, frame timer 30 ms, 10 s per run, n = 3, mean (min-max); control = the same binary with `MESH_KVM_ADAPT=0`, measured right after the series with WA-2 on, test server before its rebuild of 23:03 CET):
+
+| machine / scenario | bandwidth, WA-2 on | bandwidth, control | change | pictures/s on / control | CPU of the KVM child on / control |
+|---|---|---|---|---|---|
+| Windows 11 VM, scroll | 227.6 KiB/s (220-234) | 392.1 (378-406) | **-42 %** | 22.4 (22.2-22.6) / 22.7 (21.4-23.7) | 21.2 % / 21.0 % |
+| Windows 11 VM, video | 614.5 (611-618) | 1139 (1131-1150) | **-46 %** | 27.6 (27.4-27.8) / 27.5 (27.2-27.7) | 31.6 % / 33.8 % |
+| Windows 11 VM, typing | 19.98 | 19.99 | 0 | 11.90 / 11.90 | 6.9 % / 8.3 % |
+| Windows 11 VM, static | 0.94 | 0.97 | 0 | - | 1.7 % / 1.5 % |
+| Windows 10 LTSC VM, scroll | 238.2 (236-241) | 459.9 (447-467) | **-48 %** | 26.2 (26.0-26.5) / 28.4 (27.6-28.8) | 9.1 % / 10.0 % |
+| Windows 10 LTSC VM, video | 737.5 (726-745) | 1356 (1348-1363) | **-46 %** | 27.9 (27.7-28.2) / 31.5 (31.4-31.6) | 18.9 % / 21.9 % |
+| Windows 10 LTSC VM, typing | 22.44 | 22.51 | 0 | 11.90 / 11.91 | 0.7 % / 1.2 % |
+
+On the Windows 10 machine the number of generator frames that the viewer sees per second is 8-11 % lower with WA-2 (the ranges do not overlap, run-to-run noise there is about 4-6 %); the number of pictures the agent sends per 10 s is the same in both modes (`stats` lines), the cause is not isolated (see the report `docs/kvm-dev/wa-2.md`).
+The idle sharpening works: `settle_ms_avg` 153-168 ms, after a scroll or a video the screen is back to full quality within about 0.2 s (see also the settle test in the report).
+
+Physical laptop with a GPU (AMD Radeon, `sysmem=0`, 1920x1200 at 60 Hz, WA-2 on, no control measured): scroll 353 KiB/s at 28.0 pictures/s, video 749 KiB/s at **30.9** pictures/s (above 30: the frame timer allows about 33), CPU of the KVM child 24 % / 31 %. The first full image of a session (about 2.6 MB) is sent with the default quality 50 (the settings of the viewer arrive later) and is then sharpened step by step to the quality of the user: 0.77 s on average, up to 1.2 s on that machine. A single window of blocked pipe writes at the start no longer raises the regulator (two in a row are needed).
+
+Constrained link (client behind a `tc` ingress policer, video, Windows 11 VM, test server relay in 1-to-1 mode): at **5 Mb/s** WA-2 produces about 600 KiB/s, fits the link, and the frame delay stays at a median of 14-17 ms (P95 0.6-1.5 s); without WA-2 the delay grows by about 650 ms per second (median 11 s after 30 s). At 3 Mb/s WA-2 alone is not enough (median 15-16 s against 20-22 s without it): the regulator raises its level up to 5 within 1-3 s of the first blocked write, but on that server the first blocked write comes only after 13-28 s (kernel buffers on the way: send buffer of the server towards the viewer, receive buffer from the agent, send buffer of the agent; 10-20 MB in total), and with a smaller surplus it never comes within 45 s. **Conclusion: with this server the congestion signal reaches the agent too late, so the regulator alone does not keep the delay low on links below about 5 Mb/s; what helps there is the lower bandwidth of the motion class. A signal from the viewer (command 90 of WA-3) or a multiplexer with ACK is needed.** The regulator also needs two consecutive overloaded windows to leave level 0, so the first full image of a session no longer lowers the quality of the start image.
+
+**Not verified / limits.** x64 with TurboJPEG only (see above); in the GDI+ fallback the motion quality is not applied (GDI+ reads the global quality). One regulator for all viewers of the desktop: with several viewers the slowest one decides. The signal is the time blocked in the write to the pipe; whether that is a measure of the link of the viewer depends on the server (in the test server's 1-to-1 relay mode the server buffers several MB before it stops reading from the agent, so the first reaction comes late; see the report).
