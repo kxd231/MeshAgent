@@ -6,6 +6,11 @@ on:
   release:
     types: [ published ]
   workflow_dispatch:
+    inputs:
+      extra_cl:
+        description: 'Extra compiler options for the x64 agent build (CL environment variable), e.g. /DKVM_DXGI_DISABLE for a GDI-only A/B binary'
+        required: false
+        default: ''
 
 permissions:
   contents: write # upload the binary to the release
@@ -34,14 +39,33 @@ jobs:
 
       - name: Build Release x64
         shell: pwsh
+        env:
+          CL: ${{ inputs.extra_cl }}
         run: |
+          # /m:1 builds the projects one after the other: MeshService and MeshConsole both regenerate
+          # microscript\ILibDuktape_Commit.h in their pre-build event and fail when they do it at the same time.
           $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\amd64\MSBuild.exe' | Select-Object -First 1
-          & $vs MeshAgent-2022.sln /m /p:Configuration=Release /p:Platform=x64 /p:TurboJpegDir=C:\libjpeg-turbo64 /v:minimal
+          & $vs MeshAgent-2022.sln /m:1 /p:Configuration=Release /p:Platform=x64 /p:TurboJpegDir=C:\libjpeg-turbo64 /v:minimal
           if ($LASTEXITCODE -ne 0) { throw "MSBuild failed: $LASTEXITCODE" }
+
+      - name: Build kvm-dxgi-check.exe
+        shell: pwsh
+        run: |
+          # Stand-alone check tool for the DXGI capture (dxgi_capture.cpp without the agent). Not affected by extra_cl.
+          $env:CL = ''
+          New-Item -ItemType Directory -Force out | Out-Null
+          $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath | Select-Object -First 1
+          $vcvars = Join-Path $vsPath 'VC\Auxiliary\Build\vcvars64.bat'
+          $cl = 'cl /nologo /O2 /MT /EHsc /W3 /utf-8 /D_LINKVM /DKVM_DXGI /DKVM_DXGI_TOOL meshcore\KVM\Windows\dxgi_capture.cpp meshcore\KVM\Windows\tools\kvm_dxgi_check.cpp /Fo:out\ /Fe:out\kvm-dxgi-check.exe /link user32.lib gdi32.lib'
+          cmd /c "call `"$vcvars`" >nul && $cl"
+          if ($LASTEXITCODE -ne 0) { throw "kvm-dxgi-check build failed: $LASTEXITCODE" }
+          Remove-Item out\*.obj -ErrorAction SilentlyContinue
 
       - name: Size and hashes
         id: info
         shell: pwsh
+        env:
+          EXTRA_CL: ${{ inputs.extra_cl }}
         run: |
           $f = Get-ChildItem -Recurse -Filter MeshService64.exe | Sort-Object LastWriteTime -Descending | Select-Object -First 1
           New-Item -ItemType Directory -Force out | Out-Null
@@ -51,6 +75,9 @@ jobs:
           $sha256 = (Get-FileHash out\MeshService64.exe -Algorithm SHA256).Hash.ToLower()
           "MeshService64.exe size=$size`nsha384=$sha384`nsha256=$sha256`ncommit=$env:GITHUB_SHA" | Tee-Object out\MeshService64.exe.txt
           "## MeshService64.exe`n`n- commit: $env:GITHUB_SHA`n- size: $size`n- sha384: $sha384`n- sha256: $sha256" >> $env:GITHUB_STEP_SUMMARY
+          $tool = Get-FileHash out\kvm-dxgi-check.exe -Algorithm SHA256
+          "- kvm-dxgi-check.exe sha256: $($tool.Hash.ToLower())" >> $env:GITHUB_STEP_SUMMARY
+          "- extra_cl: $env:EXTRA_CL" >> $env:GITHUB_STEP_SUMMARY
 
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -63,4 +90,28 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$env:GITHUB_REF_NAME" out\MeshService64.exe out\MeshService64.exe.txt --clobber -R "$env:GITHUB_REPOSITORY"
+        run: gh release upload "$env:GITHUB_REF_NAME" out\MeshService64.exe out\MeshService64.exe.txt out\kvm-dxgi-check.exe --clobber -R "$env:GITHUB_REPOSITORY"
+
+  # Build check only: the DXGI capture is x64 only, the other platforms must still compile and behave as before.
+  # Nothing is uploaded. Runs for the same triggers as the main job (workflow_dispatch and release), never on push.
+  other-platforms:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: x86
+            runner: windows-2022
+          - platform: ARM64
+            runner: windows-11-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Build Release ${{ matrix.platform }}
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.Component.MSBuild -find 'MSBuild\Current\Bin\MSBuild.exe' | Select-Object -First 1
+          if (-not $vs) { $vs = 'msbuild' }
+          & $vs MeshAgent-2022.sln /m:1 /p:Configuration=Release /p:Platform=${{ matrix.platform }} /v:minimal
+          if ($LASTEXITCODE -ne 0) { throw "MSBuild failed: $LASTEXITCODE" }

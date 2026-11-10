@@ -354,14 +354,13 @@ void free_full_capture()
 	fullWidth = fullHeight = 0;
 }
 
-// Captures the screen at full resolution and downscales it to the scaled size. Returns 0 on success.
-int get_scaled_desktop_buffer(void **buffer, long long *bufferSize, int *pixelSize)
-{
-	int sw = adjust_screen_size(SCREEN_WIDTH), sh = adjust_screen_size(SCREEN_HEIGHT);
-	int dw = adjust_screen_size(SCALED_WIDTH), dh = adjust_screen_size(SCALED_HEIGHT);
-	int mode;
+#ifdef KVM_DXGI_ENABLED
+static int fullCaptureGen = 0;	// Incremented whenever the full resolution DIB section is created (its contents are gone)
+#endif
 
-	if (InterlockedExchange(&captureResetPending, 0) != 0) free_full_capture();
+// Makes sure the full resolution DIB section exists and has the padded screen size sw x sh. Returns 0 on success.
+static int ensure_full_capture(int sw, int sh)
+{
 	if (hFullBitmap == NULL || fullWidth != sw || fullHeight != sh)
 	{
 		BITMAPINFO bi;
@@ -380,7 +379,27 @@ int get_scaled_desktop_buffer(void **buffer, long long *bufferSize, int *pixelSi
 		hFullDCDefaultBitmap = SelectObject(hFullDC, hFullBitmap);
 		fullWidth = sw;
 		fullHeight = sh;
+#ifdef KVM_DXGI_ENABLED
+		fullCaptureGen++;
+#endif
 	}
+	return 0;
+}
+
+// Copies the screen rectangle into the full resolution DIB section with GDI. Returns 0 on success.
+static int capture_full_gdi()
+{
+	if (BitBlt(hFullDC, 0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, hDesktopDC, SCREEN_X, SCREEN_Y, SRCCOPY) == FALSE) { KVMDEBUG("BitBlt() returned FALSE", 0); return 1; }
+	GdiFlush();
+	return 0;
+}
+
+// Downscales the full resolution DIB section into a new buffer (*buffer, owned by the caller). Returns 0 on success.
+static int scale_full_to_buffer(void **buffer, long long *bufferSize, int *pixelSize)
+{
+	int sw = adjust_screen_size(SCREEN_WIDTH), sh = adjust_screen_size(SCREEN_HEIGHT);
+	int dw = adjust_screen_size(SCALED_WIDTH), dh = adjust_screen_size(SCALED_HEIGHT);
+	int mode;
 
 	// Pick the scaler: exact 2:1, exact 4:3 (SSE2 only) or the generic area-average filter.
 	if (SCREEN_WIDTH == 2 * SCALED_WIDTH && SCREEN_HEIGHT == 2 * SCALED_HEIGHT) { mode = 2; }
@@ -402,9 +421,6 @@ int get_scaled_desktop_buffer(void **buffer, long long *bufferSize, int *pixelSi
 		}
 		scaleSrcW = SCREEN_WIDTH; scaleSrcH = SCREEN_HEIGHT; scaleDstW = SCALED_WIDTH; scaleDstH = SCALED_HEIGHT;
 	}
-
-	if (BitBlt(hFullDC, 0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, hDesktopDC, SCREEN_X, SCREEN_Y, SRCCOPY) == FALSE) { KVMDEBUG("BitBlt() returned FALSE", 0); return 1; }
-	GdiFlush();
 
 	*bufferSize = (long long)dw * dh * 4;
 	if ((*buffer = malloc((size_t)*bufferSize)) == NULL) { KVMDEBUG("malloc() failed", 0); *bufferSize = 0; return 1; }
@@ -434,6 +450,523 @@ int get_scaled_desktop_buffer(void **buffer, long long *bufferSize, int *pixelSi
 	}
 	return 0;
 }
+
+// Captures the screen at full resolution and downscales it to the scaled size. Returns 0 on success.
+static int get_scaled_desktop_buffer(void **buffer, long long *bufferSize, int *pixelSize)
+{
+	if (ensure_full_capture(adjust_screen_size(SCREEN_WIDTH), adjust_screen_size(SCREEN_HEIGHT)) != 0) { return 1; }
+	if (capture_full_gdi() != 0) { return 1; }
+	return scale_full_to_buffer(buffer, bufferSize, pixelSize);
+}
+
+#ifdef KVM_DXGI_ENABLED
+// ---------------------------------------------------------------------------------------------------------------------
+// DXGI Desktop Duplication: policy and glue, runs on the capture thread (see dxgi_capture.h for the module).
+//
+// The DXGI image is kept in the full resolution DIB section (fullBits, the same buffer the scaled GDI path uses): only the
+// rectangles that DXGI reports as changed are copied into it from the GPU. Every captured frame is a new buffer, as with GDI:
+// a copy of fullBits at 100%, the scaled image otherwise. The cursor is drawn into that copy (100%), like the GDI path does.
+// A frame is PARTIAL when the changed rectangles are known: kvm.c then only checks the tiles they touch.
+// ---------------------------------------------------------------------------------------------------------------------
+enum { DXS_IDLE = 0, DXS_OPEN = 1, DXS_DISABLED = 2 };
+
+static struct
+{
+	int state;
+	int envChecked;
+	int strikes;				// Consecutive failures on the default desktop
+	int transients;				// Consecutive "try again later" results (back-off)
+	int hasNextTry;
+	DWORD nextTry;				// GetTickCount() value before which no new attempt is made
+	int ineligible;				// The last init was refused for the geometry in tgt* (no output / rotated): no retry until it changes
+	int tgtX, tgtY, tgtW, tgtH;	// Geometry the duplication is open for
+	char failDesktop[64];		// Desktop where an attempt failed without penalty: no new attempt until the desktop changes
+	int persistentValid;		// fullBits holds the current screen
+	int framesSinceOpen;		// Images received since the duplication was opened
+	int seenFullGen;
+	int upscaleLogged;
+	int noOutputTries;			// Consecutive "no output with these coordinates" results (the topology can still be changing)
+	int lostCount;				// ACCESS_LOST results in the current minute (a storm of them is slowed down)
+	DWORD lostWindowStart;
+	DWORD lastImageTick;		// GetTickCount() of the last image that changed something (for the check against GDI)
+	DWORD lastStaleTick;
+	int staleStrikes;
+	int staleAfterReinit;		// A re-created duplication was caused by a stale check: the next difference means a systematic one
+	int staleSystematic;		// GDI and DXGI differ permanently (e.g. HDR): the check only measures and logs from now on
+	int staleSystematicLogged;
+	int invalidCalls;			// Consecutive DXGI_ERROR_INVALID_CALL results without an image in between
+	struct { int want, rectValid; dxgi_rect rect; HCURSOR cursor; int x, y; } ov; // Cursor overlay of the previous output (100% only)
+} gDx;
+
+static void dx_desktop_name(char *name, int cap)
+{
+	DWORD needed = 0;
+	HDESK d = GetThreadDesktop(GetCurrentThreadId());
+	name[0] = 0;
+	if (d == NULL || !GetUserObjectInformationA(d, UOI_NAME, name, (DWORD)cap, &needed)) { lstrcpynA(name, "?", cap); }
+}
+
+static int dx_time_reached(DWORD t) { return (int)(GetTickCount() - t) >= 0; }
+
+static void dx_utf8(const wchar_t *w, char *out, int cap)
+{
+	int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, out, cap - 1, NULL, NULL);
+	if (n <= 0) { out[0] = 0; } else { out[n] = 0; }
+	for (char *c = out; *c != 0; c++) { if (*c == '"') { *c = '\''; } }
+}
+
+// Closes the duplication. The next frame goes through GDI until it is opened again.
+static void dx_close(void)
+{
+	dxgi_capture_shutdown();
+	if (gDx.state == DXS_OPEN) { gDx.state = DXS_IDLE; }
+	gDx.persistentValid = 0;
+	gDx.ov.want = gDx.ov.rectValid = 0;
+}
+
+static void dx_delay(DWORD ms)
+{
+	gDx.nextTry = GetTickCount() + ms;
+	gDx.hasNextTry = 1;
+}
+
+static void dx_disable(const char *reason, kvm_frame_info *info)
+{
+	dx_close();
+	gDx.state = DXS_DISABLED;
+	info->dxgiEvent |= KVM_DXGI_EVENT_DISABLED;
+	kvm_stats_log("dxgi disabled reason=%s hr=0x%08x", reason, (unsigned int)dxgi_capture_last_hr());
+}
+
+// A failure that counts towards switching DXGI off, only on the default desktop. On the secure desktops (logon screen, UAC)
+// a failure is not held against DXGI: no new attempt until the desktop changes.
+static void dx_strike(const char *desk, kvm_frame_info *info)
+{
+	if (lstrcmpiA(desk, "Default") != 0)
+	{
+		lstrcpynA(gDx.failDesktop, desk, (int)sizeof(gDx.failDesktop));
+		return;
+	}
+	if (++gDx.strikes >= KVM_DXGI_MAX_STRIKES) { dx_disable("strikes", info); }
+}
+
+// reset_capture_bitmap() (desktop switch): close the duplication without penalty, the next frame tries again at once.
+static void dx_reset(void)
+{
+	if (gDx.state == DXS_OPEN) { dx_close(); }
+	gDx.persistentValid = 0;
+	gDx.ineligible = 0;
+	gDx.noOutputTries = 0;
+	gDx.hasNextTry = 0;
+}
+
+static void dx_mark_overlay(unsigned char *map, const dxgi_rect &r)
+{
+	kvm_mark_rect_tiles(map, TILE_WIDTH_COUNT, TILE_HEIGHT_COUNT, TILE_WIDTH, TILE_HEIGHT, r.left, r.top, r.right, r.bottom, SCREEN_WIDTH, SCREEN_HEIGHT, SCALED_WIDTH, SCALED_HEIGHT);
+}
+
+static double dx_qpc_ms(void)
+{
+	static LARGE_INTEGER freq;
+	LARGE_INTEGER t;
+	if (freq.QuadPart == 0 && !QueryPerformanceFrequency(&freq)) { freq.QuadPart = 1; }
+	QueryPerformanceCounter(&t);
+	return (double)t.QuadPart * 1000.0 / (double)freq.QuadPart;
+}
+
+#ifdef KVM_STATS_LOG
+// Safety net of the measurement branch: when DXGI has reported no change for a while, the persistent image is compared with a
+// fresh GDI capture (outside the cursor). Differences twice in a row mean that the duplication stopped reporting. Returns the
+// number of differing pixels, -1 when the check could not be made.
+static long long dx_stale_compare(int sw, int sh)
+{
+	BITMAPINFO bi;
+	void *bits = NULL;
+	HBITMAP bmp;
+	HGDIOBJ old;
+	HDC dc;
+	CURSORINFO ci;
+	dxgi_rect skip;
+	long long diff = -1;
+
+	dc = CreateCompatibleDC(hDesktopDC);
+	if (dc == NULL) { return -1; }
+	ZeroMemory(&bi, sizeof(bi));
+	bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+	bi.bmiHeader.biWidth = sw;
+	bi.bmiHeader.biHeight = sh;
+	bi.bmiHeader.biPlanes = 1;
+	bi.bmiHeader.biBitCount = 32;
+	bi.bmiHeader.biCompression = BI_RGB;
+	bmp = CreateDIBSection(hDesktopDC, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+	if (bmp != NULL && bits != NULL)
+	{
+		old = SelectObject(dc, bmp);
+		// CAPTUREBLT: layered windows are part of the DXGI image, the capture of the GDI path leaves them out
+		if (BitBlt(dc, 0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, hDesktopDC, SCREEN_X, SCREEN_Y, SRCCOPY | CAPTUREBLT))
+		{
+			GdiFlush();
+			ZeroMemory(&ci, sizeof(ci));
+			ci.cbSize = sizeof(ci);
+			GetCursorInfo(&ci);
+			skip.left = ci.ptScreenPos.x - SCREEN_X - 64; skip.right = skip.left + 192;
+			skip.top = ci.ptScreenPos.y - SCREEN_Y - 64; skip.bottom = skip.top + 192;
+			diff = kvm_count_pixel_diff(fullBits + ((size_t)(sh - 1) * sw * 4), -(ptrdiff_t)sw * 4, (unsigned char*)bits + ((size_t)(sh - 1) * sw * 4), -(ptrdiff_t)sw * 4, SCREEN_WIDTH, SCREEN_HEIGHT, &skip);
+		}
+		SelectObject(dc, old);
+	}
+	if (bmp != NULL) { DeleteObject(bmp); }
+	DeleteDC(dc);
+	return diff;
+}
+#endif
+
+// Returns 0 when the frame was produced (*buffer, or KVM_FRAME_UNCHANGED), 1 when this frame has to be captured with GDI.
+// On 1 nothing is allocated and the caller captures a complete GDI frame.
+static int kvm_dxgi_frame(void **buffer, long long *bufferSize, long *mouseMove, int *pixelSize, int flags, kvm_frame_info *info)
+{
+	char desk[64];
+	int sw, sh, want, changed = 0, gotImage = 0, fed = 0, kind, drawn = 0;
+	int forceFull = (flags & KVM_CAPTURE_FORCE_FULL) != 0;
+	unsigned int timeout;
+	double acquireStart, acquireMs, outStart;
+	dxgi_result r;
+	dxgi_frame f;
+	CURSORINFO ci;
+	dxgi_rect cur;
+	unsigned char *dstTop, *map = NULL;
+	void *out = NULL;
+	long long outSize = 0;
+	int outPixel = 4;
+
+	if (gDx.state == DXS_DISABLED) { return 1; }
+	if (!gDx.envChecked)
+	{
+		char env[8] = "";
+		gDx.envChecked = 1;
+		if (GetEnvironmentVariableA("MESH_KVM_FORCE_GDI", env, sizeof(env)) > 0 && env[0] == '1') { dx_disable("env", info); return 1; }
+	}
+
+	// Scaling up is done with StretchBlt on the GDI path. Scaling down and 100% use the full resolution image.
+	if (SCALING_FACTOR != 1024 && !(adjust_screen_size(SCALED_WIDTH) <= adjust_screen_size(SCREEN_WIDTH) && adjust_screen_size(SCALED_HEIGHT) <= adjust_screen_size(SCREEN_HEIGHT)))
+	{
+		if (gDx.state == DXS_OPEN) { dx_close(); }
+		if (!gDx.upscaleLogged) { gDx.upscaleLogged = 1; kvm_stats_log("dxgi ineligible reason=upscale scale=%d", SCALING_FACTOR); }
+		return 1;
+	}
+	gDx.upscaleLogged = 0;
+
+	// The duplication is bound to one output: a new capture rectangle needs a new duplication.
+	if (gDx.state == DXS_OPEN && (gDx.tgtX != SCREEN_X || gDx.tgtY != SCREEN_Y || gDx.tgtW != SCREEN_WIDTH || gDx.tgtH != SCREEN_HEIGHT)) { dx_close(); }
+
+	if (gDx.state == DXS_IDLE)
+	{
+		dxgi_info di;
+		dxgi_result ir;
+		double initStart;
+		int sameGeometry = (gDx.tgtX == SCREEN_X && gDx.tgtY == SCREEN_Y && gDx.tgtW == SCREEN_WIDTH && gDx.tgtH == SCREEN_HEIGHT);
+
+		if (gDx.ineligible)
+		{
+			if (sameGeometry) { return 1; }
+			gDx.ineligible = 0;
+		}
+		if (!sameGeometry) { gDx.noOutputTries = 0; }
+		dx_desktop_name(desk, (int)sizeof(desk));
+		if (gDx.failDesktop[0] != 0)
+		{
+			if (lstrcmpiA(desk, gDx.failDesktop) == 0) { return 1; }
+			gDx.failDesktop[0] = 0;
+		}
+		if (gDx.hasNextTry && !dx_time_reached(gDx.nextTry)) { return 1; }
+		gDx.hasNextTry = 0;
+
+		initStart = dx_qpc_ms();
+		ir = dxgi_capture_init(SCREEN_X, SCREEN_Y, SCREEN_WIDTH, SCREEN_HEIGHT, &di);
+		if (dx_qpc_ms() - initStart > 1000.0) { kvm_stats_log("dxgi slow_init ms=%d result=%s", (int)(dx_qpc_ms() - initStart), dxgi_result_name(ir)); }
+		gDx.tgtX = SCREEN_X; gDx.tgtY = SCREEN_Y; gDx.tgtW = SCREEN_WIDTH; gDx.tgtH = SCREEN_HEIGHT;
+		if (ir == DXGI_CAP_OK)
+		{
+			char ad[256], out8[64];
+			gDx.state = DXS_OPEN;
+			gDx.framesSinceOpen = 0;
+			gDx.persistentValid = 0;
+			gDx.transients = 0;
+			gDx.noOutputTries = 0;
+			gDx.lastImageTick = gDx.lastStaleTick = GetTickCount();
+			gDx.staleStrikes = 0;
+			gDx.ov.want = gDx.ov.rectValid = 0;
+			info->dxgiEvent |= KVM_DXGI_EVENT_OPEN;
+			dx_utf8(di.adapter, ad, (int)sizeof(ad));
+			dx_utf8(di.output, out8, (int)sizeof(out8));
+			kvm_stats_log("dxgi open adapter=\"%s\" vendor=0x%04x output=%s mode=%dx%d rot=%d sysmem=%d desktop=%s", ad, di.vendorId, out8, di.width, di.height, di.rotation, di.systemMemory, desk);
+		}
+		else if (ir == DXGI_CAP_NO_OUTPUT || ir == DXGI_CAP_ROTATED)
+		{
+			info->dxgiEvent |= KVM_DXGI_EVENT_FALLBACK;
+			if (ir == DXGI_CAP_NO_OUTPUT && ++gDx.noOutputTries < 3)
+			{
+				// Right after a change of the display topology the outputs of DXGI can lag behind: ask again in a second, then give up
+				dx_delay(1000);
+				return 1;
+			}
+			gDx.ineligible = 1;
+			kvm_stats_log("dxgi ineligible reason=%s rect=%d,%d,%d,%d desktop=%s", ir == DXGI_CAP_ROTATED ? "rotated" : "no_output", SCREEN_X, SCREEN_Y, SCREEN_WIDTH, SCREEN_HEIGHT, desk);
+			return 1;
+		}
+		else
+		{
+			info->dxgiEvent |= KVM_DXGI_EVENT_FALLBACK;
+			if (ir == DXGI_CAP_UNSUPPORTED) { dx_disable("unsupported", info); return 1; }
+			if (ir == DXGI_CAP_TRANSIENT)
+			{
+				// Try again later; every failed attempt doubles the wait (up to 8 times), no penalty
+				if (gDx.transients < 4) { gDx.transients++; }
+				if (lstrcmpiA(desk, "Default") != 0) { lstrcpynA(gDx.failDesktop, desk, (int)sizeof(gDx.failDesktop)); }
+				dx_delay((DWORD)KVM_DXGI_RETRY_MS << (gDx.transients - 1));
+				if (gDx.transients <= 3) { kvm_stats_log("dxgi fail stage=init result=transient hr=0x%08x desktop=%s", (unsigned int)dxgi_capture_last_hr(), desk); }
+				return 1;
+			}
+			kvm_stats_log("dxgi fail stage=init result=%s hr=0x%08x strikes=%d/%d desktop=%s", dxgi_result_name(ir), (unsigned int)dxgi_capture_last_hr(), gDx.strikes + 1, KVM_DXGI_MAX_STRIKES, desk);
+			dx_delay(KVM_DXGI_RETRY_MS);
+			dx_strike(desk, info);
+			return 1;
+		}
+	}
+
+	// From here on the duplication is open.
+	sw = adjust_screen_size(SCREEN_WIDTH);
+	sh = adjust_screen_size(SCREEN_HEIGHT);
+	if (ensure_full_capture(sw, sh) != 0) { return 1; }
+	if (gDx.seenFullGen != fullCaptureGen) { gDx.seenFullGen = fullCaptureGen; gDx.persistentValid = 0; }
+
+	// The mouse cursor is not part of the DXGI image. At 100% it is drawn into the output (like the GDI path), when the
+	// client expects it in the image (mouseMove[0] != 0). A change of the cursor needs a new output.
+	want = (SCALING_FACTOR == 1024 && mouseMove[0] != 0) ? 1 : 0;
+	memset(&ci, 0, sizeof(ci));
+	ci.cbSize = sizeof(ci);
+	if (want)
+	{
+		GetCursorInfo(&ci);
+		changed = (!gDx.ov.want || mouseMove[1] != gDx.ov.x || mouseMove[2] != gDx.ov.y || ci.hCursor != gDx.ov.cursor) ? 1 : 0;
+	}
+	else
+	{
+		changed = gDx.ov.want ? 1 : 0;
+	}
+
+	timeout = (forceFull || changed) ? 0 : (gDx.persistentValid ? KVM_DXGI_TIMEOUT_MS : KVM_DXGI_FIRST_FRAME_MS);
+	dstTop = fullBits + ((size_t)(sh - 1) * sw * 4);
+	memset(&f, 0, sizeof(f));
+	acquireStart = dx_qpc_ms();
+	r = dxgi_capture_acquire(timeout, dstTop, -(ptrdiff_t)sw * 4, gDx.persistentValid ? 0 : 1, &f);
+	acquireMs = dx_qpc_ms() - acquireStart;
+
+	switch (r)
+	{
+		case DXGI_CAP_OK:
+			gDx.framesSinceOpen++;
+			gDx.strikes = 0;
+			gDx.invalidCalls = 0;
+			gDx.persistentValid = 1;
+			gotImage = (f.rectCount > 0);
+			if (gotImage) { gDx.lastImageTick = GetTickCount(); gDx.staleStrikes = 0; }
+			break;
+		case DXGI_CAP_NO_CHANGE:
+		case DXGI_CAP_TIMEOUT:
+			break;
+		default:
+		{
+			// The module is closed. This frame goes through GDI.
+			int framesBefore = gDx.framesSinceOpen;
+			dx_desktop_name(desk, (int)sizeof(desk));
+			gDx.state = DXS_IDLE;
+			gDx.persistentValid = 0;
+			gDx.ov.want = gDx.ov.rectValid = 0;
+			info->dxgiEvent |= (r == DXGI_CAP_LOST) ? KVM_DXGI_EVENT_LOST : KVM_DXGI_EVENT_FALLBACK;
+			if (r == DXGI_CAP_LOST)
+			{
+				// Resolution change, UAC, lock, sign in: open it again after a short pause. Only a duplication that dies
+				// before it gave a single image counts against DXGI.
+				kvm_stats_log("dxgi lost hr=0x%08x images=%d desktop=%s", (unsigned int)dxgi_capture_last_hr(), framesBefore, desk);
+				if ((DWORD)(GetTickCount() - gDx.lostWindowStart) > 60000) { gDx.lostWindowStart = GetTickCount(); gDx.lostCount = 0; }
+				if (++gDx.lostCount > 5)
+				{
+					// More than 5 in a minute: something keeps taking the duplication away, do not rebuild the device four times a second
+					if (gDx.lostCount == 6) { kvm_stats_log("dxgi lost_storm count=%d", gDx.lostCount); }
+					dx_delay(5000);
+				}
+				else
+				{
+					dx_delay(KVM_DXGI_LOST_DELAY_MS);
+				}
+				if (framesBefore == 0) { dx_strike(desk, info); }
+			}
+			else if (r == DXGI_CAP_TRANSIENT)
+			{
+				if (lstrcmpiA(desk, "Default") != 0) { lstrcpynA(gDx.failDesktop, desk, (int)sizeof(gDx.failDesktop)); }
+				dx_delay(KVM_DXGI_RETRY_MS);
+				kvm_stats_log("dxgi fail stage=acquire result=transient hr=0x%08x release_hr=0x%08x images=%d desktop=%s", (unsigned int)dxgi_capture_last_hr(), (unsigned int)dxgi_capture_release_hr(), framesBefore, desk);
+				if (dxgi_capture_last_hr() == DXGI_ERROR_INVALID_CALL && ++gDx.invalidCalls >= 3)
+				{
+					// The same error again and again without an image: not a change of the display, count it like an error
+					kvm_stats_log("dxgi invalid_call_repeat count=%d desktop=%s", gDx.invalidCalls, desk);
+					gDx.invalidCalls = 0;
+					dx_strike(desk, info);
+				}
+			}
+			else
+			{
+				kvm_stats_log("dxgi fail stage=acquire result=%s hr=0x%08x strikes=%d/%d desktop=%s", dxgi_result_name(r), (unsigned int)dxgi_capture_last_hr(), gDx.strikes + 1, KVM_DXGI_MAX_STRIKES, desk);
+				dx_delay(KVM_DXGI_RETRY_MS);
+				dx_strike(desk, info);
+			}
+			return 1;
+		}
+	}
+
+	// No image yet (the duplication gave nothing since it was opened): take the starting point from GDI. Changes after the
+	// duplication was created arrive as rectangles later and are applied on top of it.
+	if (!gDx.persistentValid)
+	{
+		if (capture_full_gdi() != 0) { return 1; }
+		gDx.persistentValid = 1;
+		fed = 1;
+	}
+
+	if (!gotImage && !fed && !changed && !forceFull)
+	{
+#ifdef KVM_STATS_LOG
+		// Safety net of the measurement branch, see dx_stale_compare()
+		if ((DWORD)(GetTickCount() - gDx.lastImageTick) >= KVM_STALE_QUIET_MS && (DWORD)(GetTickCount() - gDx.lastStaleTick) >= KVM_STATS_PERIOD_MS)
+		{
+			double t0 = dx_qpc_ms();
+			long long diff = dx_stale_compare(sw, sh);
+			info->staleUs = (unsigned int)((dx_qpc_ms() - t0) * 1000.0);
+			gDx.lastStaleTick = GetTickCount();
+			if (diff > 0 && gDx.staleSystematic)
+			{
+				// Known to differ permanently: measure and log only (no re-creation, no GDI frames)
+				if (gDx.staleSystematicLogged < 5) { gDx.staleSystematicLogged++; kvm_stats_log("dxgi stale_systematic px=%lld", diff); }
+			}
+			else if (diff > 0)
+			{
+				info->staleSuspect = ++gDx.staleStrikes;
+				if (gDx.staleAfterReinit)
+				{
+					// The picture of a freshly created duplication already differs: GDI and DXGI see the screen differently (HDR, a layered window...)
+					gDx.staleSystematic = 1;
+					gDx.staleSystematicLogged = 1;
+					gDx.staleStrikes = 0;
+					kvm_stats_log("dxgi stale_systematic px=%lld", diff);
+				}
+				else
+				{
+					kvm_stats_log("dxgi %s px=%lld", gDx.staleStrikes >= 2 ? "stale" : "stale_suspect", diff);
+					if (gDx.staleStrikes >= 2)
+					{
+						// The duplication does not report what is on the screen: build it again, this frame comes from GDI (complete)
+						gDx.staleStrikes = 0;
+						gDx.staleAfterReinit = 1;
+						dx_close();
+						gDx.hasNextTry = 0;
+						return 1;
+					}
+				}
+			}
+			else
+			{
+				gDx.staleStrikes = 0;
+				gDx.staleAfterReinit = 0;
+			}
+		}
+#endif
+		// Nothing to send. A timeout was the wait for changes, the main loop does not need its pause after it.
+		info->kind = KVM_FRAME_UNCHANGED;
+		info->source = KVM_SOURCE_DXGI;
+		info->idleWait = (r == DXGI_CAP_TIMEOUT && timeout > 0 && acquireMs >= (double)timeout / 2.0) ? 1 : 0; // Only if it really waited
+		*buffer = NULL;
+		*bufferSize = 0;
+		*pixelSize = 4;
+		return 0;
+	}
+
+	kind = (forceFull || f.fullCopy || fed) ? KVM_FRAME_FULL : KVM_FRAME_PARTIAL;
+	memset(&cur, 0, sizeof(cur));
+	outStart = dx_qpc_ms();
+	if (SCALING_FACTOR == 1024)
+	{
+		outSize = (long long)sw * sh * 4;
+		if ((out = malloc((size_t)outSize)) == NULL) { return 1; }
+		memcpy(out, fullBits, (size_t)outSize);
+		if (want) { drawn = kvm_cursor_xor((unsigned char*)out + ((size_t)(sh - 1) * sw * 4), -(ptrdiff_t)sw * 4, sw, sh, mouseMove[1], mouseMove[2], &cur); }
+	}
+	else if (scale_full_to_buffer(&out, &outSize, &outPixel) != 0)
+	{
+		return 1;
+	}
+
+	info->outUs = (unsigned int)((dx_qpc_ms() - outStart) * 1000.0);
+
+	if (kind == KVM_FRAME_PARTIAL)
+	{
+		if ((map = (unsigned char*)calloc((size_t)TILE_HEIGHT_COUNT * TILE_WIDTH_COUNT, 1)) == NULL) { free(out); return 1; }
+		for (int i = 0; i < f.rectCount; i++) { dx_mark_overlay(map, f.rects[i]); }
+		if (SCALING_FACTOR == 1024)
+		{
+			// The overlay moved or changed: the tiles under the old and the new one
+			if (gDx.ov.rectValid) { dx_mark_overlay(map, gDx.ov.rect); }
+			if (drawn) { dx_mark_overlay(map, cur); }
+		}
+	}
+
+	gDx.ov.want = want;
+	gDx.ov.rectValid = drawn;
+	gDx.ov.rect = cur;
+	gDx.ov.cursor = ci.hCursor;
+	gDx.ov.x = mouseMove[1];
+	gDx.ov.y = mouseMove[2];
+
+	*buffer = out;
+	*bufferSize = outSize;
+	*pixelSize = outPixel;
+	info->kind = kind;
+	info->source = KVM_SOURCE_DXGI;
+	info->tileDirty = map;
+	info->dirtyRects = f.dirtyCount;
+	info->moveRects = f.moveCount;
+	info->dirtyArea = f.dirtyArea;
+	info->moveArea = f.moveArea;
+	info->copyUs = f.copyUs;
+	return 0;
+}
+
+// The DXGI and D3D11 calls are made in the agent's own process: a fault in a driver must not end the KVM session in an
+// endless restart loop (the KVM process is restarted when it ends). On an exception DXGI is switched off for this process.
+static int dxgi_frame_guarded(void **buffer, long long *bufferSize, long *mouseMove, int *pixelSize, int flags, kvm_frame_info *info, DWORD *code)
+{
+	__try
+	{
+		return kvm_dxgi_frame(buffer, bufferSize, mouseMove, pixelSize, flags, info);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		*code = GetExceptionCode();
+		return -1;
+	}
+}
+
+static void dxgi_shutdown_guarded(void)
+{
+	__try
+	{
+		dxgi_capture_shutdown();
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+	}
+}
+#endif
 
 // Extracts the required tile buffer from the desktop buffer
 int get_tile_buffer(int x, int y, void **buffer, void *desktop, int tilewidth, int tileheight) 
@@ -869,16 +1402,57 @@ int get_tile_at(int x, int y, void** buffer, long long *bufferSize, void *deskto
 // This function captures the entire desktop buffer to scan. It runs on the capture thread while the main thread may
 // still encode the previous frame, so it reports the bytes per pixel of this frame in *pixelSize instead of changing
 // PIXEL_SIZE; the main loop sets PIXEL_SIZE when it starts encoding this frame.
-int get_desktop_buffer(void **buffer, long long *bufferSize, long* mouseMove, int *pixelSize)
+int get_desktop_buffer(void **buffer, long long *bufferSize, long* mouseMove, int *pixelSize, int flags, kvm_frame_info *info)
 {
 	BITMAPINFO bmpInfo;
 
+	UNREFERENCED_PARAMETER(flags);
+	memset(info, 0, sizeof(*info)); // GDI frames are always complete: kind = KVM_FRAME_FULL, source = KVM_SOURCE_GDI
+	info->kind = KVM_FRAME_FULL;
+	info->source = KVM_SOURCE_GDI;
 	*buffer = NULL; // If anything fails, this will be the indication.
 	*bufferSize = 0;
 	*pixelSize = 0;
 
 	if (hDesktopDC) ReleaseDC(NULL, hDesktopDC);
 	if ((hDesktopDC = GetDC(NULL)) == NULL) { KVMDEBUG("GetDC(NULL) returned NULL", 0); return 1; } // We need to do this incase the current desktop changes.
+
+	// reset_capture_bitmap() was called (e.g. desktop switch): the full resolution bitmap is created again when it is needed.
+	if (InterlockedExchange(&captureResetPending, 0) != 0)
+	{
+		free_full_capture();
+#ifdef KVM_DXGI_ENABLED
+		dx_reset();
+#endif
+	}
+
+#ifdef KVM_DXGI_ENABLED
+	{
+		DWORD exceptionCode = 0;
+		int dxr = dxgi_frame_guarded(buffer, bufferSize, mouseMove, pixelSize, flags, info, &exceptionCode);
+		if (dxr == 0) { return 0; }
+		if (dxr < 0)
+		{
+			gDx.state = DXS_DISABLED;
+			dxgi_shutdown_guarded();
+			gDx.persistentValid = 0;
+			info->dxgiEvent |= KVM_DXGI_EVENT_DISABLED;
+			kvm_stats_log("dxgi disabled reason=exception code=0x%08x", (unsigned int)exceptionCode);
+		}
+		// This frame comes from GDI (a complete frame); only the DXGI events are passed on
+		{
+			int events = info->dxgiEvent;
+			if (info->tileDirty != NULL && dxr > 0) { free(info->tileDirty); }
+			memset(info, 0, sizeof(*info));
+			info->kind = KVM_FRAME_FULL;
+			info->source = KVM_SOURCE_GDI;
+			info->dxgiEvent = events;
+			*buffer = NULL;
+			*bufferSize = 0;
+			*pixelSize = 0;
+		}
+	}
+#endif
 
 	// Downscaling: capture at full resolution and scale on the CPU. Falls back to StretchBlt() if that fails.
 	if (SCALING_FACTOR != 1024 && adjust_screen_size(SCALED_WIDTH) <= adjust_screen_size(SCREEN_WIDTH) && adjust_screen_size(SCALED_HEIGHT) <= adjust_screen_size(SCREEN_HEIGHT))
@@ -1068,6 +1642,29 @@ void release_desktop_dc()
 	if (hDesktopDC) ReleaseDC(NULL, hDesktopDC);
 	hDesktopDC = NULL;
 }
+
+#ifdef KVM_DXGI_ENABLED
+// The capture thread ends: close the duplication, it belongs to this thread.
+void kvm_dxgi_thread_end(void)
+{
+	dxgi_shutdown_guarded();
+	if (gDx.state == DXS_OPEN) { gDx.state = DXS_IDLE; }
+	gDx.persistentValid = 0;
+	gDx.ov.want = gDx.ov.rectValid = 0;
+}
+#endif
+
+#ifdef KVM_STATS_LOG
+// JPEG chroma subsampling in use (TJSAMP_* value), for the statistics log.
+int kvm_subsamp_value(void)
+{
+#ifdef _TURBOJPEG
+	return (int)KVM_TJ_SUBSAMP;
+#else
+	return -1;
+#endif
+}
+#endif
 
 // Forces the capture bitmap to be re-created on the next frame (e.g. after a desktop switch).
 void reset_capture_bitmap()

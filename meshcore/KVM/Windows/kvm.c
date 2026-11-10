@@ -30,6 +30,7 @@ limitations under the License.
 #include "microstack/ILibProcessPipe.h"
 #include "microstack/ILibRemoteLogging.h"
 #include <sas.h>
+#include <stdarg.h>
 #include <timeapi.h>
 #pragma comment(lib, "winmm.lib")
 
@@ -131,6 +132,9 @@ HANDLE hStdOut = INVALID_HANDLE_VALUE;
 HANDLE hStdIn = INVALID_HANDLE_VALUE;
 int ThreadRunning = 0;
 int gGeometryGeneration = 0; // Incremented by kvm_server_SetResolution(), frames captured with an older geometry are dropped.
+// Set when the next captured frame has to be complete (KVM_FRAME_FULL: every tile goes through the CRC check): a refresh request,
+// a new geometry, the start of the session, or a frame that was not fully processed. Read and cleared by kvm_capture_start().
+volatile LONG gKvmFullFrame = 1;
 int kvmConsoleMode = 0;
 
 ILibQueue gPendingPackets = NULL;
@@ -633,6 +637,7 @@ int kvm_server_inputdata(char *block, int blocklen, ILibKVM_WriteHandler writeHa
 				tileInfo[row][col].flags = 0;
 			}
 		}
+		InterlockedExchange(&gKvmFullFrame, 1); // The next frame has to check every tile
 
 		break;
 	}
@@ -836,6 +841,7 @@ void kvm_server_SetResolution(ILibKVM_WriteHandler writeHandler, void *reserved)
 			tileInfo[row][col].flags = 0;
 		}
 	}
+	InterlockedExchange(&gKvmFullFrame, 1); // The next frame has to check every tile
 }
 
 #define BUFSIZE 65535
@@ -910,6 +916,147 @@ DWORD WINAPI kvm_mainloopinput(LPVOID Param)
 }
 #endif
 
+#ifdef KVM_STATS_LOG
+// Statistics log: <exe directory>\<exe name without .exe>-kvm.log, one line per event and every KVM_STATS_PERIOD_MS.
+// Only written by the branch with the DXGI measurements; the file stops growing at KVM_STATS_LOG_MAX bytes.
+static SRWLOCK gStatsLock = SRWLOCK_INIT;
+static wchar_t gStatsPath[MAX_PATH + 16];
+static int gStatsPathReady = 0;
+
+static long long kvm_qpc_frequency(void)
+{
+	static long long freq = 0;
+	if (freq == 0)
+	{
+		LARGE_INTEGER f;
+		freq = (QueryPerformanceFrequency(&f) && f.QuadPart > 0) ? f.QuadPart : 1;
+	}
+	return freq;
+}
+
+void kvm_stats_log(const char *fmt, ...)
+{
+	char line[1024];
+	SYSTEMTIME st;
+	va_list ap;
+	int n, m;
+	HANDLE h;
+	DWORD written;
+	LARGE_INTEGER size;
+
+	GetLocalTime(&st);
+	n = sprintf_s(line, sizeof(line), "%04d-%02d-%02d %02d:%02d:%02d.%03d pid=%lu ", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, (unsigned long)GetCurrentProcessId());
+	if (n < 0) { return; }
+	va_start(ap, fmt);
+	m = _vsnprintf_s(line + n, sizeof(line) - n - 3, _TRUNCATE, fmt, ap); // Leaves room for the line end
+	va_end(ap);
+	if (m < 0) { m = (int)strlen(line + n); } // Truncated
+	n += m;
+	line[n++] = '\r';
+	line[n++] = '\n';
+
+	AcquireSRWLockExclusive(&gStatsLock);
+	if (!gStatsPathReady)
+	{
+		DWORD len = GetModuleFileNameW(NULL, gStatsPath, MAX_PATH);
+		if (len > 4 && _wcsicmp(gStatsPath + len - 4, L".exe") == 0) { len -= 4; }
+		if (len > 0 && len < MAX_PATH)
+		{
+			wcscpy_s(gStatsPath + len, 16, L"-kvm.log");
+			gStatsPathReady = 1;
+		}
+	}
+	if (gStatsPathReady)
+	{
+		h = CreateFileW(gStatsPath, FILE_APPEND_DATA | FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+		if (h != INVALID_HANDLE_VALUE)
+		{
+			if (GetFileSizeEx(h, &size) && size.QuadPart < KVM_STATS_LOG_MAX) { WriteFile(h, line, (DWORD)n, &written, NULL); }
+			CloseHandle(h);
+		}
+	}
+	ReleaseSRWLockExclusive(&gStatsLock);
+}
+
+// Counters of the main loop, one line is written per KVM_STATS_PERIOD_MS.
+typedef struct KVM_Stats
+{
+	DWORD sessionStart, periodStart;
+	int frames, full, partial, unchanged, gdi, dxgi, tiles, moveFrames, captureFrames, copyFrames, outFrames, staleChecks, staleSuspects;
+	long long bytes, writeUs, dirtyRects, dirtyArea, moveRects, moveArea, moveMaxArea, captureUs, copyUs, outUs, staleUs;
+} KVM_Stats;
+static KVM_Stats gStats;
+
+static void kvm_stats_account(const kvm_frame_info *fi, int tiles, long long bytes, long long writeUs)
+{
+	gStats.frames++;
+	gStats.tiles += tiles;
+	gStats.bytes += bytes;
+	gStats.writeUs += writeUs;
+	if (fi == NULL) { return; }
+	if (fi->kind == KVM_FRAME_PARTIAL) { gStats.partial++; }
+	else if (fi->kind == KVM_FRAME_UNCHANGED) { gStats.unchanged++; }
+	else { gStats.full++; }
+	if (fi->source == KVM_SOURCE_DXGI) { gStats.dxgi++; } else { gStats.gdi++; }
+	gStats.dirtyRects += fi->dirtyRects;
+	gStats.dirtyArea += fi->dirtyArea;
+	gStats.moveRects += fi->moveRects;
+	gStats.moveArea += fi->moveArea;
+	if (fi->moveRects > 0)
+	{
+		gStats.moveFrames++;
+		if (fi->moveArea > gStats.moveMaxArea) { gStats.moveMaxArea = fi->moveArea; }
+	}
+	if (fi->kind != KVM_FRAME_UNCHANGED) { gStats.captureUs += fi->captureUs; gStats.captureFrames++; }
+	if (fi->copyUs > 0) { gStats.copyUs += fi->copyUs; gStats.copyFrames++; }
+	if (fi->outUs > 0) { gStats.outUs += fi->outUs; gStats.outFrames++; }
+	if (fi->staleUs > 0) { gStats.staleUs += fi->staleUs; gStats.staleChecks++; }
+	if (fi->staleSuspect > 0) { gStats.staleSuspects++; }
+}
+
+static void kvm_stats_flush(int final)
+{
+	DWORD now = timeGetTime();
+	if (!final && (DWORD)(now - gStats.periodStart) < KVM_STATS_PERIOD_MS) { return; }
+	if (gStats.frames > 0)
+	{
+		// "frames" are all loop iterations (a frame without changes counts, too); the rate of images that reached the tile check is
+		// fps = (full + partial) / period. copy_us: GPU -> persistent image; out_us: making the output buffer (copy of the whole image
+		// and cursor, or scaling); stale_*: the check of the DXGI image against GDI (KVM_STALE_QUIET_MS without changes, every period).
+		unsigned long periodMs = (unsigned long)(now - gStats.periodStart);
+		unsigned long fps10 = periodMs > 0 ? (unsigned long)(((long long)(gStats.full + gStats.partial) * 10000) / (long long)periodMs) : 0;
+		kvm_stats_log("stats t=%lu period_ms=%lu path=%s frames=%d full=%d partial=%d unchanged=%d fps=%lu.%lu gdi=%d dxgi=%d tiles=%d bytes=%lld write_ms=%lld dirty_rects=%lld dirty_area=%lld move_rects=%lld move_area=%lld move_frames=%d move_max_area=%lld copy_us_avg=%lld out_us_avg=%lld capture_us_avg=%lld stale_checks=%d stale_suspects=%d stale_us_avg=%lld%s",
+			(unsigned long)((now - gStats.sessionStart) / 1000), periodMs, (gStats.dxgi == 0 ? "gdi" : (gStats.gdi == 0 ? "dxgi" : "mixed")),
+			gStats.frames, gStats.full, gStats.partial, gStats.unchanged, fps10 / 10, fps10 % 10, gStats.gdi, gStats.dxgi, gStats.tiles, gStats.bytes, gStats.writeUs / 1000,
+			gStats.dirtyRects, gStats.dirtyArea, gStats.moveRects, gStats.moveArea, gStats.moveFrames, gStats.moveMaxArea,
+			gStats.copyFrames > 0 ? gStats.copyUs / gStats.copyFrames : 0LL, gStats.outFrames > 0 ? gStats.outUs / gStats.outFrames : 0LL,
+			gStats.captureFrames > 0 ? gStats.captureUs / gStats.captureFrames : 0LL,
+			gStats.staleChecks, gStats.staleSuspects, gStats.staleChecks > 0 ? gStats.staleUs / gStats.staleChecks : 0LL,
+			final ? " final=1" : "");
+	}
+	gStats.frames = gStats.full = gStats.partial = gStats.unchanged = gStats.gdi = gStats.dxgi = gStats.tiles = gStats.moveFrames = gStats.captureFrames = gStats.copyFrames = gStats.outFrames = gStats.staleChecks = gStats.staleSuspects = 0;
+	gStats.bytes = gStats.writeUs = gStats.dirtyRects = gStats.dirtyArea = gStats.moveRects = gStats.moveArea = gStats.moveMaxArea = gStats.captureUs = gStats.copyUs = gStats.outUs = gStats.staleUs = 0;
+	gStats.periodStart = now;
+}
+
+static void kvm_stats_start(void)
+{
+	char env[8] = "";
+	int forceGdi;
+	memset(&gStats, 0, sizeof(gStats));
+	gStats.sessionStart = gStats.periodStart = timeGetTime();
+	forceGdi = (GetEnvironmentVariableA("MESH_KVM_FORCE_GDI", env, sizeof(env)) > 0 && env[0] == '1') ? 1 : 0;
+	kvm_stats_log("start build=\"%s %s\" dxgi=%d env_force_gdi=%d subsamp=%d screen=%d,%d,%d,%d scale=%d",
+		__DATE__, __TIME__,
+#ifdef KVM_DXGI_ENABLED
+		1,
+#else
+		0,
+#endif
+		forceGdi, kvm_subsamp_value(), SCREEN_X, SCREEN_Y, SCREEN_WIDTH, SCREEN_HEIGHT, SCALING_FACTOR);
+}
+#endif
+
 // Screen capture runs on its own thread: while the screen is changing, the next frame is captured (GDI capture
 // is paced by DWM composition) while the current one is encoded and sent. The capture thread only runs between
 // kvm_capture_start() and kvm_capture_wait(); the geometry (resolution, scaling, desktop) is only changed by the
@@ -927,6 +1074,8 @@ typedef struct KVM_CaptureState
 	int pixelSize;
 	int result;
 	int generation;
+	int flags;				// KVM_CAPTURE_* passed to get_desktop_buffer()
+	kvm_frame_info info;	// What get_desktop_buffer() reported about the frame
 } KVM_CaptureState;
 KVM_CaptureState gCapture;
 
@@ -935,7 +1084,16 @@ void kvm_capture_switch_desktop()
 {
 	HDESK desktop = OpenInputDesktop(0, TRUE, DESKTOP_CREATEMENU | DESKTOP_CREATEWINDOW | DESKTOP_ENUMERATE | DESKTOP_HOOKCONTROL | DESKTOP_WRITEOBJECTS | DESKTOP_READOBJECTS | DESKTOP_SWITCHDESKTOP | GENERIC_WRITE);
 	if (desktop == NULL) return;
-	if (SetThreadDesktop(desktop) == 0) { CloseDesktop(desktop); return; }
+	if (SetThreadDesktop(desktop) == 0)
+	{
+#ifdef KVM_STATS_LOG
+		static int logged = 0; // Not on every frame
+		DWORD err = GetLastError();
+		if (logged < 5) { logged++; kvm_stats_log("capture SetThreadDesktop failed err=%lu", (unsigned long)err); }
+#endif
+		CloseDesktop(desktop);
+		return;
+	}
 	if (gCapture.desktop != NULL) CloseDesktop(gCapture.desktop);
 	gCapture.desktop = desktop;
 }
@@ -945,12 +1103,25 @@ DWORD WINAPI kvm_capture_thread(LPVOID parm)
 	UNREFERENCED_PARAMETER(parm);
 	while (WaitForSingleObject(gCapture.startEvent, INFINITE) == WAIT_OBJECT_0 && !gCapture.quit)
 	{
+#ifdef KVM_STATS_LOG
+		LARGE_INTEGER t0, t1;
+#endif
 		kvm_capture_switch_desktop();
 		gCapture.buffer = NULL;
 		gCapture.bufferSize = 0;
-		gCapture.result = get_desktop_buffer(&gCapture.buffer, &gCapture.bufferSize, gCapture.mouseMove, &gCapture.pixelSize);
+#ifdef KVM_STATS_LOG
+		QueryPerformanceCounter(&t0);
+#endif
+		gCapture.result = get_desktop_buffer(&gCapture.buffer, &gCapture.bufferSize, gCapture.mouseMove, &gCapture.pixelSize, gCapture.flags, &gCapture.info);
+#ifdef KVM_STATS_LOG
+		QueryPerformanceCounter(&t1);
+		gCapture.info.captureUs = (unsigned int)(((t1.QuadPart - t0.QuadPart) * 1000000LL) / kvm_qpc_frequency());
+#endif
 		SetEvent(gCapture.doneEvent);
 	}
+#ifdef KVM_DXGI_ENABLED
+	kvm_dxgi_thread_end(); // The duplication belongs to this thread
+#endif
 	release_desktop_dc(); // A DC must be released on the thread that got it
 	return 0;
 }
@@ -959,17 +1130,27 @@ void kvm_capture_start(long *mouseMove)
 {
 	memcpy(gCapture.mouseMove, mouseMove, sizeof(gCapture.mouseMove));
 	gCapture.generation = gGeometryGeneration;
+	gCapture.flags = InterlockedExchange(&gKvmFullFrame, 0) ? KVM_CAPTURE_FORCE_FULL : 0;
 	SetEvent(gCapture.startEvent);
 }
 
-// Waits for the frame started by kvm_capture_start(). Returns the desktop buffer, or NULL if the capture failed.
-void* kvm_capture_wait(long long *bufferSize, int *generation, int *pixelSize)
+// Waits for the frame started by kvm_capture_start(). Returns 0 on success, then *desktop is the frame (NULL when
+// info->kind is KVM_FRAME_UNCHANGED) and info->tileDirty belongs to the caller; any other value means the capture failed.
+int kvm_capture_wait(void **desktop, long long *bufferSize, int *generation, int *pixelSize, kvm_frame_info *info)
 {
 	WaitForSingleObject(gCapture.doneEvent, INFINITE);
 	*bufferSize = gCapture.bufferSize;
 	*generation = gCapture.generation;
 	*pixelSize = gCapture.pixelSize;
-	return (gCapture.result == 0) ? gCapture.buffer : NULL;
+	*info = gCapture.info;
+	if (gCapture.result != 0)
+	{
+		*desktop = NULL;
+		if (info->tileDirty != NULL) { free(info->tileDirty); info->tileDirty = NULL; }
+		return gCapture.result;
+	}
+	*desktop = gCapture.buffer;
+	return 0;
 }
 
 // Handles desktop and resolution changes and the pending mouse packets before a capture. Returns 0 on shutdown.
@@ -1078,6 +1259,8 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 	long mouseMove[3] = {0, 0, 0};
 	int sentHideCursor = 0;
 	int captureInFlight = 0, lastSentTiles = 0, frameGeneration = 0, framePixelSize = 0, dropFrame = 0;
+	kvm_frame_info frameInfo;
+	int captureResult = 0, idleWait = 0, aborted = 0;
 
 	gPendingPackets = ILibQueue_Create();
 	KVM_InitMouseCursors(gPendingPackets);
@@ -1153,6 +1336,10 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 			tileInfo[row][col].crc = 0xFF;
 		}
 	}
+	InterlockedExchange(&gKvmFullFrame, 1); // The first frame has to check every tile
+#ifdef KVM_STATS_LOG
+	kvm_stats_start();
+#endif
 
 	// Send the list of displays
 	kvm_send_display_list(writeHandler, reserved);
@@ -1179,6 +1366,11 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 	{
 		DWORD frameStart = timeGetTime();
 		int sentTiles = 0;
+#ifdef KVM_STATS_LOG
+		int statTiles = 0;
+		long long statBytes = 0, statWriteUs = 0;
+#endif
+		idleWait = 0;
 		KVMDEBUG("kvm_server_mainloop / loop1", (int)GetCurrentThreadId());
 
 		// Reset all the flags to TILE_TODO
@@ -1200,9 +1392,10 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 		}
 
 		// Get the captured desktop
-		desktop = kvm_capture_wait(&desktopsize, &frameGeneration, &framePixelSize);
+		desktop = NULL;
+		captureResult = kvm_capture_wait(&desktop, &desktopsize, &frameGeneration, &framePixelSize, &frameInfo);
 		captureInFlight = 0;
-		if (desktop == NULL)
+		if (captureResult != 0)
 		{
 #ifdef _WINSERVICE
 			if (!kvmConsoleMode)
@@ -1221,64 +1414,101 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 				kvm_capture_start(mouseMove);
 				captureInFlight = 1;
 			}
+			idleWait = frameInfo.idleWait;
 
-			// Drop the frame if the resolution or scaling changed after it was captured, or if the buffer is
-			// smaller than what the tile code reads at this frame's color depth.
-			PIXEL_SIZE = framePixelSize;
-			dropFrame = (frameGeneration != gGeometryGeneration) || !desktop_buffer_fits(desktopsize, PIXEL_SIZE);
-
-			bmpInfo = get_bmp_info(TILE_WIDTH, TILE_HEIGHT);
-			for (row = 0; !dropFrame && row < TILE_HEIGHT_COUNT; row++)
+			if (frameInfo.kind != KVM_FRAME_UNCHANGED && desktop != NULL)
 			{
-				for (col = 0; col < TILE_WIDTH_COUNT; col++)
+				// Drop the frame if the resolution or scaling changed after it was captured, or if the buffer is
+				// smaller than what the tile code reads at this frame's color depth.
+				PIXEL_SIZE = framePixelSize;
+				dropFrame = (frameGeneration != gGeometryGeneration) || !desktop_buffer_fits(desktopsize, PIXEL_SIZE);
+				aborted = 0;
+
+				// A partial frame lists the tiles that can have changed, the others are not checked.
+				if (!dropFrame && frameInfo.kind == KVM_FRAME_PARTIAL && frameInfo.tileDirty != NULL)
 				{
-					height = TILE_HEIGHT * row;
-					width = TILE_WIDTH * col;
-
-					while (!g_shutdown && (g_pause))
+					for (row = 0; row < TILE_HEIGHT_COUNT; row++)
 					{
-						Sleep(50); /*printf(".");*/
-					} // If the socket is in pause state, wait here. //ToDo: YLIAN!!!!
-
-					if (g_shutdown || SCALING_FACTOR != SCALING_FACTOR_NEW)
-					{
-						height = SCALED_HEIGHT;
-						width = SCALED_WIDTH;
-						break;
-					}
-
-					// Skip the tile if it has already been sent or if the CRC is same as before
-					if (tileInfo[row][col].flags == (char)TILE_SENT || tileInfo[row][col].flags == (char)TILE_DONT_SEND)
-					{
-						continue;
-					}
-
-					if (get_tile_at(width, height, &buf, &tilesize, desktop, row, col) == 1)
-					{
-						// GetTileAt failed, lets not send the tile
-						continue;
-					}
-					if (buf && !g_shutdown)
-					{
-						sentTiles = 1;
-						KVMDEBUG2("Writing JPEG: %llu bytes", tilesize);
-						switch (writeHandler((char *)buf, (int)tilesize, reserved))
+						for (col = 0; col < TILE_WIDTH_COUNT; col++)
 						{
-						case ILibTransport_DoneState_INCOMPLETE:
-							g_pause = 1;
-							ILibRemoteLogging_printf(ILibChainGetLogger(gILibChain), ILibRemoteLogging_Modules_Agent_KVM, ILibRemoteLogging_Flags_VerbosityLevel_2, "Agent KVM: KVM PAUSE");
-							KVMDEBUG2("JPEG WRITE resulted in PAUSE");
-							break;
-						case ILibTransport_DoneState_ERROR:
-							g_shutdown = 1;
-							height = SCALED_HEIGHT;
-							width = SCALED_WIDTH;
-							KVMDEBUG2("JPEG WRITE resulted in ERROR");
-							break;
+							if (frameInfo.tileDirty[(row * TILE_WIDTH_COUNT) + col] == 0) { tileInfo[row][col].flags = (char)TILE_DONT_SEND; }
 						}
-						free(buf);
 					}
 				}
+
+				bmpInfo = get_bmp_info(TILE_WIDTH, TILE_HEIGHT);
+				for (row = 0; !dropFrame && row < TILE_HEIGHT_COUNT; row++)
+				{
+					for (col = 0; col < TILE_WIDTH_COUNT; col++)
+					{
+						height = TILE_HEIGHT * row;
+						width = TILE_WIDTH * col;
+
+						while (!g_shutdown && (g_pause))
+						{
+							Sleep(50); /*printf(".");*/
+						} // If the socket is in pause state, wait here. //ToDo: YLIAN!!!!
+
+						if (g_shutdown || SCALING_FACTOR != SCALING_FACTOR_NEW)
+						{
+							height = SCALED_HEIGHT;
+							width = SCALED_WIDTH;
+							aborted = 1;
+							break;
+						}
+
+						// Skip the tile if it has already been sent or if the CRC is same as before
+						if (tileInfo[row][col].flags == (char)TILE_SENT || tileInfo[row][col].flags == (char)TILE_DONT_SEND)
+						{
+							continue;
+						}
+
+						if (get_tile_at(width, height, &buf, &tilesize, desktop, row, col) == 1)
+						{
+							// GetTileAt failed, lets not send the tile
+							continue;
+						}
+						if (buf && !g_shutdown)
+						{
+#ifdef KVM_STATS_LOG
+							LARGE_INTEGER w0, w1;
+							QueryPerformanceCounter(&w0);
+#endif
+							sentTiles = 1;
+							KVMDEBUG2("Writing JPEG: %llu bytes", tilesize);
+							switch (writeHandler((char *)buf, (int)tilesize, reserved))
+							{
+							case ILibTransport_DoneState_INCOMPLETE:
+								g_pause = 1;
+								ILibRemoteLogging_printf(ILibChainGetLogger(gILibChain), ILibRemoteLogging_Modules_Agent_KVM, ILibRemoteLogging_Flags_VerbosityLevel_2, "Agent KVM: KVM PAUSE");
+								KVMDEBUG2("JPEG WRITE resulted in PAUSE");
+								break;
+							case ILibTransport_DoneState_ERROR:
+								g_shutdown = 1;
+								height = SCALED_HEIGHT;
+								width = SCALED_WIDTH;
+								aborted = 1;
+								KVMDEBUG2("JPEG WRITE resulted in ERROR");
+								break;
+							}
+#ifdef KVM_STATS_LOG
+							QueryPerformanceCounter(&w1);
+							statTiles++;
+							statBytes += tilesize;
+							statWriteUs += ((w1.QuadPart - w0.QuadPart) * 1000000LL) / kvm_qpc_frequency();
+#endif
+							free(buf);
+						}
+						else if (buf)
+						{
+							free(buf); // The session is closing
+						}
+					}
+				}
+
+				// A complete or partial frame that was not processed to the end (dropped, paused session closed, write error)
+				// leaves changes that the CRC of the tiles does not know about yet. The next frame has to check every tile.
+				if (dropFrame || aborted) { InterlockedExchange(&gKvmFullFrame, 1); }
 			}
 
 			KVMDEBUG("kvm_server_mainloop / loop2", (int)GetCurrentThreadId());
@@ -1287,10 +1517,17 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 				free(desktop);
 			desktop = NULL;
 			desktopsize = 0;
+			if (frameInfo.tileDirty)
+				free(frameInfo.tileDirty);
+			frameInfo.tileDirty = NULL;
 		}
 
 		KVMDEBUG("kvm_server_mainloop / loop3", (int)GetCurrentThreadId());
 		lastSentTiles = sentTiles;
+#ifdef KVM_STATS_LOG
+		kvm_stats_account(captureResult == 0 ? &frameInfo : NULL, statTiles, statBytes, statWriteUs);
+		kvm_stats_flush(0);
+#endif
 
 		// We can't go full speed here, we need to slow this down.
 		// When tiles were sent, the time spent capturing and encoding counts towards the frame rate timer.
@@ -1299,6 +1536,10 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 		{
 			DWORD elapsed = timeGetTime() - frameStart;
 			height = (elapsed >= (DWORD)FRAME_RATE_TIMER) ? 0 : (FRAME_RATE_TIMER - (int)elapsed);
+		}
+		if (idleWait)
+		{
+			height = 0; // The capture already waited for changes, no second pause
 		}
 		while (!g_shutdown && height > 0)
 		{
@@ -1317,12 +1558,18 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 	}
 
 	timeEndPeriod(1);
+#ifdef KVM_STATS_LOG
+	kvm_stats_flush(1);
+#endif
 
 	// Stop the capture thread
 	if (captureInFlight)
 	{
-		void *pending = kvm_capture_wait(&desktopsize, &frameGeneration, &framePixelSize);
+		void *pending = NULL;
+		kvm_frame_info pendingInfo;
+		kvm_capture_wait(&pending, &desktopsize, &frameGeneration, &framePixelSize, &pendingInfo);
 		if (pending != NULL) free(pending);
+		if (pendingInfo.tileDirty != NULL) free(pendingInfo.tileDirty);
 	}
 	if (gCapture.thread != NULL)
 	{
@@ -1607,196 +1854,5 @@ void kvm_cleanup()
 		ILibRemoteLogging_printf(ILibChainGetLogger(gILibChain), ILibRemoteLogging_Modules_Agent_KVM, ILibRemoteLogging_Flags_VerbosityLevel_1, "KVM.c/kvm_cleanup: gChildProcess = NULL");
 	}
 }
-
-////
-//// Desktop Duplication API KVM
-////
-// #include <d3d11.h>
-// #include <dxgi1_2.h>
-//
-// typedef struct D3D11_Functions
-//{
-//	HRESULT(*D3D11CreateDevice)(
-//		IDXGIAdapter            *pAdapter,
-//		D3D_DRIVER_TYPE         DriverType,
-//		HMODULE                 Software,
-//		UINT                    Flags,
-//		const D3D_FEATURE_LEVEL *pFeatureLevels,
-//		UINT                    FeatureLevels,
-//		UINT                    SDKVersion,
-//		ID3D11Device            **ppDevice,
-//		D3D_FEATURE_LEVEL       *pFeatureLevel,
-//		ID3D11DeviceContext     **ppImmediateContext
-//		);
-// }D3D11_Functions;
-
-// void DD_Init()
-//{
-// int i;
-// HRESULT hr;
-// ID3D11Device* m_Device;
-// ID3D11DeviceContext* m_DeviceContext;
-// IDXGIFactory2* m_Factory;
-// DWORD m_OcclusionCookie;
-// DXGI_OUTDUPL_DESC lOutputDuplDesc;
-// ID3D11Texture2D *lGDIImage;
-// ID3D11Texture2D *desktopImage;
-// ID3D11Texture2D *destinationImage;
-
-// DXGI_OUTDUPL_FRAME_INFO lFrameInfo;
-// IDXGIResource *lDesktopResource;
-
-// D3D11_Functions funcs;
-
-// HMODULE _D3D = NULL;
-// if ((_D3D = LoadLibraryExA((LPCSTR)"D3D11.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32)) != NULL)
-//{
-//	(FARPROC)funcs.D3D11CreateDevice = GetProcAddress(_D3D, "D3D11CreateDevice");
-// }
-
-// D3D_DRIVER_TYPE DriverTypes[] =
-//{
-//	D3D_DRIVER_TYPE_HARDWARE,
-//	D3D_DRIVER_TYPE_WARP,
-//	D3D_DRIVER_TYPE_REFERENCE,
-// };
-// UINT NumDriverTypes = ARRAYSIZE(DriverTypes);
-
-//// Feature levels supported
-// D3D_FEATURE_LEVEL FeatureLevels[] =
-//{
-//	D3D_FEATURE_LEVEL_11_0,
-//	D3D_FEATURE_LEVEL_10_1,
-//	D3D_FEATURE_LEVEL_10_0,
-//	D3D_FEATURE_LEVEL_9_1
-// };
-// UINT NumFeatureLevels = ARRAYSIZE(FeatureLevels);
-// D3D_FEATURE_LEVEL FeatureLevel;
-
-//// Create device
-// for (UINT DriverTypeIndex = 0; DriverTypeIndex < NumDriverTypes; ++DriverTypeIndex)
-//{
-//	hr = funcs.D3D11CreateDevice(NULL, DriverTypes[DriverTypeIndex], NULL, 0, FeatureLevels, NumFeatureLevels, D3D11_SDK_VERSION, &m_Device, &FeatureLevel, &m_DeviceContext);
-//	if (SUCCEEDED(hr))
-//	{
-//		// Device creation succeeded, no need to loop anymore
-//		break;
-//	}
-// }
-// if (FAILED(hr))
-//{
-//	DebugBreak();
-// }
-
-//// Get DXGI factory
-// IDXGIDevice* DxgiDevice = NULL;
-// hr = m_Device->lpVtbl->QueryInterface(m_Device, &IID_IDXGIDevice, (void**)&DxgiDevice);
-// if (FAILED(hr))
-//{
-//	DebugBreak();
-// }
-
-// IDXGIAdapter* DxgiAdapter = NULL;
-// hr = DxgiDevice->lpVtbl->GetParent(DxgiDevice, &IID_IDXGIAdapter, (void**)&DxgiAdapter);
-// DxgiDevice->lpVtbl->Release(DxgiDevice);
-// DxgiDevice = NULL;
-// if (FAILED(hr))
-//{
-//	DebugBreak();
-// }
-
-// hr = DxgiAdapter->lpVtbl->GetParent(DxgiAdapter, &IID_IDXGIFactory2, (void**)&m_Factory);
-// DxgiAdapter->lpVtbl->Release(DxgiAdapter);
-// DxgiAdapter = NULL;
-// if (FAILED(hr))
-//{
-//	DebugBreak();
-//	//return ProcessFailure(m_Device, L"Failed to get parent DXGI Factory", L"Error", hr, SystemTransitionsExpectedErrors);
-// }
-
-// IDXGIOutput1 *DxgiOutput1;
-// hr = m_Device->lpVtbl->QueryInterface(m_Device, &IID_IDXGIOutput, (void**)&DxgiOutput1);
-// if (FAILED(hr))
-//{
-//	DebugBreak();
-// }
-
-// IDXGIOutputDuplication *dupl = NULL;
-// DxgiOutput1->lpVtbl->DuplicateOutput(DxgiOutput1, m_Device, &dupl);
-
-//// Create GUI drawing texture
-// dupl->lpVtbl->GetDesc(dupl, &lOutputDuplDesc);
-
-// D3D11_TEXTURE2D_DESC desc;
-// desc.Width = lOutputDuplDesc.ModeDesc.Width;
-// desc.Height = lOutputDuplDesc.ModeDesc.Height;
-// desc.Format = lOutputDuplDesc.ModeDesc.Format;
-// desc.ArraySize = 1;
-// desc.BindFlags = D3D11_BIND_RENDER_TARGET;
-// desc.MiscFlags = D3D11_RESOURCE_MISC_GDI_COMPATIBLE;
-// desc.SampleDesc.Count = 1;
-// desc.SampleDesc.Quality = 0;
-// desc.MipLevels = 1;
-// desc.CPUAccessFlags = 0;
-// desc.Usage = D3D11_USAGE_DEFAULT;
-
-// hr = m_Device->lpVtbl->CreateTexture2D(m_Device, &desc, NULL, &lGDIImage);
-// hr = m_Device->lpVtbl->CreateTexture2D(m_Device, &desc, NULL, &destinationImage);
-
-// if (FAILED(hr))
-//{
-//	DebugBreak();
-// }
-
-//// Get new frame
-// for (i = 0; i < 5; ++i)
-//{
-//	hr = dupl->lpVtbl->AcquireNextFrame(dupl, 250, &lFrameInfo, &lDesktopResource);
-//	if (hr != DXGI_ERROR_WAIT_TIMEOUT) { break; }
-//	Sleep(100);
-// }
-//
-// hr = lDesktopResource->lpVtbl->QueryInterface(lDesktopResource, &IID_ID3D11Texture2D, &desktopImage);
-
-//// Copy image into GDI drawing texture
-// m_DeviceContext->lpVtbl->CopyResource(m_DeviceContext, lGDIImage, desktopImage);
-
-//// Draw cursor image into GDI drawing texture
-// IDXGISurface1 *surface;
-// hr = lGDIImage->lpVtbl->QueryInterface(lGDIImage, &IID_IDXGISurface1, &surface);
-
-//// Copy from CPU access texture to bitmap buffer
-
-// D3D11_MAPPED_SUBRESOURCE resource;
-// UINT subresource = D3D11CalcSubresource(0, 0, 0);
-// m_DeviceContext->lpVtbl->Map(m_DeviceContext, destinationImage, subresource, D3D11_MAP_READ_WRITE, 0, &resource);
-
-// BITMAPINFO	lBmpInfo;
-
-//// BMP 32 bpp
-
-// ZeroMemory(&lBmpInfo, sizeof(BITMAPINFO));
-// lBmpInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-// lBmpInfo.bmiHeader.biBitCount = 32;
-// lBmpInfo.bmiHeader.biCompression = BI_RGB;
-// lBmpInfo.bmiHeader.biWidth = lOutputDuplDesc.ModeDesc.Width;
-// lBmpInfo.bmiHeader.biHeight = lOutputDuplDesc.ModeDesc.Height;
-// lBmpInfo.bmiHeader.biPlanes = 1;
-// lBmpInfo.bmiHeader.biSizeImage = lOutputDuplDesc.ModeDesc.Width * lOutputDuplDesc.ModeDesc.Height * 4;
-
-// BYTE* pBuf = (BYTE*)ILibMemory_SmartAllocate(lBmpInfo.bmiHeader.biSizeImage);
-// UINT lBmpRowPitch = lOutputDuplDesc.ModeDesc.Width * 4;
-// BYTE* sptr = (BYTE*)resource.pData;
-// BYTE* dptr = pBuf + lBmpInfo.bmiHeader.biSizeImage - lBmpRowPitch;
-// UINT lRowPitch = min(lBmpRowPitch, resource.RowPitch);
-// size_t h;
-
-// for (h = 0; h < lOutputDuplDesc.ModeDesc.Height; ++h)
-//{
-//	memcpy_s(dptr, lBmpRowPitch, sptr, lRowPitch);
-//	sptr += resource.RowPitch;
-//	dptr -= lBmpRowPitch;
-// }
-//}
 
 #endif

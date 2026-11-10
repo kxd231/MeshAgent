@@ -384,7 +384,7 @@
     <ClCompile>
       <Optimization>Disabled</Optimization>
       <AdditionalIncludeDirectories>..\openssl\include;$(TurboJpegDir)\include;..\;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>_TURBOJPEG;MESH_AGENTID=4;DUK_USE_DATE_NOW_WINDOWS;MICROSTACK_PROXY;_WINSERVICE;NOLMSCOMMANDER;WIN32;WIN64;_LINKVM;_DEBUG;_CONSOLE;MEMORY_CHECK;MICROSTACK_NO_STDAFX;MICROSTACK_PROXY;__STDC__;_CRT_SECURE_NO_WARNINGS;WINSOCK2;ILibWebServer_SESSION_TRACKING;_REMOTELOGGING;_REMOTELOGGINGSERVER;MICROSTACK_TLS_DETECT;_MSC_PLATFORM_TOOLSET_$(PlatformToolset);ILibChain_WATCHDOG_TIMEOUT=600000;DUK_USE_DEBUGGER_SUPPORT;DUK_USE_INTERRUPT_COUNTER;DUK_USE_DEBUGGER_INSPECT;DUK_USE_DEBUGGER_PAUSE_UNCAUGHT;DUK_USE_DEBUGGER_DUMPHEAP;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>KVM_DXGI;_TURBOJPEG;MESH_AGENTID=4;DUK_USE_DATE_NOW_WINDOWS;MICROSTACK_PROXY;_WINSERVICE;NOLMSCOMMANDER;WIN32;WIN64;_LINKVM;_DEBUG;_CONSOLE;MEMORY_CHECK;MICROSTACK_NO_STDAFX;MICROSTACK_PROXY;__STDC__;_CRT_SECURE_NO_WARNINGS;WINSOCK2;ILibWebServer_SESSION_TRACKING;_REMOTELOGGING;_REMOTELOGGINGSERVER;MICROSTACK_TLS_DETECT;_MSC_PLATFORM_TOOLSET_$(PlatformToolset);ILibChain_WATCHDOG_TIMEOUT=600000;DUK_USE_DEBUGGER_SUPPORT;DUK_USE_INTERRUPT_COUNTER;DUK_USE_DEBUGGER_INSPECT;DUK_USE_DEBUGGER_PAUSE_UNCAUGHT;DUK_USE_DEBUGGER_DUMPHEAP;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <MinimalRebuild>true</MinimalRebuild>
       <BasicRuntimeChecks>EnableFastChecks</BasicRuntimeChecks>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
@@ -636,7 +636,7 @@ powershell -ExecutionPolicy Unrestricted $(ProjectDir)prebuild.ps1 $(ProjectDir)
       <Optimization>MinSpace</Optimization>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <AdditionalIncludeDirectories>..\openssl\include;$(TurboJpegDir)\include;..\;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>_TURBOJPEG;MESH_AGENTID=4;DUK_USE_DATE_NOW_WINDOWS;NOLMSCOMMANDER;MICROSTACK_PROXY;WIN32;WIN64;_WINSERVICE;NDEBUG;_LINKVM;_CONSOLE;MICROSTACK_NO_STDAFX;WINSOCK2;MICROSTACK_TLS_DETECT;_MSC_PLATFORM_TOOLSET_$(PlatformToolset);ILibChain_WATCHDOG_TIMEOUT=600000;DUK_USE_DEBUGGER_SUPPORT;DUK_USE_INTERRUPT_COUNTER;DUK_USE_DEBUGGER_INSPECT;DUK_USE_DEBUGGER_PAUSE_UNCAUGHT;DUK_USE_DEBUGGER_DUMPHEAP;_REMOTELOGGING;_REMOTELOGGINGSERVER;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>KVM_DXGI;_TURBOJPEG;MESH_AGENTID=4;DUK_USE_DATE_NOW_WINDOWS;NOLMSCOMMANDER;MICROSTACK_PROXY;WIN32;WIN64;_WINSERVICE;NDEBUG;_LINKVM;_CONSOLE;MICROSTACK_NO_STDAFX;WINSOCK2;MICROSTACK_TLS_DETECT;_MSC_PLATFORM_TOOLSET_$(PlatformToolset);ILibChain_WATCHDOG_TIMEOUT=600000;DUK_USE_DEBUGGER_SUPPORT;DUK_USE_INTERRUPT_COUNTER;DUK_USE_DEBUGGER_INSPECT;DUK_USE_DEBUGGER_PAUSE_UNCAUGHT;DUK_USE_DEBUGGER_DUMPHEAP;_REMOTELOGGING;_REMOTELOGGINGSERVER;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <PrecompiledHeader>
@@ -821,6 +821,7 @@ powershell -ExecutionPolicy Unrestricted $(ProjectDir)prebuild.ps1 $(ProjectDir)
   <ItemGroup>
     <ClCompile Include="..\meshcore\agentcore.c" />
     <ClCompile Include="..\meshcore\KVM\Windows\input.c" />
+    <ClCompile Include="..\meshcore\KVM\Windows\dxgi_capture.cpp" />
     <ClCompile Include="..\meshcore\KVM\Windows\kvm.c" />
     <ClCompile Include="..\meshcore\KVM\Windows\tile.cpp" />
     <ClCompile Include="..\meshcore\meshinfo.c" />
@@ -877,6 +878,7 @@ powershell -ExecutionPolicy Unrestricted $(ProjectDir)prebuild.ps1 $(ProjectDir)
     <ClInclude Include="..\meshcore\agentcore.h" />
     <ClInclude Include="..\meshcore\KVM\Windows\input.h" />
     <ClInclude Include="..\meshcore\KVM\Windows\kvm.h" />
+    <ClInclude Include="..\meshcore\KVM\Windows\dxgi_capture.h" />
     <ClInclude Include="..\meshcore\KVM\Windows\tile.h" />
     <ClInclude Include="..\meshcore\meshdefines.h" />
     <ClInclude Include="..\meshcore\meshinfo.h" />
