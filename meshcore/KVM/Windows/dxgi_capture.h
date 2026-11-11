@@ -70,6 +70,9 @@ struct pm_sprite; // dxgi_ptrmask.h (C++ only, included by the files that use it
 #ifndef KVM_DXGI_POINTER_MIN_DIFF
 #define KVM_DXGI_POINTER_MIN_DIFF 8		// differing pixels in the cursor field (DXGI image against GDI) that mean 'the cursor is part of the image'
 #endif
+#ifndef KVM_DXGI_POINTER_NEAR_PX
+#define KVM_DXGI_POINTER_NEAR_PX 128		// a full match of the cursor within this distance of an expected place ends the search for the cursor in a frame (others are only compared when none is)
+#endif
 #ifndef KVM_DXGI_POINTER_QUIET_MS
 #define KVM_DXGI_POINTER_QUIET_MS 150	// no frame touched the cursor field for this long: the pixels under the cursor are read from GDI and the mask is corrected
 #endif

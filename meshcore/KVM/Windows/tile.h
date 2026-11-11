@@ -36,10 +36,18 @@ struct tileInfo_t {
 	unsigned char streak;		// changes of the content in a row, each at most KVM_ADAPT_MOTION_MS after the previous one
 	unsigned char noted;		// low byte of the frame stamp: the content of this frame was already looked at
 	unsigned char refresh;		// the tile is sent only because of a refresh / new geometry (the content did not change)
+	unsigned char deferred;		// WA-2b: a change of this tile was held back by the motion frame limit; it has to be looked at again and sent
+	unsigned int deferredAt;	// timeGetTime() of the first time it was held back (0 = not held back): held-back changes are served in this order
 	int contentCrc;
 	unsigned int lastChange;	// timeGetTime() of the last change of the content
 #endif
 };
+
+#ifdef KVM_ADAPT_ENABLED
+#define KVM_TILE_DEFERRED(t) ((t)->deferred != 0)
+#else
+#define KVM_TILE_DEFERRED(t) 0
+#endif
 
 // Initial state of a tile: the viewer has nothing yet (crc 0xFF), WA-2 state empty.
 static __inline void kvm_tile_init(struct tileInfo_t *t)
@@ -47,7 +55,7 @@ static __inline void kvm_tile_init(struct tileInfo_t *t)
 	t->crc = 0xFF;
 	t->flags = 0;
 #ifdef KVM_ADAPT_ENABLED
-	t->sentQ = 0; t->sentSub = 0; t->streak = 0; t->noted = 0; t->refresh = 0;
+	t->sentQ = 0; t->sentSub = 0; t->streak = 0; t->noted = 0; t->refresh = 0; t->deferred = 0; t->deferredAt = 0;
 	t->contentCrc = 0x7FFFFFFF;
 	t->lastChange = 0;
 #endif

@@ -197,6 +197,49 @@ int main()
 	}
 		pm_cache_free(&cache2);
 	}
+	// pm_sprite_spread is a permutation: every opaque pixel exactly once (n = 4..4000 all, then every 97th up to 65536)
+	{
+		int bad = 0, tested = 0;
+		for (int n = 4; n <= 65536; n += (n < 4000 ? 1 : 97))
+		{
+			pm_sprite sp; memset(&sp, 0, sizeof(sp));
+			sp.n = n; sp.x = (int *)malloc(sizeof(int) * n); sp.y = (int *)malloc(sizeof(int) * n); sp.rgb = (unsigned char *)malloc((size_t)n * 3);
+			for (int i = 0; i < n; i++) { sp.x[i] = i; sp.y[i] = n - i; sp.rgb[i * 3] = (unsigned char)i; sp.rgb[i * 3 + 1] = sp.rgb[i * 3 + 2] = 0; }
+			pm_sprite_spread(&sp);
+			std::vector<unsigned char> seen((size_t)n, 0);
+			bool ok = true;
+			for (int i = 0; i < n && ok; i++) { if (sp.x[i] < 0 || sp.x[i] >= n || seen[sp.x[i]] || sp.y[i] != n - sp.x[i] || sp.rgb[i * 3] != (unsigned char)sp.x[i]) { ok = false; } else { seen[sp.x[i]] = 1; } }
+			if (!ok) { bad++; if (bad <= 3) { printf("not a permutation: n = %d\n", n); } }
+			tested++;
+			pm_sprite_free(&sp);
+		}
+		CHECK(bad == 0, "pm_sprite_spread: %d of %d sizes are not permutations", bad, tested);
+		printf("spread: %d sizes tested\n", tested);
+	}
+	// pm_pick: the same cursor twice in the frame (a screenshot of a desktop inside the frame): the one near the expected place wins
+	{
+		pm_cand c[3] = { { 300, 200, 70 }, { 40, 30, 70 }, { 41, 31, 50 } };
+		int ex[2] = { 38, 500 }, ey[2] = { 29, 500 };
+		CHECK(pm_pick(c, 3, ex, ey, 2) == 1, "pm_pick near candidate: %d", pm_pick(c, 3, ex, ey, 2));
+		pm_cand one[1] = { { 900, 900, 40 } };
+		CHECK(pm_pick(one, 1, ex, ey, 2) == 0, "a single candidate far away is taken");
+		pm_cand weak[2] = { { 40, 30, 20 }, { 300, 200, 70 } };
+		CHECK(pm_pick(weak, 2, ex, ey, 2) == 1, "a much weaker candidate near does not beat a full one: %d", pm_pick(weak, 2, ex, ey, 2));
+		CHECK(pm_pick(c, 0, ex, ey, 2) == -1, "no candidates");
+	}
+	// more than PM_REGIONS small rectangles: the ones near the cursor must be saved first (the rule of dx_precopy, here as the ordering it relies on)
+	{
+		pm_rect win = { 90, 50, 130, 90 };
+		int order[40], no = 0;
+		for (int pass = 0; pass < 2; pass++) for (int i = 0; i < 40; i++)
+		{
+			pm_rect q = { i * 4, i * 2, i * 4 + 6, i * 2 + 6 };
+			bool near = q.left < win.right && q.right > win.left && q.top < win.bottom && q.bottom > win.top;
+			if ((pass == 0) == near) { order[no++] = i; }
+		}
+		int posOfNear = -1; for (int k = 0; k < no; k++) { pm_rect q = { order[k] * 4, order[k] * 2, order[k] * 4 + 6, order[k] * 2 + 6 }; if (q.left < win.right && q.right > win.left && q.top < win.bottom && q.bottom > win.top) { posOfNear = k; break; } }
+		CHECK(no == 40 && posOfNear == 0, "near rectangles come first (%d)", posOfNear);
+	}
 	printf(g_fail ? "FAILED %d\n" : "ALL OK\n", g_fail);
 	return g_fail ? 1 : 0;
 }

@@ -616,6 +616,7 @@ static double dx_qpc_ms(void)
 // Safety net of the measurement branch: when DXGI has reported no change for a while, the persistent image is compared with a
 // fresh GDI capture (outside the cursor). Differences twice in a row mean that the duplication stopped reporting. Returns the
 // number of differing pixels, -1 when the check could not be made.
+static int g_staleBox[4]; // rectangle around the differences of the last dx_stale_compare()
 static long long dx_stale_compare(int sw, int sh)
 {
 	BITMAPINFO bi;
@@ -650,6 +651,28 @@ static long long dx_stale_compare(int sw, int sh)
 			skip.left = ci.ptScreenPos.x - SCREEN_X - 64; skip.right = skip.left + 192;
 			skip.top = ci.ptScreenPos.y - SCREEN_Y - 64; skip.bottom = skip.top + 192;
 			diff = kvm_count_pixel_diff(fullBits + ((size_t)(sh - 1) * sw * 4), -(ptrdiff_t)sw * 4, (unsigned char*)bits + ((size_t)(sh - 1) * sw * 4), -(ptrdiff_t)sw * 4, SCREEN_WIDTH, SCREEN_HEIGHT, &skip);
+			g_staleBox[0] = g_staleBox[1] = g_staleBox[2] = g_staleBox[3] = 0;
+			if (diff > 0)
+			{
+				// Rectangle around the differences (same skip field as the count): x0,y0 inclusive, x1,y1 exclusive, in screen pixels, top-down
+				int x0 = SCREEN_WIDTH, y0 = SCREEN_HEIGHT, x1 = 0, y1 = 0;
+				for (int y = 0; y < SCREEN_HEIGHT; y++)
+				{
+					const unsigned char *pa = fullBits + ((size_t)(sh - 1 - y) * sw * 4), *pb = (const unsigned char*)bits + ((size_t)(sh - 1 - y) * sw * 4);
+					for (int x = 0; x < SCREEN_WIDTH; x++)
+					{
+						if (y >= skip.top && y < skip.bottom && x >= skip.left && x < skip.right) { continue; }
+						if (pa[x * 4] != pb[x * 4] || pa[x * 4 + 1] != pb[x * 4 + 1] || pa[x * 4 + 2] != pb[x * 4 + 2])
+						{
+							if (x < x0) { x0 = x; }
+							if (x + 1 > x1) { x1 = x + 1; }
+							if (y < y0) { y0 = y; }
+							if (y + 1 > y1) { y1 = y + 1; }
+						}
+					}
+				}
+				g_staleBox[0] = x0; g_staleBox[1] = y0; g_staleBox[2] = x1; g_staleBox[3] = y1;
+			}
 		}
 		SelectObject(dc, old);
 	}
@@ -853,6 +876,8 @@ static void dx_precopy(int fullCopy, int rectCount, const dxgi_rect *rects)
 		if (win[i].right > SCREEN_WIDTH) { win[i].right = SCREEN_WIDTH; }
 		if (win[i].bottom > SCREEN_HEIGHT) { win[i].bottom = SCREEN_HEIGHT; }
 	}
+	// Only PM_REGIONS rectangles are saved: first the ones near the places where the cursor can be (and the large ones, where the windows are saved), then the others
+	for (int pass = 0; pass < 2; pass++)
 	for (int i = 0; i < rectCount && gDx.ptr.nReg < PM_REGIONS; i++)
 	{
 		q = rects[i];
@@ -860,6 +885,11 @@ static void dx_precopy(int fullCopy, int rectCount, const dxgi_rect *rects)
 		if (q.right > SCREEN_WIDTH) { q.right = SCREEN_WIDTH; } if (q.bottom > SCREEN_HEIGHT) { q.bottom = SCREEN_HEIGHT; }
 		if (q.right <= q.left || q.bottom <= q.top) { continue; }
 		long long area = (long long)(q.right - q.left) * (q.bottom - q.top);
+		{
+			int nearWin = (area > 65536) ? 1 : 0;
+			for (int k = 0; k < nWin && !nearWin; k++) { if (q.left < win[k].right && q.right > win[k].left && q.top < win[k].bottom && q.bottom > win[k].top) { nearWin = 1; } }
+			if ((pass == 0) != (nearWin != 0)) { continue; }
+		}
 		if (area <= 65536)
 		{
 			if (budget < area || !pm_region_save(fullBits, gDx.ptr.sw, gDx.ptr.sh, &gDx.ptr.reg[gDx.ptr.nReg], PMR(q))) { continue; }
@@ -940,7 +970,7 @@ static int dx_pointer_process(const dxgi_frame &f, int gotImage, int sw, int sh,
 	if (gotImage && gDx.ptr.hookState != 0)
 	{
 		int st = gDx.ptr.hookState;
-		int found = 0, bx = 0, by = 0, hits = 0, outside = 0;
+		int found = 0, bx = 0, by = 0, hits = 0, outside = 0, farPick = 0;
 		pm_mask *e;
 		ur = gDx.ptr.hookUr; cr = gDx.ptr.hookCr; hc = gDx.ptr.hookHc; cp = gDx.ptr.hookPos;
 		gDx.ptr.hookState = 0;
@@ -948,13 +978,40 @@ static int dx_pointer_process(const dxgi_frame &f, int gotImage, int sw, int sh,
 		if (st == 1 && e->spState == 1)
 		{
 			// Where did the system put the cursor into this frame? Not necessarily where GetCursorInfo says it is now.
+			// Several places can look like the cursor (the same arrow inside a screenshot shown in the frame): collect the best match of every region and take the
+			// one nearest to where the cursor is expected (GetCursorInfo, the places where it was found before). A full match within KVM_DXGI_POINTER_NEAR_PX of an
+			// expected place ends the search (the usual case costs what it did).
 			double t0 = dx_qpc_ms();
 			long long tried = 0;
+			pm_cand cand[PM_REGIONS];
+			int nCand = 0, ex[4], ey[4], nEx = 0;
+			ex[nEx] = (cp.x - SCREEN_X) - e->sp.hx; ey[nEx++] = (cp.y - SCREEN_Y) - e->sp.hy;
+			for (int i = 0; i < gDx.ptr.nHist && nEx < 4; i++) { ex[nEx] = gDx.ptr.hist[i].left + KVM_DXGI_POINTER_MARGIN; ey[nEx++] = gDx.ptr.hist[i].top + KVM_DXGI_POINTER_MARGIN; }
 			for (int i = 0; i < gDx.ptr.nReg; i++)
 			{
 				int x = 0, y = 0, h2 = 0;
-				if (pm_find(fullBits, sw, sh, &e->sp, gDx.ptr.reg[i].r, &x, &y, &h2, 120000, &tried) && h2 > hits) { hits = h2; bx = x; by = y; found = 1; }
-				if (hits >= e->sp.n) { break; } // every opaque pixel matches: that is it
+				long long left = 600000 - tried;
+				if (left <= 0) { break; }
+				if (pm_find(fullBits, sw, sh, &e->sp, gDx.ptr.reg[i].r, &x, &y, &h2, left < 120000 ? left : 120000, &tried))
+				{
+					cand[nCand].x = x; cand[nCand].y = y; cand[nCand].hits = h2; nCand++;
+					if (h2 >= e->sp.n)
+					{
+						int isNear = 0;
+						for (int k = 0; k < nEx; k++) { int dx = x - ex[k], dy = y - ey[k]; if (dx < 0) { dx = -dx; } if (dy < 0) { dy = -dy; } if (dx <= KVM_DXGI_POINTER_NEAR_PX && dy <= KVM_DXGI_POINTER_NEAR_PX) { isNear = 1; } }
+						if (isNear) { break; }
+					}
+				}
+			}
+			{
+				int pick = pm_pick(cand, nCand, ex, ey, nEx);
+				if (pick >= 0)
+				{
+					int nearest = 0x7FFFFFFF;
+					bx = cand[pick].x; by = cand[pick].y; hits = cand[pick].hits; found = 1;
+					for (int k = 0; k < nEx; k++) { int dx = bx - ex[k], dy = by - ey[k], d; if (dx < 0) { dx = -dx; } if (dy < 0) { dy = -dy; } d = dx > dy ? dx : dy; if (d < nearest) { nearest = d; } }
+					if (nearest > KVM_DXGI_POINTER_NEAR_PX) { farPick = 1; } // far from every expected place: maybe not the cursor (a picture of one inside the frame): check the field against GDI
+				}
 			}
 			gDx.ptr.stSearchUs += (unsigned int)((dx_qpc_ms() - t0) * 1000.0);
 			if (found)
@@ -975,13 +1032,16 @@ static int dx_pointer_process(const dxgi_frame &f, int gotImage, int sw, int sh,
 		}
 		if (dx_ptr_buf(&gDx.ptr.N, &gDx.ptr.nCap, (size_t)(cr.right - cr.left) * (cr.bottom - cr.top) * 4))
 		{
-			pm_copy_out(fullBits, sw, sh, PMR(cr), gDx.ptr.N); // the raw pixels of the field: with the cursor
 			if (st == 1 && e->m != NULL && (found || e->spState != 1 || gDx.ptr.hookTouchCur))
 			{
-				// The pixels under the cursor shape come from before the frame, the rest of the field is new
+				// The pixels under the cursor shape come from before the frame, the rest of the field is new.
+				// N (the raw pixels of the field, with the cursor) is only written here and in the branch below: it is what the next quiet GDI read compares with.
+				int sameSpot = (gDx.ptr.nValid && gDx.ptr.curHc == hc && gDx.ptr.curPos.x == cp.x && gDx.ptr.curPos.y == cp.y) ? 1 : 0;
+				pm_copy_out(fullBits, sw, sh, PMR(cr), gDx.ptr.N);
 				outside = pm_restore_regions(e, PMR(ur), PMR(cr), fullBits, sw, sh, gDx.ptr.reg, gDx.ptr.nReg);
 				gDx.ptr.stRestores++;
-				if (outside > 0 || e->provisional || (e->spState == 1 && !found)) { gDx.ptr.stale = 1; }
+				// A still cursor whose field the frame touched: the content under its shape may have changed too (nothing outside the mask changed, so the count above cannot tell): refresh it from GDI.
+				if (outside > 0 || e->provisional || (e->spState == 1 && !found) || farPick || (sameSpot && gDx.ptr.hookTouchCur)) { gDx.ptr.stale = 1; }
 				gDx.ptr.curUr = ur; gDx.ptr.curCr = cr; gDx.ptr.curHc = hc; gDx.ptr.curPos = cp;
 				gDx.ptr.nValid = 1;
 				gDx.ptr.lastTouch = now;
@@ -990,6 +1050,7 @@ static int dx_pointer_process(const dxgi_frame &f, int gotImage, int sw, int sh,
 			else if (gDx.ptr.hookTouchCur && (st == 2 || e->m == NULL))
 			{
 				// A cursor without a mask (monochrome cursor of a new handle), or no pixels from before the frame: one GDI read
+				pm_copy_out(fullBits, sw, sh, PMR(cr), gDx.ptr.N);
 				if (dx_gdi_read(cr))
 				{
 					if (e->m == NULL) { pm_build(e, PMR(ur), PMR(cr), gDx.ptr.N, gDx.ptr.G, 1); dx_mask_log("new_cursor", hc, e); }
@@ -1012,10 +1073,11 @@ static int dx_pointer_process(const dxgi_frame &f, int gotImage, int sw, int sh,
 		HCURSOR hc2;
 		POINT cp2;
 		if (!dx_ptr_field(&ur2, &cr2, &hc2, &cp2)) { gDx.ptr.stale = 0; } // hidden
-		else if (hc2 == gDx.ptr.curHc && cp2.x == gDx.ptr.curPos.x && cp2.y == gDx.ptr.curPos.y && gDx.ptr.nValid &&
+		else if (gDx.ptr.nValid &&
 			((DWORD)(now - gDx.ptr.lastTouch) >= KVM_DXGI_POINTER_QUIET_MS || (DWORD)(now - gDx.ptr.lastGdi) >= KVM_DXGI_POINTER_REFRESH_MS))
 		{
-			// (a cursor that moved gets its new state from the next frame)
+			// The field is the one saved at the last restore (curCr, where the cursor was found), not necessarily where GetCursorInfo says the cursor is now: the GDI read
+			// has no cursor in it, so what it puts under the mask is true wherever the cursor is.
 			pm_mask *e = pm_cache_find(&gDx.ptr.cache, (void *)gDx.ptr.curHc, gDx.ptr.curUr.right - gDx.ptr.curUr.left, gDx.ptr.curUr.bottom - gDx.ptr.curUr.top);
 			if (e != NULL && dx_gdi_read(gDx.ptr.curCr))
 			{
@@ -1297,7 +1359,7 @@ static int kvm_dxgi_frame(void **buffer, long long *bufferSize, long *mouseMove,
 				}
 				else
 				{
-					kvm_stats_log("dxgi %s px=%lld", gDx.staleStrikes >= 2 ? "stale" : "stale_suspect", diff);
+					kvm_stats_log("dxgi %s px=%lld box=%d,%d,%d,%d", gDx.staleStrikes >= 2 ? "stale" : "stale_suspect", diff, g_staleBox[0], g_staleBox[1], g_staleBox[2], g_staleBox[3]);
 					if (gDx.staleStrikes >= 2)
 					{
 						// The duplication does not report what is on the screen: build it again, this frame comes from GDI (complete)
@@ -1456,6 +1518,17 @@ char* alloc_tile_packet(int x, int y, DWORD jpegSize, long long *bufferSize, int
 }
 
 #ifdef _TURBOJPEG
+#ifdef KVM_ADAPT_ENABLED
+static double tile_qpc_ms(void)
+{
+	static LARGE_INTEGER freq;
+	LARGE_INTEGER t;
+	if (freq.QuadPart == 0 && !QueryPerformanceFrequency(&freq)) { freq.QuadPart = 1; }
+	QueryPerformanceCounter(&t);
+	return (double)t.QuadPart * 1000.0 / (double)freq.QuadPart;
+}
+#endif
+static int g_tjOptimize = 0; // WA-2b: optimized Huffman tables for the next encode (set by the caller, see kvm_adapt_jpeg_opt)
 // Encodes the tile as JPEG directly from the bottom-up desktop buffer using TurboJPEG. Returns 0 on success.
 int calc_opt_compr_send_turbo(int x, int y, int captureWidth, int captureHeight, void* desktop, void ** buffer, long long *bufferSize, int quality, int subsamp)
 {
@@ -1472,6 +1545,7 @@ int calc_opt_compr_send_turbo(int x, int y, int captureWidth, int captureHeight,
 	if (tj3Set(tjCompressor, TJPARAM_QUALITY, quality) != 0 ||
 		tj3Set(tjCompressor, TJPARAM_SUBSAMP, subsamp) != 0 ||
 		tj3Set(tjCompressor, TJPARAM_FASTDCT, 1) != 0 ||
+		tj3Set(tjCompressor, TJPARAM_OPTIMIZE, g_tjOptimize) != 0 ||
 		tj3Set(tjCompressor, TJPARAM_BOTTOMUP, 1) != 0)
 	{
 		KVMDEBUG("tj3Set() failed", 0);
@@ -1670,6 +1744,25 @@ static void tile_encode_params(int cls, int *quality, int *subsamp)
 #endif
 }
 
+// The time of the oldest held-back change among the tiles of the rectangle (0 = none of them was held back).
+static unsigned int tile_rect_oldest_deferred(int row0, int col0, int row1, int col1)
+{
+#ifdef KVM_ADAPT_ENABLED
+	unsigned int oldest = 0;
+	for (int r = row0; r <= row1; r++)
+	{
+		for (int c = col0; c <= col1; c++)
+		{
+			if (KVM_TILE_DEFERRED(&tileInfo[r][c]) && (oldest == 0 || (int)(tileInfo[r][c].deferredAt - oldest) < 0)) { oldest = tileInfo[r][c].deferredAt; }
+		}
+	}
+	return oldest;
+#else
+	(void)row0; (void)col0; (void)row1; (void)col1;
+	return 0;
+#endif
+}
+
 //Fetches the encoded jpeg tile at the given location. The neighboring tiles are coalesed to form a larger jpeg before returning.
 int get_tile_at(int x, int y, void** buffer, long long *bufferSize, void *desktop, int row, int col)
 {	
@@ -1690,7 +1783,7 @@ int get_tile_at(int x, int y, void** buffer, long long *bufferSize, void *deskto
 		// Compute CRC on the contents of the bitmap; Proceed with image encoding only if the CRC is different.
 		CRC = tile_crc(x, y, desktop, TILE_WIDTH, TILE_HEIGHT);
 		kvm_adapt_note_crc(&tileInfo[row][col], CRC); // WA-2: the content of the tile was looked at (tileInfo.crc still has the old value)
-		if (CRC == tileInfo[row][col].crc) return 0;
+		if (CRC == tileInfo[row][col].crc && !KVM_TILE_DEFERRED(&tileInfo[row][col])) return 0;
 		tileInfo[row][col].crc = CRC; // Update the tile CRC in the global data structure.
 	}
 
@@ -1701,8 +1794,10 @@ int get_tile_at(int x, int y, void** buffer, long long *bufferSize, void *deskto
 	// COALESCING SECTION
 
 	// First got to the right most changed tile and record it
+	const int maxRectTiles = kvm_adapt_max_rect_tiles(); // under a budget a rectangle stays small enough for the bucket to ration the picture in pieces
 	while (rightcol + 1 < TILE_WIDTH_COUNT)
 	{
+		if (maxRectTiles > 0 && (rightcol + 2 - col) > maxRectTiles) { break; }
 		rightcol++;
 		r_x = rightcol * TILE_WIDTH;
 		
@@ -1714,7 +1809,7 @@ int get_tile_at(int x, int y, void** buffer, long long *bufferSize, void *deskto
 			kvm_adapt_note_crc(&tileInfo[row][rightcol], CRC);
 		}
 
-		if (CRC != tileInfo[row][rightcol].crc || tileInfo[row][rightcol].flags == (char)TILE_MARKED_NOT_SENT) // If the tile has changed, increment the capturewidth.
+		if (CRC != tileInfo[row][rightcol].crc || tileInfo[row][rightcol].flags == (char)TILE_MARKED_NOT_SENT || KVM_TILE_DEFERRED(&tileInfo[row][rightcol])) // If the tile has changed, increment the capturewidth.
 		{
 			tileInfo[row][rightcol].crc = CRC; 
 			if (kvm_adapt_class(&tileInfo[row][rightcol]) != startClass)
@@ -1748,6 +1843,7 @@ int get_tile_at(int x, int y, void** buffer, long long *bufferSize, void *deskto
 	//while ((botrow + 1 < TILE_HEIGHT_COUNT) && ((captureHeight + TILE_HEIGHT) * captureWidth * PIXEL_SIZE / COMPRESSION_RATIO <= 65500))
 	while ((botrow + 1 < TILE_HEIGHT_COUNT))
 	{
+		if (maxRectTiles > 0 && (botrow + 2 - row) * (rightcol - col + 1) > maxRectTiles) { break; }
 		botrow++;
 		r_y = botrow * TILE_HEIGHT;
 		int fail = 0;
@@ -1765,7 +1861,7 @@ int get_tile_at(int x, int y, void** buffer, long long *bufferSize, void *deskto
 				kvm_adapt_note_crc(&tileInfo[botrow][rcol], CRC);
 			}
 
-			if (CRC != tileInfo[botrow][rcol].crc || tileInfo[botrow][rcol].flags == (char)TILE_MARKED_NOT_SENT)
+			if (CRC != tileInfo[botrow][rcol].crc || tileInfo[botrow][rcol].flags == (char)TILE_MARKED_NOT_SENT || KVM_TILE_DEFERRED(&tileInfo[botrow][rcol]))
 			{
 				tileInfo[botrow][rcol].flags = (char)TILE_MARKED_NOT_SENT;
 				tileInfo[botrow][rcol].crc = CRC;
@@ -1823,13 +1919,34 @@ int get_tile_at(int x, int y, void** buffer, long long *bufferSize, void *deskto
 		}
 	}
 
+	// WA-2b: the motion frame limit holds this rectangle back. The tiles keep their new CRC and are marked as deferred: the next frame looks at them
+	// again whether or not the capture lists them as changed (the change must not get lost), and sends them in the class they were held back in.
+	// The same holds back what the budget (byte bucket) does not allow now: it is sent later, in the quality of the ladder step, and sharpened after that.
+	if (kvm_adapt_gate_closed(startClass) || kvm_adapt_bucket_closed((botrow - row + 1) * (rightcol - col + 1), tile_rect_oldest_deferred(row, col, botrow, rightcol)))
+	{
+		for (int r = row; r <= botrow; r++)
+		{
+			for (int c = col; c <= rightcol; c++) { tileInfo[r][c].flags = (char)TILE_SENT; }
+		}
+		kvm_adapt_defer(row, col, botrow, rightcol);
+		return 0;
+	}
+
 	int retval = 0;
 	int firstTime = 1;
+	// Under a budget, at a low ladder step, a larger rectangle of the full class is sent in the quality of the step as well (and sharpened later)
+	int encClass = kvm_adapt_force_motion((botrow - row + 1) * (rightcol - col + 1)) ? 1 : startClass;
+#ifdef KVM_ADAPT_ENABLED
+	double encStart = tile_qpc_ms();
+#endif
+#ifdef _TURBOJPEG
+	g_tjOptimize = kvm_adapt_jpeg_opt(0, (botrow - row + 1) * (rightcol - col + 1));
+#endif
 
 	// This loop is used to adjust the COMPRESSION_RATIO. This loop runs only once most of the time.
 	do {
 		// retval here is 0 if everything was good. It is > 0 if it contains the size of the jpeg that was created and not sent.
-		tile_encode_params(startClass, &quality, &subsamp);
+		tile_encode_params(encClass, &quality, &subsamp);
 		retval = calc_opt_compr_send(x, y, captureWidth, captureHeight, desktop, buffer, bufferSize, quality, subsamp);
 		if (retval == 0 && *bufferSize == 0) break;
 		if (retval != 0)
@@ -1863,12 +1980,15 @@ int get_tile_at(int x, int y, void** buffer, long long *bufferSize, void *deskto
 
 	// Set the flags to TILE_SENT
 	if (*buffer != NULL) {
+#ifdef KVM_ADAPT_ENABLED
+		kvm_adapt_note_encode(0, (unsigned int)((tile_qpc_ms() - encStart) * 1000.0), (botrow - row + 1) * (rightcol - col + 1));
+#endif
 		for (int r = row; r <= botrow; r++) {
 			for (int c = col; c <= rightcol; c++) {
 				tileInfo[r][c].flags = (char)TILE_SENT;
 			}
 		}
-		kvm_adapt_sent(row, col, botrow, rightcol, startClass, quality, subsamp != KVM_FULL_SUBSAMP, *bufferSize);
+		kvm_adapt_sent(row, col, botrow, rightcol, encClass, quality, subsamp != KVM_FULL_SUBSAMP, *bufferSize);
 	}
 
 	return retval;
@@ -1878,8 +1998,15 @@ int get_tile_at(int x, int y, void** buffer, long long *bufferSize, void *deskto
 // WA-2 sharpening: encodes tiles of the current picture with the quality of the user and the normal subsampling. Returns 0 and a packet in *buffer on success.
 int kvm_adapt_encode_sharp(int x, int y, int w, int h, void *desktop, void **buffer, long long *bufferSize, int *quality)
 {
+	double encStart = tile_qpc_ms();
+	int res;
 	*quality = (encCompression < 1) ? 1 : (encCompression > 90 ? 90 : (int)encCompression);
-	return (calc_opt_compr_send(x, y, w, h, desktop, buffer, bufferSize, *quality, KVM_FULL_SUBSAMP) == 0 && *buffer != NULL) ? 0 : 1;
+#ifdef _TURBOJPEG
+	g_tjOptimize = kvm_adapt_jpeg_opt(1, 0);
+#endif
+	res = (calc_opt_compr_send(x, y, w, h, desktop, buffer, bufferSize, *quality, KVM_FULL_SUBSAMP) == 0 && *buffer != NULL) ? 0 : 1;
+	if (res == 0) { kvm_adapt_note_encode(1, (unsigned int)((tile_qpc_ms() - encStart) * 1000.0), (w / TILE_WIDTH) * (h / TILE_HEIGHT)); }
+	return res;
 }
 #endif
 

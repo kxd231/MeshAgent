@@ -40,6 +40,8 @@ struct pm_sprite
 
 static inline void pm_sprite_free(pm_sprite *sp) { free(sp->x); free(sp->y); free(sp->rgb); free(sp->aff); memset(sp, 0, sizeof(*sp)); }
 
+static inline int pm_gcd(int a, int b) { while (b != 0) { int t = a % b; a = b; b = t; } return a; }
+
 // Orders the n opaque pixels so that the first ones are far apart (stride permutation); a, b are the arrays to permute together.
 static inline void pm_sprite_spread(pm_sprite *sp)
 {
@@ -49,7 +51,7 @@ static inline void pm_sprite_spread(pm_sprite *sp)
 	unsigned char *nc = (unsigned char *)malloc((size_t)n * 3);
 	if (nx == NULL || ny == NULL || nc == NULL) { free(nx); free(ny); free(nc); return; }
 	int step = 7;
-	while (n % step == 0) { step += 2; }
+	while (pm_gcd(step, n) != 1) { step += 2; } // coprime with n: the stride visits every index exactly once
 	for (int i = 0, j = 0; i < n; i++, j = (j + step) % n) { nx[i] = sp->x[j]; ny[i] = sp->y[j]; memcpy(nc + (size_t)i * 3, sp->rgb + (size_t)j * 3, 3); }
 	free(sp->x); free(sp->y); free(sp->rgb);
 	sp->x = nx; sp->y = ny; sp->rgb = nc;
@@ -269,6 +271,31 @@ static inline int pm_find(unsigned char *fb, int sw, int sh, const pm_sprite *sp
 	}
 	if (tried) { *tried += t; }
 	return best > 0;
+}
+
+// Several places in the frame can look like the cursor (the same arrow inside a screenshot shown in the frame): pm_find gives the best match of each region,
+// pm_pick chooses among them. The one nearest to a place where the cursor is expected (GetCursorInfo, the places where it was found before) wins among the
+// candidates that match about as well as the best one (at least 90 % of its matching pixels); a single candidate is taken as it is. Distance = the larger of
+// the two coordinate differences, to the nearest expected top-left corner of the sprite. Returns the index of the chosen candidate, -1 for none.
+struct pm_cand { int x, y, hits; };
+static inline int pm_pick(const pm_cand *c, int n, const int *ex, const int *ey, int ne)
+{
+	int best = -1, maxHits = 0, bestDist = 0;
+	for (int i = 0; i < n; i++) { if (c[i].hits > maxHits) { maxHits = c[i].hits; } }
+	if (maxHits <= 0) { return -1; }
+	for (int i = 0; i < n; i++)
+	{
+		int dist = 0x7FFFFFFF;
+		if ((long long)c[i].hits * 10 < (long long)maxHits * 9) { continue; }
+		for (int k = 0; k < ne; k++)
+		{
+			int dx = c[i].x - ex[k], dy = c[i].y - ey[k];
+			if (dx < 0) { dx = -dx; } if (dy < 0) { dy = -dy; }
+			if ((dx > dy ? dx : dy) < dist) { dist = dx > dy ? dx : dy; }
+		}
+		if (best < 0 || dist < bestDist || (dist == bestDist && c[i].hits > c[best].hits)) { best = i; bestDist = dist; }
+	}
+	return best;
 }
 
 // The mask of a colour cursor from its bitmap: every pixel that the cursor changes (alpha > 0), widened by one pixel. The field has

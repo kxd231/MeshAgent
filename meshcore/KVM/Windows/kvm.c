@@ -501,6 +501,9 @@ int kvm_server_inputdata(char *block, int blocklen, ILibKVM_WriteHandler writeHa
 
 	// printf("INPUT: %d, %d\r\n", type, size);
 
+	if (type == MNG_KVM_KEY || type == MNG_KVM_KEY_UNICODE || type == MNG_KVM_MOUSE || type == MNG_KVM_TOUCH) { kvm_adapt_note_input(); }
+	else if (type == MNG_KVM_REFRESH) { kvm_adapt_note_refresh(); }
+
 	switch (type)
 	{
 	case MNG_KVM_INPUT_LOCK:
@@ -582,17 +585,22 @@ int kvm_server_inputdata(char *block, int blocklen, ILibKVM_WriteHandler writeHa
 	}
 	case MNG_KVM_COMPRESSION: // Compression
 	{
+		if (size >= 12)
+		{
+			// WA-2b: bandwidth budget chosen by the viewer, units of 100 kbit/s, 0 = none. A command of size 10 (older viewer, thumbnails) leaves the budget alone.
+			kvm_adapt_set_budget((int)ntohs(((unsigned short *)(block + 10))[0]) * 100);
+		}
 		if (size >= 10)
 		{
 			int fr = ((int)ntohs(((unsigned short *)(block + 8))[0]));
-			if (fr >= 20 && fr <= 5000)
+			if (fr >= KVM_ADAPT_MIN_FRAME_TIMER && fr <= 5000) // 10 ms with WA-2b (x64 MeshService), 20 ms in the other builds
 				FRAME_RATE_TIMER = fr;
 		}
 		if (size >= 8)
 		{
 			int ns = ((int)ntohs(((unsigned short *)(block + 6))[0]));
 			if (ns >= 64 && ns <= 4096)
-				SCALING_FACTOR_NEW = ns;
+				SCALING_FACTOR_NEW = kvm_adapt_user_scale(ns); // WA-2b: the scale of the viewer times the share the budget asks for
 		}
 		if (size >= 6)
 		{
@@ -652,7 +660,7 @@ int kvm_server_inputdata(char *block, int blocklen, ILibKVM_WriteHandler writeHa
 	case MNG_KVM_FRAME_RATE_TIMER:
 	{
 		int fr = ((int)ntohs(((unsigned short *)(block))[2]));
-		if (fr >= 20 && fr <= 5000)
+		if (fr >= KVM_ADAPT_MIN_FRAME_TIMER && fr <= 5000) // 10 ms with WA-2b (x64 MeshService), 20 ms in the other builds
 			FRAME_RATE_TIMER = fr;
 		break;
 	}
@@ -1376,6 +1384,8 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 #ifdef KVM_STATS_LOG
 		int statTiles = 0;
 		long long statBytes = 0, statWriteUs = 0;
+		LARGE_INTEGER lq0, lq1, lq2, lq3;
+		long long loopWaitUs = 0, loopProcUs = 0;
 #endif
 		idleWait = 0;
 		KVMDEBUG("kvm_server_mainloop / loop1", (int)GetCurrentThreadId());
@@ -1401,7 +1411,14 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 
 		// Get the captured desktop
 		desktop = NULL;
+#ifdef KVM_STATS_LOG
+		QueryPerformanceCounter(&lq0);
+#endif
 		captureResult = kvm_capture_wait(&desktop, &desktopsize, &frameGeneration, &framePixelSize, &frameInfo);
+#ifdef KVM_STATS_LOG
+		QueryPerformanceCounter(&lq1);
+		loopWaitUs = ((lq1.QuadPart - lq0.QuadPart) * 1000000LL) / kvm_qpc_frequency();
+#endif
 		captureInFlight = 0;
 		if (captureResult != 0)
 		{
@@ -1440,7 +1457,7 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 					{
 						for (col = 0; col < TILE_WIDTH_COUNT; col++)
 						{
-							if (frameInfo.tileDirty[(row * TILE_WIDTH_COUNT) + col] == 0) { tileInfo[row][col].flags = (char)TILE_DONT_SEND; }
+							if (frameInfo.tileDirty[(row * TILE_WIDTH_COUNT) + col] == 0 && !KVM_TILE_DEFERRED(&tileInfo[row][col])) { tileInfo[row][col].flags = (char)TILE_DONT_SEND; } // WA-2b: a tile held back by the motion frame limit is looked at again
 						}
 					}
 				}
@@ -1505,7 +1522,7 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 							statTiles++;
 							statBytes += tilesize;
 							statWriteUs += ((w1.QuadPart - w0.QuadPart) * 1000000LL) / kvm_qpc_frequency();
-							kvm_adapt_note_write((unsigned int)(((w1.QuadPart - w0.QuadPart) * 1000000LL) / kvm_qpc_frequency()), tilesize);
+							kvm_adapt_note_write((unsigned int)(((w1.QuadPart - w0.QuadPart) * 1000000LL) / kvm_qpc_frequency()), tilesize, 0);
 #endif
 							free(buf);
 						}
@@ -1515,6 +1532,8 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 						}
 					}
 				}
+
+				if (kvm_adapt_frame_deferred()) { sentTiles = 1; } // WA-2b: a change was held back: keep the loop pace and the overlap of the capture
 
 				// WA-2: tiles that were sent with a lower quality while they moved and have been still for a while are sent again in full quality
 				// (an ordinary picture command). Only after a frame that was processed to the end.
@@ -1536,7 +1555,7 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 						statTiles++;
 						statBytes += sharpSize;
 						statWriteUs += ((sw1.QuadPart - sw0.QuadPart) * 1000000LL) / kvm_qpc_frequency();
-						kvm_adapt_note_write((unsigned int)(((sw1.QuadPart - sw0.QuadPart) * 1000000LL) / kvm_qpc_frequency()), sharpSize);
+						kvm_adapt_note_write((unsigned int)(((sw1.QuadPart - sw0.QuadPart) * 1000000LL) / kvm_qpc_frequency()), sharpSize, 1);
 #endif
 						free(sharpBuf);
 						sharpBuf = NULL;
@@ -1565,6 +1584,8 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 		KVMDEBUG("kvm_server_mainloop / loop3", (int)GetCurrentThreadId());
 		lastSentTiles = sentTiles;
 #ifdef KVM_STATS_LOG
+		QueryPerformanceCounter(&lq2);
+		loopProcUs = ((lq2.QuadPart - lq1.QuadPart) * 1000000LL) / kvm_qpc_frequency();
 		kvm_stats_account(captureResult == 0 ? &frameInfo : NULL, statTiles, statBytes, statWriteUs);
 		kvm_stats_flush(0);
 #endif
@@ -1582,6 +1603,9 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 		{
 			height = 0; // The capture already waited for changes, no second pause
 		}
+#ifdef KVM_STATS_LOG
+		QueryPerformanceCounter(&lq2);
+#endif
 		while (!g_shutdown && height > 0)
 		{
 			if (height > 50)
@@ -1596,6 +1620,10 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 			}
 			SleepEx(0, TRUE);
 		}
+#ifdef KVM_STATS_LOG
+		QueryPerformanceCounter(&lq3);
+		kvm_adapt_note_loop((unsigned int)loopWaitUs, (unsigned int)loopProcUs, (unsigned int)(((lq3.QuadPart - lq2.QuadPart) * 1000000LL) / kvm_qpc_frequency()));
+#endif
 	}
 
 	timeEndPeriod(1);
