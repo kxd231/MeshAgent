@@ -10,11 +10,16 @@
 //                           "verified" needs pass and o2_tested (move rectangles seen) and bbox_tested (a frame above KVM_DXGI_BBOX_RECTS rectangles)
 //   cursor [--ibeam]        kvm_cursor_xor() against the cursor drawing code of the GDI path; --ibeam puts the (monochrome) text cursor
 //                           under the mouse pointer first: it MOVES THE MOUSE POINTER, only for a test machine
+//   pointer [seconds] [--move]  what DXGI says about the pointer (LastMouseUpdateTime, PointerPosition.Visible, shape size) next to GetCursorInfo,
+//                           and the differences DXGI against GDI inside the cursor field (a software cursor that the system composes into the
+//                           desktop image shows there). --move puts the pointer on three places with SetCursorPos (only for a test machine);
+//                           without it nothing is touched. Also compares BitBlt with and without CAPTUREBLT in the field.
 //   idle <seconds>          duplication open, nothing changes: CPU time of this process
 //   stalecost [n]           cost of the check of the DXGI image against GDI that the agent makes every 10 s when nothing changes
 // The test windows are transparent to the mouse, never take the focus and are closed by the tool itself.
 
 #include "../dxgi_capture.h"
+#include "../dxgi_ptrmask.h"
 
 #ifndef KVM_DXGI_ENABLED
 #error kvm_dxgi_check needs /D_LINKVM /DKVM_DXGI on x64
@@ -25,6 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
+#include <math.h>
 
 // ---------------------------------------------------------------------------------------------------------------- helpers
 
@@ -148,14 +154,16 @@ static void dib_free(dib_t *d)
 static unsigned char *dib_top(dib_t *d) { return d->bits + ((size_t)(d->h - 1) * d->w * 4); }
 
 // The same BitBlt as capture_full_gdi() in tile.cpp.
-static int gdi_grab(const RECT &rc, dib_t *d)
+static int gdi_grab_rop(const RECT &rc, dib_t *d, DWORD rop)
 {
 	HDC scr = GetDC(NULL);
-	BOOL ok = BitBlt(d->dc, 0, 0, d->w, d->h, scr, rc.left, rc.top, SRCCOPY);
+	BOOL ok = BitBlt(d->dc, 0, 0, d->w, d->h, scr, rc.left, rc.top, rop);
 	GdiFlush();
 	ReleaseDC(NULL, scr);
 	return ok ? 1 : 0;
 }
+
+static int gdi_grab(const RECT &rc, dib_t *d) { return gdi_grab_rop(rc, d, SRCCOPY); }
 
 struct cmp_t
 {
@@ -873,6 +881,336 @@ static int mode_cursor(int ibeam)
 	return pass ? 0 : 1;
 }
 
+// ---------------------------------------------------------------------------------------------------------------- pointer
+
+// Pixels (bytes 0..2) that differ between two bottom-up images inside r (image coordinates, clipped).
+static long long rect_diff(const dib_t *a, const dib_t *b, int l, int t, int rr, int bb)
+{
+	long long n = 0;
+	if (l < 0) { l = 0; } if (t < 0) { t = 0; } if (rr > a->w) { rr = a->w; } if (bb > a->h) { bb = a->h; }
+	for (int y = t; y < bb; y++)
+	{
+		int m = a->h - 1 - y;
+		const unsigned char *pa = a->bits + ((size_t)m * a->w + l) * 4, *pb = b->bits + ((size_t)m * a->w + l) * 4;
+		for (int x = l; x < rr; x++, pa += 4, pb += 4) { if (pa[0] != pb[0] || pa[1] != pb[1] || pa[2] != pb[2]) { n++; } }
+	}
+	return n;
+}
+
+struct ptr_frame_t { unsigned int t; int res, rects, upd, vis, x, y; unsigned int shape; POINT cur; };
+
+static int mode_pointer(int seconds, int move, int blt)
+{
+	int idx = pick_monitor(0);
+	if (idx < 0) { printf("{\"mode\":\"pointer\",\"error\":\"no monitor\"}\n"); return 2; }
+	RECT rc = g_mon[idx].rc;
+	int w = rc.right - rc.left, h = rc.bottom - rc.top;
+	dib_t dx, g1, g2;
+	dxgi_frame f;
+	dxgi_info di;
+	static ptr_frame_t fr[400];
+	int nfr = 0, nblt = 0, nimg = 0, nnc = 0, ntimeout = 0, updVisible = 0, updHidden = 0, updNone = 0;
+	POINT oldPos = { 0, 0 };
+	unsigned long long t0;
+
+	memset(&f, 0, sizeof(f));
+	if (!dib_create(&dx, w, h) || !dib_create(&g1, w, h) || !dib_create(&g2, w, h)) { printf("{\"mode\":\"pointer\",\"error\":\"bitmap\"}\n"); return 2; }
+	dxgi_result ri = dxgi_capture_init(rc.left, rc.top, w, h, &di);
+	if (ri != DXGI_CAP_OK) { printf("{\"mode\":\"pointer\",\"init\":\"%s\",\"init_hr\":\"0x%08x\",\"pass\":0}\n", dxgi_result_name(ri), (unsigned int)dxgi_capture_last_hr()); return 1; }
+	GetCursorPos(&oldPos);
+	t0 = now_ms();
+	dxgi_result ra = acquire_image(NULL, &dx, 4000, &f);
+	{
+		POINT p; GetCursorPos(&p);
+		fr[nfr].t = (unsigned int)(now_ms() - t0); fr[nfr].res = (int)ra; fr[nfr].rects = f.rectCount; fr[nfr].upd = f.ptrUpdate; fr[nfr].vis = f.ptrVisible;
+		fr[nfr].x = f.ptrX; fr[nfr].y = f.ptrY; fr[nfr].shape = f.ptrShapeSize; fr[nfr].cur = p; nfr++;
+		if (ra == DXGI_CAP_OK) { nimg++; }
+		if (f.ptrUpdate) { if (f.ptrVisible) { updVisible++; } else { updHidden++; } } else { updNone++; }
+	}
+	int firstUpd = f.ptrUpdate, firstVis = f.ptrVisible;
+	if (blt != 0)
+	{
+		dxgi_rect fl;
+		if (kvm_cursor_field(KVM_DXGI_POINTER_MARGIN, &fl, NULL, NULL))
+		{
+			HDC scr = GetDC(NULL);
+			BitBlt(g1.dc, 0, 0, fl.right - fl.left, fl.bottom - fl.top, scr, fl.left, fl.top, blt == 2 ? (SRCCOPY | CAPTUREBLT) : SRCCOPY);
+			GdiFlush();
+			ReleaseDC(NULL, scr);
+			nblt++;
+		}
+	}
+
+	// The pointer is put on three places (--move), then left alone; frames are collected for 'seconds'
+	int cx = (rc.left + rc.right) / 2, cy = (rc.top + rc.bottom) / 2;
+	static const int dxy[][2] = { { 0, 0 }, { 220, 90 }, { -180, -120 } };
+	int step = -1;
+	unsigned long long tstart = now_ms(), tend = tstart + (unsigned long long)seconds * 1000;
+	while (now_ms() < tend && ra == DXGI_CAP_OK)
+	{
+		unsigned long long el = now_ms() - tstart;
+		if (move && step < 2 && el >= (unsigned long long)(300 + (step + 1) * 700)) { step++; SetCursorPos(cx + dxy[step][0], cy + dxy[step][1]); }
+		pump();
+		memset(&f, 0, sizeof(f));
+		dxgi_result r = dxgi_capture_acquire(50, dib_top(&dx), -(ptrdiff_t)dx.w * 4, 0, &f);
+		if (r == DXGI_CAP_TIMEOUT) { ntimeout++; continue; }
+		if (r != DXGI_CAP_OK && r != DXGI_CAP_NO_CHANGE) { ra = r; break; }
+		if (r == DXGI_CAP_OK) { nimg++; } else { nnc++; }
+		if (r == DXGI_CAP_OK && blt != 0)
+		{
+			// Like the agent's patch of the cursor field: one BitBlt of the field after every image (1 = SRCCOPY, 2 = SRCCOPY | CAPTUREBLT); does that make the system draw again?
+			dxgi_rect fl;
+			if (kvm_cursor_field(KVM_DXGI_POINTER_MARGIN, &fl, NULL, NULL))
+			{
+				HDC scr = GetDC(NULL);
+				BitBlt(g1.dc, 0, 0, fl.right - fl.left, fl.bottom - fl.top, scr, fl.left, fl.top, blt == 2 ? (SRCCOPY | CAPTUREBLT) : SRCCOPY);
+				GdiFlush();
+				ReleaseDC(NULL, scr);
+				nblt++;
+			}
+		}
+		if (f.ptrUpdate) { if (f.ptrVisible) { updVisible++; } else { updHidden++; } } else { updNone++; }
+		if (nfr < 400)
+		{
+			POINT p; GetCursorPos(&p);
+			fr[nfr].t = (unsigned int)(now_ms() - t0); fr[nfr].res = (int)r; fr[nfr].rects = f.rectCount; fr[nfr].upd = f.ptrUpdate; fr[nfr].vis = f.ptrVisible;
+			fr[nfr].x = f.ptrX; fr[nfr].y = f.ptrY; fr[nfr].shape = f.ptrShapeSize; fr[nfr].cur = p; nfr++;
+		}
+	}
+	// Settle: take the last changes
+	{
+		unsigned long long until = now_ms() + 400;
+		while (now_ms() < until) { pump(); memset(&f, 0, sizeof(f)); if (dxgi_capture_acquire(50, dib_top(&dx), -(ptrdiff_t)dx.w * 4, 0, &f) == DXGI_CAP_OK) { nimg++; } }
+	}
+	HCURSOR hc = NULL; POINT cp = { 0, 0 };
+	dxgi_rect fld0, fldM;
+	int showing = kvm_cursor_field(0, &fld0, &hc, &cp);
+	kvm_cursor_field(KVM_DXGI_POINTER_MARGIN, &fldM, NULL, NULL);
+	CURSORINFO ci; memset(&ci, 0, sizeof(ci)); ci.cbSize = sizeof(ci); GetCursorInfo(&ci);
+	gdi_grab_rop(rc, &g1, SRCCOPY);
+	gdi_grab_rop(rc, &g2, SRCCOPY | CAPTUREBLT);
+	int l = fldM.left - rc.left, t = fldM.top - rc.top, r = fldM.right - rc.left, b = fldM.bottom - rc.top;
+	long long dxVsGdiField = showing ? rect_diff(&dx, &g1, l, t, r, b) : -1;
+	long long dxVsGdiAll = rect_diff(&dx, &g1, 0, 0, w, h);
+	long long capVsPlainField = showing ? rect_diff(&g2, &g1, l, t, r, b) : -1;
+	long long capVsPlainAll = rect_diff(&g2, &g1, 0, 0, w, h);
+	long long dxVsCapField = showing ? rect_diff(&dx, &g2, l, t, r, b) : -1;
+
+	printf("{\"mode\":\"pointer\",\"monitor\":"); json_str(g_mon[idx].name);
+	printf(",\"blt_mode\":%d,\"blts\":%d,\"images_per_s\":%.1f", blt, nblt, nimg * 1000.0 / (double)(now_ms() - tstart > 0 ? now_ms() - tstart : 1));
+	printf(",\"size\":\"%dx%d\",\"sysmem\":%d,\"move\":%d,\"first_frame\":{\"result\":\"%s\",\"mouse_update\":%d,\"visible\":%d},", w, h, di.systemMemory, move, dxgi_result_name(ra), firstUpd, firstVis);
+	printf("\"counts\":{\"images\":%d,\"no_change\":%d,\"timeouts\":%d,\"frames_with_mouse_update_visible\":%d,\"frames_with_mouse_update_hidden\":%d,\"frames_without_mouse_update\":%d},", nimg, nnc, ntimeout, updVisible, updHidden, updNone);
+	printf("\"cursor_info\":{\"showing\":%d,\"flags\":%lu,\"handle\":\"%p\",\"x\":%ld,\"y\":%ld,\"field\":[%d,%d,%d,%d],\"field_margin\":%d},", showing, (unsigned long)ci.flags, (void *)hc, cp.x - rc.left, cp.y - rc.top, l, t, r, b, KVM_DXGI_POINTER_MARGIN);
+	printf("\"field_diff\":{\"dxgi_vs_gdi\":%lld,\"capture_blt_vs_plain\":%lld,\"dxgi_vs_capture_blt\":%lld},\"all_diff\":{\"dxgi_vs_gdi\":%lld,\"capture_blt_vs_plain\":%lld},", dxVsGdiField, capVsPlainField, dxVsCapField, dxVsGdiAll, capVsPlainAll);
+	printf("\"frames\":[");
+	for (int i = 0; i < nfr && i < 60; i++)
+	{
+		printf("%s{\"t\":%u,\"r\":\"%s\",\"rects\":%d,\"mouse_update\":%d,\"visible\":%d,\"x\":%d,\"y\":%d,\"shape\":%u,\"cursor_pos\":[%ld,%ld]}", i ? "," : "", fr[i].t, dxgi_result_name((dxgi_result)fr[i].res), fr[i].rects, fr[i].upd, fr[i].vis, fr[i].x, fr[i].y, fr[i].shape, fr[i].cur.x - rc.left, fr[i].cur.y - rc.top);
+	}
+	printf("],\"frames_total\":%d,\"pass\":1}\n", nfr);
+	dxgi_capture_shutdown();
+	if (move) { SetCursorPos(oldPos.x, oldPos.y); }
+	dib_free(&g2); dib_free(&g1); dib_free(&dx);
+	return 0;
+}
+
+// ---------------------------------------------------------------------------------------------------------------- bltcost
+
+static double qpc_us(void)
+{
+	static LARGE_INTEGER fq;
+	LARGE_INTEGER t;
+	if (fq.QuadPart == 0) { QueryPerformanceFrequency(&fq); }
+	QueryPerformanceCounter(&t);
+	return (double)t.QuadPart * 1e6 / (double)fq.QuadPart;
+}
+
+// Time of one BitBlt from the screen into a DIB: plain or CAPTUREBLT, the cursor field (80x80) or the whole screen, without a duplication,
+// and with the duplication open and a frame held (like the agent's patch).
+static int mode_bltcost(int reps)
+{
+	int idx = pick_monitor(0);
+	if (idx < 0) { printf("{\"mode\":\"bltcost\",\"error\":\"no monitor\"}\n"); return 2; }
+	RECT rc = g_mon[idx].rc;
+	int w = rc.right - rc.left, h = rc.bottom - rc.top;
+	dib_t d;
+	dxgi_frame f;
+	dxgi_info di;
+	dxgi_rect fl;
+	POINT cp;
+	if (!dib_create(&d, w, h)) { printf("{\"mode\":\"bltcost\",\"error\":\"bitmap\"}\n"); return 2; }
+	if (!kvm_cursor_field(KVM_DXGI_POINTER_MARGIN, &fl, NULL, &cp)) { fl.left = rc.left + 100; fl.top = rc.top + 100; fl.right = fl.left + 80; fl.bottom = fl.top + 80; }
+	HDC scr = GetDC(NULL);
+	printf("{\"mode\":\"bltcost\",\"size\":\"%dx%d\",\"reps\":%d,\"results\":[", w, h, reps);
+	int first = 1;
+	for (int held = 0; held < 2; held++)
+	{
+		if (held)
+		{
+			memset(&f, 0, sizeof(f));
+			if (dxgi_capture_init(rc.left, rc.top, w, h, &di) != DXGI_CAP_OK) { break; }
+			acquire_image(NULL, &d, 3000, &f); // the frame stays held
+		}
+		for (int mode = 0; mode < 2; mode++)
+		{
+			for (int full = 0; full < 2; full++)
+			{
+				double sum = 0, mn = 1e12, mx = 0;
+				for (int i = 0; i < reps; i++)
+				{
+					double t0 = qpc_us();
+					if (full) { BitBlt(d.dc, 0, 0, w, h, scr, rc.left, rc.top, mode ? (SRCCOPY | CAPTUREBLT) : SRCCOPY); }
+					else { BitBlt(d.dc, 0, 0, fl.right - fl.left, fl.bottom - fl.top, scr, fl.left, fl.top, mode ? (SRCCOPY | CAPTUREBLT) : SRCCOPY); }
+					GdiFlush();
+					double dt = qpc_us() - t0;
+					sum += dt; if (dt < mn) { mn = dt; } if (dt > mx) { mx = dt; }
+					Sleep(25);
+				}
+				printf("%s{\"frame_held\":%d,\"capture_blt\":%d,\"whole_screen\":%d,\"avg_us\":%.0f,\"min_us\":%.0f,\"max_us\":%.0f}", first ? "" : ",", held, mode, full, sum / reps, mn, mx);
+				first = 0;
+			}
+		}
+		if (held) { dxgi_capture_shutdown(); }
+	}
+	printf("],\"pass\":1}\n");
+	ReleaseDC(NULL, scr);
+	dib_free(&d);
+	return 0;
+}
+
+// ---------------------------------------------------------------------------------------------------------------- trail
+
+// A software cursor that moves on a still screen (SetCursorPos every 10 ms along a path, only for a test machine): what rectangles does DXGI report,
+// where does the cursor sit in the frame (found by its opaque pixels, in the rectangles of the frame only) and how does that compare with the position
+// that GetCursorPos gives right after the frame was acquired.
+struct trail_frame { double t; int nr; int rc[4][4]; int nf; int fx[4], fy[4], fh[4]; int fr[4]; POINT pre, post; int step; int lag; long long tried; double us; };
+
+static int mode_trail(int seconds, int moveIt)
+{
+	int idx = pick_monitor(0);
+	if (idx < 0) { printf("{\"mode\":\"trail\",\"error\":\"no monitor\"}\n"); return 2; }
+	RECT rc = g_mon[idx].rc;
+	int w = rc.right - rc.left, h = rc.bottom - rc.top;
+	dib_t dx;
+	dxgi_frame f;
+	dxgi_info di;
+	pm_sprite sp;
+	static trail_frame fr[400];
+	static POINT hist[4000];
+	int nfr = 0, steps = 0, nimg = 0, noFind = 0, exactPost = 0, exactPre = 0, other = 0, multi = 0, bigRects = 0;
+	long long totalTried = 0;
+	double totalUs = 0;
+	int lagHist[8] = { 0 };
+	int rectW[6] = { 0 }; // histogram of the largest rectangle side: <=48, <=96, <=200, <=400, more
+	POINT oldPos = { 0, 0 };
+
+	memset(&f, 0, sizeof(f));
+	memset(&sp, 0, sizeof(sp));
+	if (!dib_create(&dx, w, h)) { printf("{\"mode\":\"trail\",\"error\":\"bitmap\"}\n"); return 2; }
+	dxgi_result ri = dxgi_capture_init(rc.left, rc.top, w, h, &di);
+	if (ri != DXGI_CAP_OK) { printf("{\"mode\":\"trail\",\"init\":\"%s\",\"pass\":0}\n", dxgi_result_name(ri)); return 1; }
+	GetCursorPos(&oldPos);
+	acquire_image(NULL, &dx, 4000, &f);
+	{
+		CURSORINFO ci; memset(&ci, 0, sizeof(ci)); ci.cbSize = sizeof(ci); GetCursorInfo(&ci);
+		kvm_cursor_sprite(ci.hCursor, &sp);
+	}
+	printf("{\"mode\":\"trail\",\"size\":\"%dx%d\",\"move\":%d,\"sprite\":{\"w\":%d,\"h\":%d,\"hotspot\":[%d,%d],\"opaque\":%d,\"monochrome\":%d},", w, h, moveIt, sp.w, sp.h, sp.hx, sp.hy, sp.n, sp.monochrome);
+	int cx = (rc.left + rc.right) / 2, cy = (rc.top + rc.bottom) / 2;
+	double t0 = qpc_us(), nextMove = t0;
+	while (qpc_us() - t0 < seconds * 1e6 && sp.n > 0)
+	{
+		double now = qpc_us();
+		if (moveIt && now >= nextMove && steps < 4000)
+		{
+			double t = (now - t0) / 1000.0;
+			POINT p = { cx + (int)(w * 0.38 * cos(t * 0.0021)), cy + (int)(h * 0.38 * sin(t * 0.0033)) };
+			SetCursorPos(p.x, p.y);
+			hist[steps].x = p.x - rc.left; hist[steps].y = p.y - rc.top; steps++;
+			nextMove += 10000.0;
+		}
+		pump();
+		POINT pre; GetCursorPos(&pre);
+		memset(&f, 0, sizeof(f));
+		dxgi_result r = dxgi_capture_acquire(6, dib_top(&dx), -(ptrdiff_t)dx.w * 4, 0, &f);
+		if (r != DXGI_CAP_OK || f.rectCount == 0) { continue; }
+		nimg++;
+		trail_frame *tf = (nfr < 400) ? &fr[nfr] : NULL;
+		trail_frame tmp; if (tf == NULL) { tf = &tmp; }
+		memset(tf, 0, sizeof(*tf));
+		GetCursorPos(&tf->post);
+		tf->pre = pre; tf->t = (qpc_us() - t0) / 1000.0; tf->step = steps - 1; tf->nr = f.rectCount;
+		double q0 = qpc_us();
+		int maxSide = 0;
+		for (int i = 0; i < f.rectCount; i++)
+		{
+			const dxgi_rect &q = f.rects[i];
+			int side = (q.right - q.left > q.bottom - q.top) ? q.right - q.left : q.bottom - q.top;
+			if (side > maxSide) { maxSide = side; }
+			if (i < 4) { tf->rc[i][0] = q.left; tf->rc[i][1] = q.top; tf->rc[i][2] = q.right; tf->rc[i][3] = q.bottom; }
+			if (side > 400) { bigRects++; continue; }
+			int bx = 0, by = 0, hits = 0;
+			if (pm_find(dx.bits, w, h, &sp, *(const pm_rect *)&q, &bx, &by, &hits, 400000, &tf->tried) && tf->nf < 4)
+			{
+				tf->fx[tf->nf] = bx + sp.hx; tf->fy[tf->nf] = by + sp.hy; tf->fh[tf->nf] = hits; tf->fr[tf->nf] = i; tf->nf++;
+			}
+		}
+		tf->us = qpc_us() - q0;
+		totalUs += tf->us; totalTried += tf->tried;
+		rectW[maxSide <= 48 ? 0 : (maxSide <= 96 ? 1 : (maxSide <= 200 ? 2 : (maxSide <= 400 ? 3 : 4)))]++;
+		if (tf->nf == 0) { noFind++; }
+		else
+		{
+			if (tf->nf > 1) { multi++; }
+			int px = tf->post.x - rc.left, py = tf->post.y - rc.top, qx = tf->pre.x - rc.left, qy = tf->pre.y - rc.top;
+			int isPost = 0, isPre = 0;
+			for (int k = 0; k < tf->nf; k++) { if (tf->fx[k] == px && tf->fy[k] == py) { isPost = 1; } if (tf->fx[k] == qx && tf->fy[k] == qy) { isPre = 1; } }
+			if (isPost) { exactPost++; } else if (isPre) { exactPre++; } else { other++; }
+			// lag in steps behind the last position set
+			tf->lag = -1;
+			for (int k = 0; k < tf->nf && tf->lag < 0; k++)
+				for (int b = 0; b < 40 && steps - 1 - b >= 0; b++) { if (hist[steps - 1 - b].x == tf->fx[k] && hist[steps - 1 - b].y == tf->fy[k]) { tf->lag = b; break; } }
+			if (tf->lag >= 0) { lagHist[tf->lag > 6 ? 7 : tf->lag]++; }
+		}
+		if (nfr < 400) { nfr++; }
+	}
+	printf("\"images\":%d,\"steps\":%d,\"not_found\":%d,\"found_equals_getcursorpos_after\":%d,\"found_equals_getcursorpos_before\":%d,\"found_elsewhere\":%d,\"frames_with_several_matches\":%d,\"rects_over_400px\":%d,", nimg, steps, noFind, exactPost, exactPre, other, multi, bigRects);
+	printf("\"search_us_avg\":%.1f,\"positions_tried_avg\":%.0f,\"largest_rect_side_hist\":{\"le48\":%d,\"le96\":%d,\"le200\":%d,\"le400\":%d,\"over400\":%d},\"lag_steps_hist\":[%d,%d,%d,%d,%d,%d,%d,%d],", nimg ? totalUs / nimg : 0.0, nimg ? (double)totalTried / nimg : 0.0, rectW[0], rectW[1], rectW[2], rectW[3], rectW[4], lagHist[0], lagHist[1], lagHist[2], lagHist[3], lagHist[4], lagHist[5], lagHist[6], lagHist[7]);
+	// the sprite as text: # dark, o light, + other opaque, . not opaque
+	printf("\"sprite_rows\":[");
+	if (sp.n > 0)
+	{
+		for (int y = 0; y < sp.h; y++)
+		{
+			char row[300]; int k = 0;
+			for (int x = 0; x < sp.w && k < 290; x++)
+			{
+				char c = '.';
+				for (int i = 0; i < sp.n; i++) { if (sp.x[i] == x && sp.y[i] == y) { int v = (sp.rgb[i * 3] + sp.rgb[i * 3 + 1] + sp.rgb[i * 3 + 2]) / 3; c = v < 60 ? '#' : (v > 200 ? 'o' : '+'); break; } }
+				row[k++] = c;
+			}
+			row[k] = 0;
+			printf("%s\"%s\"", y ? "," : "", row);
+		}
+	}
+	printf("],\"frames\":[");
+	for (int i = 0; i < nfr && i < 70; i++)
+	{
+		const trail_frame &tf = fr[i];
+		printf("%s{\"t\":%.0f,\"rects\":[", i ? "," : "", tf.t);
+		for (int k = 0; k < tf.nr && k < 4; k++) { printf("%s[%d,%d,%d,%d]", k ? "," : "", tf.rc[k][0], tf.rc[k][1], tf.rc[k][2], tf.rc[k][3]); }
+		printf("],\"n_rects\":%d,\"found\":[", tf.nr);
+		for (int k = 0; k < tf.nf; k++) { printf("%s[%d,%d,%d,r%d]", k ? "," : "", tf.fx[k], tf.fy[k], tf.fh[k], tf.fr[k]); }
+		printf("],\"pre\":[%ld,%ld],\"post\":[%ld,%ld],\"lag_steps\":%d,\"us\":%.0f}", tf.pre.x - rc.left, tf.pre.y - rc.top, tf.post.x - rc.left, tf.post.y - rc.top, tf.lag, tf.us);
+	}
+	printf("],\"pass\":1}\n");
+	pm_sprite_free(&sp);
+	dxgi_capture_shutdown();
+	if (moveIt) { SetCursorPos(oldPos.x, oldPos.y); }
+	dib_free(&dx);
+	return 0;
+}
+
 // ---------------------------------------------------------------------------------------------------------------- idle
 
 static unsigned long long proc_cpu_100ns(void)
@@ -1004,7 +1342,20 @@ int main(int argc, char **argv)
 		return mode_cursor(ib);
 	}
 	if (strcmp(mode, "stalecost") == 0) { return mode_stalecost(argc > 2 ? atoi(argv[2]) : 20); }
+	if (strcmp(mode, "pointer") == 0)
+	{
+		int mv = 0, secs = 4, bl = 0;
+		for (int i = 2; i < argc; i++) { if (strcmp(argv[i], "--blt=plain") == 0) { bl = 1; } else if (strcmp(argv[i], "--blt=capture") == 0) { bl = 2; } else if (strcmp(argv[i], "--move") == 0) { mv = 1; } else if (atoi(argv[i]) > 0) { secs = atoi(argv[i]); } }
+		return mode_pointer(secs, mv, bl);
+	}
+	if (strcmp(mode, "trail") == 0)
+	{
+		int mv = 0, secs = 3;
+		for (int i = 2; i < argc; i++) { if (strcmp(argv[i], "--move") == 0) { mv = 1; } else if (atoi(argv[i]) > 0) { secs = atoi(argv[i]); } }
+		return mode_trail(secs, mv);
+	}
+	if (strcmp(mode, "bltcost") == 0) { return mode_bltcost(argc > 2 ? atoi(argv[2]) : 20); }
 	if (strcmp(mode, "idle") == 0) { return mode_idle(argc > 2 ? atoi(argv[2]) : 10); }
-	printf("{\"error\":\"usage: kvm-dxgi-check info | compare [--monitor n] | rects <seconds> [--bbox n] | cursor [--ibeam] | idle <seconds> | stalecost [n]\"}\n");
+	printf("{\"error\":\"usage: kvm-dxgi-check info | compare [--monitor n] | rects <seconds> [--bbox n] | cursor [--ibeam] | pointer [seconds] [--move] | trail [seconds] [--move] | idle <seconds> | stalecost [n]\"}\n");
 	return 2;
 }

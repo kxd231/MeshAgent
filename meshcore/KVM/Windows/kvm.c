@@ -982,8 +982,8 @@ void kvm_stats_log(const char *fmt, ...)
 typedef struct KVM_Stats
 {
 	DWORD sessionStart, periodStart;
-	int frames, full, partial, unchanged, gdi, dxgi, tiles, moveFrames, captureFrames, copyFrames, outFrames, staleChecks, staleSuspects;
-	long long bytes, writeUs, dirtyRects, dirtyArea, moveRects, moveArea, moveMaxArea, captureUs, copyUs, outUs, staleUs;
+	int frames, full, partial, unchanged, gdi, dxgi, tiles, moveFrames, captureFrames, copyFrames, outFrames, staleChecks, staleSuspects, ptrGdiReads, ptrRestores, ptrEmbedded, ptrMaskPx, ptrFound, ptrNotFound;
+	long long bytes, writeUs, dirtyRects, dirtyArea, moveRects, moveArea, moveMaxArea, captureUs, copyUs, outUs, staleUs, ptrGdiUs, ptrSearchUs;
 } KVM_Stats;
 static KVM_Stats gStats;
 
@@ -1012,6 +1012,9 @@ static void kvm_stats_account(const kvm_frame_info *fi, int tiles, long long byt
 	if (fi->outUs > 0) { gStats.outUs += fi->outUs; gStats.outFrames++; }
 	if (fi->staleUs > 0) { gStats.staleUs += fi->staleUs; gStats.staleChecks++; }
 	if (fi->staleSuspect > 0) { gStats.staleSuspects++; }
+	if (fi->source == KVM_SOURCE_DXGI) { gStats.ptrEmbedded = fi->ptrEmbedded; }
+	gStats.ptrGdiReads += fi->ptrGdiReads; gStats.ptrGdiUs += fi->ptrGdiUs; gStats.ptrRestores += fi->ptrRestores; gStats.ptrFound += fi->ptrFound; gStats.ptrNotFound += fi->ptrNotFound; gStats.ptrSearchUs += fi->ptrSearchUs;
+	if (fi->source == KVM_SOURCE_DXGI) { gStats.ptrMaskPx = fi->ptrMaskPx; }
 }
 
 static void kvm_stats_flush(int final)
@@ -1025,17 +1028,18 @@ static void kvm_stats_flush(int final)
 		// and cursor, or scaling); stale_*: the check of the DXGI image against GDI (KVM_STALE_QUIET_MS without changes, every period).
 		unsigned long periodMs = (unsigned long)(now - gStats.periodStart);
 		unsigned long fps10 = periodMs > 0 ? (unsigned long)(((long long)(gStats.full + gStats.partial) * 10000) / (long long)periodMs) : 0;
-		kvm_stats_log("stats t=%lu period_ms=%lu path=%s frames=%d full=%d partial=%d unchanged=%d fps=%lu.%lu gdi=%d dxgi=%d tiles=%d bytes=%lld write_ms=%lld dirty_rects=%lld dirty_area=%lld move_rects=%lld move_area=%lld move_frames=%d move_max_area=%lld copy_us_avg=%lld out_us_avg=%lld capture_us_avg=%lld stale_checks=%d stale_suspects=%d stale_us_avg=%lld%s",
+		kvm_stats_log("stats t=%lu period_ms=%lu path=%s frames=%d full=%d partial=%d unchanged=%d fps=%lu.%lu gdi=%d dxgi=%d tiles=%d bytes=%lld write_ms=%lld dirty_rects=%lld dirty_area=%lld move_rects=%lld move_area=%lld move_frames=%d move_max_area=%lld copy_us_avg=%lld out_us_avg=%lld capture_us_avg=%lld stale_checks=%d stale_suspects=%d stale_us_avg=%lld ptr_embedded=%d ptr_restores=%d ptr_gdi_reads=%d ptr_gdi_us_avg=%lld ptr_mask_px=%d ptr_found=%d ptr_not_found=%d ptr_search_us_avg=%lld%s",
 			(unsigned long)((now - gStats.sessionStart) / 1000), periodMs, (gStats.dxgi == 0 ? "gdi" : (gStats.gdi == 0 ? "dxgi" : "mixed")),
 			gStats.frames, gStats.full, gStats.partial, gStats.unchanged, fps10 / 10, fps10 % 10, gStats.gdi, gStats.dxgi, gStats.tiles, gStats.bytes, gStats.writeUs / 1000,
 			gStats.dirtyRects, gStats.dirtyArea, gStats.moveRects, gStats.moveArea, gStats.moveFrames, gStats.moveMaxArea,
 			gStats.copyFrames > 0 ? gStats.copyUs / gStats.copyFrames : 0LL, gStats.outFrames > 0 ? gStats.outUs / gStats.outFrames : 0LL,
 			gStats.captureFrames > 0 ? gStats.captureUs / gStats.captureFrames : 0LL,
 			gStats.staleChecks, gStats.staleSuspects, gStats.staleChecks > 0 ? gStats.staleUs / gStats.staleChecks : 0LL,
+			gStats.ptrEmbedded, gStats.ptrRestores, gStats.ptrGdiReads, gStats.ptrGdiReads > 0 ? gStats.ptrGdiUs / gStats.ptrGdiReads : 0LL, gStats.ptrMaskPx, gStats.ptrFound, gStats.ptrNotFound, gStats.ptrFound > 0 ? gStats.ptrSearchUs / gStats.ptrFound : 0LL,
 			final ? " final=1" : "");
 	}
-	gStats.frames = gStats.full = gStats.partial = gStats.unchanged = gStats.gdi = gStats.dxgi = gStats.tiles = gStats.moveFrames = gStats.captureFrames = gStats.copyFrames = gStats.outFrames = gStats.staleChecks = gStats.staleSuspects = 0;
-	gStats.bytes = gStats.writeUs = gStats.dirtyRects = gStats.dirtyArea = gStats.moveRects = gStats.moveArea = gStats.moveMaxArea = gStats.captureUs = gStats.copyUs = gStats.outUs = gStats.staleUs = 0;
+	gStats.frames = gStats.full = gStats.partial = gStats.unchanged = gStats.gdi = gStats.dxgi = gStats.tiles = gStats.moveFrames = gStats.captureFrames = gStats.copyFrames = gStats.outFrames = gStats.staleChecks = gStats.staleSuspects = gStats.ptrGdiReads = gStats.ptrRestores = gStats.ptrFound = gStats.ptrNotFound = 0;
+	gStats.bytes = gStats.writeUs = gStats.dirtyRects = gStats.dirtyArea = gStats.moveRects = gStats.moveArea = gStats.moveMaxArea = gStats.captureUs = gStats.copyUs = gStats.outUs = gStats.staleUs = gStats.ptrGdiUs = gStats.ptrSearchUs = 0;
 	gStats.periodStart = now;
 	kvm_adapt_stats_flush(final);
 }

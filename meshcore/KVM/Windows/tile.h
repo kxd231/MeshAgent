@@ -83,6 +83,10 @@ typedef struct kvm_frame_info {
 	unsigned int staleUs;			// Time of the check of the DXGI image against GDI done in this call (0 = none)
 	int staleSuspect;				// That check found differences (1 = first time, 2 = second time in a row)
 	int dxgiEvent;					// KVM_DXGI_EVENT_ENUM bits that happened while capturing this frame
+	int ptrEmbedded;				// DXGI frame: the system cursor is composed into the desktop image (software cursor) and was taken out again
+	unsigned int ptrGdiUs;			// Software cursor: time of the GDI reads of the cursor field made for this frame, and how many (ptrGdiReads)
+	int ptrGdiReads, ptrRestores, ptrMaskPx, ptrFound, ptrNotFound;	// found/not found: the cursor looked for in the rectangles of the frame
+	unsigned int ptrSearchUs;		// time of that search	// GDI reads, restores of the pixels under the cursor from before the frame, pixels of the current cursor mask
 } kvm_frame_info;
 
 short initialize_gdiplus();

@@ -43,6 +43,8 @@ Licensed under the Apache License, Version 2.0 (same as the rest of the agent).
 #include <windows.h>
 #include <stddef.h>
 
+struct pm_sprite; // dxgi_ptrmask.h (C++ only, included by the files that use it)
+
 // Tunables (milliseconds unless noted). Can be overridden with /D on the compiler command line.
 #ifndef KVM_DXGI_TIMEOUT_MS
 #define KVM_DXGI_TIMEOUT_MS 50			// AcquireNextFrame wait when nothing is pending
@@ -61,6 +63,18 @@ Licensed under the Apache License, Version 2.0 (same as the rest of the agent).
 #endif
 #ifndef KVM_DXGI_BBOX_RECTS
 #define KVM_DXGI_BBOX_RECTS 64			// more rectangles than this are copied from the GPU as one bounding box
+#endif
+#ifndef KVM_DXGI_POINTER_MARGIN
+#define KVM_DXGI_POINTER_MARGIN 24		// pixels added on every side of the cursor bitmap when its field is taken from GDI (shadow, enlarged cursor)
+#endif
+#ifndef KVM_DXGI_POINTER_MIN_DIFF
+#define KVM_DXGI_POINTER_MIN_DIFF 8		// differing pixels in the cursor field (DXGI image against GDI) that mean 'the cursor is part of the image'
+#endif
+#ifndef KVM_DXGI_POINTER_QUIET_MS
+#define KVM_DXGI_POINTER_QUIET_MS 150	// no frame touched the cursor field for this long: the pixels under the cursor are read from GDI and the mask is corrected
+#endif
+#ifndef KVM_DXGI_POINTER_REFRESH_MS
+#define KVM_DXGI_POINTER_REFRESH_MS 500	// while frames keep touching the field, the pixels under the cursor are read from GDI at most this often
 #endif
 #ifndef KVM_DXGI_CLEAR_ALPHA
 #define KVM_DXGI_CLEAR_ALPHA 1			// zero the 4th byte of every pixel, like GDI does (equal tile CRCs on both paths)
@@ -92,6 +106,11 @@ typedef struct dxgi_frame {
 	int moveCount;  long long moveArea;    // GetFrameMoveRects (statistics, destination areas, before clipping)
 	int accumulatedFrames;
 	unsigned int copyUs;      // time of CopySubresourceRegion + Map + copy into dst
+	// Pointer fields of DXGI_OUTDUPL_FRAME_INFO, filled for every acquired frame (also NO_CHANGE), zero after a timeout.
+	int ptrUpdate;            // LastMouseUpdateTime != 0: this frame carries a pointer update (position or shape)
+	int ptrVisible;           // PointerPosition.Visible (meaningful when ptrUpdate)
+	int ptrX, ptrY;           // PointerPosition.Position (meaningful when ptrUpdate)
+	unsigned int ptrShapeSize;// PointerShapeBufferSize: a new pointer shape is delivered with this frame
 } dxgi_frame;
 
 typedef struct dxgi_info {
@@ -110,6 +129,11 @@ dxgi_result dxgi_capture_init(int x, int y, int w, int h, dxgi_info *info);
 // wantFull without a new image (TIMEOUT / NO_CHANGE) copies nothing: the caller decides how to fill the buffer.
 dxgi_result dxgi_capture_acquire(unsigned int timeoutMs, unsigned char *dstTop, ptrdiff_t dstStride, int wantFull, dxgi_frame *frame);
 
+// Hook called by dxgi_capture_acquire after the rectangles of a new image are known and before anything is copied into dst: the caller can still
+// read the old pixels there (the agent keeps the pixels under a software cursor). rects are the areas that will be written (one bounding box when
+// more rectangles than the bounding-box threshold are copied; the whole output for fullCopy). NULL = no hook.
+typedef void (*dxgi_precopy_fn)(int fullCopy, int rectCount, const dxgi_rect *rects);
+void dxgi_capture_set_precopy(dxgi_precopy_fn fn);
 void dxgi_capture_set_bbox_rects(int n); // Test hook: more rectangles than n are copied as one bounding box (default KVM_DXGI_BBOX_RECTS)
 int dxgi_capture_bbox_rects(void);
 int dxgi_capture_sysmem(void);             // 1 while frames are read from the mapped system memory surface (no GPU copy path)
@@ -133,6 +157,13 @@ long long kvm_count_pixel_diff(const unsigned char *aTop, ptrdiff_t aStride, con
 // XORs the current mouse cursor into dst at (x, y), the way the GDI path draws it. covered gets the touched rectangle (may be empty).
 // Returns 1 if something was drawn.
 int kvm_cursor_xor(unsigned char *dstTop, ptrdiff_t dstStride, int dstW, int dstH, int x, int y, dxgi_rect *covered);
+// The field of the system cursor: bitmap of the current cursor placed at its hotspot, plus 'margin' pixels on every side, in screen
+// coordinates (not clipped). Returns 1 when the cursor is showing (CURSOR_SHOWING) and has a handle, 0 otherwise (r is then empty).
+// hcur / pos get the handle and the hotspot position (ptScreenPos) when not NULL. Used by the agent and by the check tool.
+int kvm_cursor_field(int margin, dxgi_rect *r, HCURSOR *hcur, POINT *pos);
+// The fully opaque pixels of the cursor with this handle (colour cursors), see pm_sprite. Returns 1 when sp is filled (free it with pm_sprite_free),
+// 0 for monochrome cursors (sp->monochrome = 1, nothing allocated) and on errors.
+int kvm_cursor_sprite(HCURSOR hc, struct pm_sprite *sp);
 
 #ifdef __cplusplus
 }

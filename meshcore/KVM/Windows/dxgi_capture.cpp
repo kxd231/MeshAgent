@@ -5,6 +5,7 @@
 // This file must not include microstack or agent headers.
 
 #include "dxgi_capture.h"
+#include "dxgi_ptrmask.h"
 
 #ifdef KVM_DXGI_ENABLED
 
@@ -39,6 +40,7 @@ static UINT g_metaCap = 0;
 static dxgi_rect *g_rects = NULL;
 static int g_rectsCap = 0;
 static int g_bboxRects = KVM_DXGI_BBOX_RECTS;
+static dxgi_precopy_fn g_precopy = NULL;
 static HRESULT g_releaseHr = S_OK;      // result of the last ReleaseFrame
 static int g_releaseLost = 0;           // ReleaseFrame reported a lost duplication: the next acquire reports it at once
 static long long g_cntSysmem = 0, g_cntStaging = 0, g_cntBbox = 0;
@@ -326,6 +328,11 @@ dxgi_result dxgi_capture_acquire(unsigned int timeoutMs, unsigned char *dstTop, 
 	}
 	g_held = 1;
 	frame->accumulatedFrames = (int)fi.AccumulatedFrames;
+	frame->ptrUpdate = (fi.LastMouseUpdateTime.QuadPart != 0) ? 1 : 0;
+	frame->ptrVisible = fi.PointerPosition.Visible ? 1 : 0;
+	frame->ptrX = (int)fi.PointerPosition.Position.x;
+	frame->ptrY = (int)fi.PointerPosition.Position.y;
+	frame->ptrShapeSize = fi.PointerShapeBufferSize;
 
 	if (fi.LastPresentTime.QuadPart == 0)
 	{
@@ -371,6 +378,24 @@ dxgi_result dxgi_capture_acquire(unsigned int timeoutMs, unsigned char *dstTop, 
 		safe_release(res);
 		g_frames++;
 		return DXGI_CAP_OK;
+	}
+
+	if (g_precopy != NULL)
+	{
+		dxgi_rect hb;
+		if (!full && count > g_bboxRects)
+		{
+			hb = g_rects[0];
+			for (i = 1; i < (UINT)count; i++)
+			{
+				if (g_rects[i].left < hb.left) { hb.left = g_rects[i].left; }
+				if (g_rects[i].top < hb.top) { hb.top = g_rects[i].top; }
+				if (g_rects[i].right > hb.right) { hb.right = g_rects[i].right; }
+				if (g_rects[i].bottom > hb.bottom) { hb.bottom = g_rects[i].bottom; }
+			}
+			g_precopy(0, 1, &hb);
+		}
+		else { g_precopy(full, count, g_rects); }
 	}
 
 	QueryPerformanceFrequency(&freq);
@@ -490,6 +515,7 @@ fail:
 	return result;
 }
 
+void dxgi_capture_set_precopy(dxgi_precopy_fn fn) { g_precopy = fn; }
 void dxgi_capture_set_bbox_rects(int n) { g_bboxRects = (n < 1) ? 1 : n; }
 int dxgi_capture_bbox_rects(void) { return g_bboxRects; }
 
@@ -676,6 +702,119 @@ int kvm_cursor_xor(unsigned char *dstTop, ptrdiff_t dstStride, int dstW, int dst
 	if (ii.hbmMask != NULL) { DeleteObject(ii.hbmMask); }
 	if (ii.hbmColor != NULL) { DeleteObject(ii.hbmColor); }
 	return drawn;
+}
+
+int kvm_cursor_field(int margin, dxgi_rect *r, HCURSOR *hcur, POINT *pos)
+{
+	CURSORINFO ci;
+	ICONINFO ii;
+	BITMAP bm;
+	int ok = 0;
+
+	memset(r, 0, sizeof(*r));
+	if (hcur != NULL) { *hcur = NULL; }
+	if (pos != NULL) { pos->x = pos->y = 0; }
+	memset(&ci, 0, sizeof(ci));
+	ci.cbSize = sizeof(ci);
+	memset(&ii, 0, sizeof(ii));
+	if (!GetCursorInfo(&ci)) { return 0; }
+	if (hcur != NULL) { *hcur = ci.hCursor; }
+	if (pos != NULL) { *pos = ci.ptScreenPos; }
+	if ((ci.flags & CURSOR_SHOWING) == 0 || ci.hCursor == NULL || !GetIconInfo(ci.hCursor, &ii)) { return 0; }
+	if (GetObject(ii.hbmMask, sizeof(bm), &bm) == sizeof(bm))
+	{
+		int cw = bm.bmWidth, ch = ii.hbmColor ? bm.bmHeight : (bm.bmHeight / 2);
+		if (cw > 0 && ch > 0 && cw <= 1024 && ch <= 1024)
+		{
+			r->left = ci.ptScreenPos.x - (int)ii.xHotspot - margin;
+			r->top = ci.ptScreenPos.y - (int)ii.yHotspot - margin;
+			r->right = r->left + cw + 2 * margin;
+			r->bottom = r->top + ch + 2 * margin;
+			ok = 1;
+		}
+	}
+	if (ii.hbmMask != NULL) { DeleteObject(ii.hbmMask); }
+	if (ii.hbmColor != NULL) { DeleteObject(ii.hbmColor); }
+	return ok;
+}
+
+int kvm_cursor_sprite(HCURSOR hc, pm_sprite *sp)
+{
+	ICONINFO ii;
+	BITMAP bm;
+	int ok = 0;
+
+	memset(sp, 0, sizeof(*sp));
+	memset(&ii, 0, sizeof(ii));
+	if (hc == NULL || !GetIconInfo(hc, &ii)) { return 0; }
+	if (ii.hbmColor == NULL) { sp->monochrome = 1; sp->hc = hc; }
+	else if (GetObject(ii.hbmMask, sizeof(bm), &bm) == sizeof(bm))
+	{
+		int cw = bm.bmWidth, ch = bm.bmHeight;
+		if (cw > 0 && ch > 0 && cw <= 256 && ch <= 256)
+		{
+			HDC dc = CreateCompatibleDC(NULL);
+			if (dc != NULL)
+			{
+				BITMAPINFO bi;
+				void *bb = NULL, *wb = NULL;
+				HBITMAP bmpB, bmpW;
+				memset(&bi, 0, sizeof(bi));
+				bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+				bi.bmiHeader.biWidth = cw;
+				bi.bmiHeader.biHeight = -ch; // top-down
+				bi.bmiHeader.biPlanes = 1;
+				bi.bmiHeader.biBitCount = 32;
+				bi.bmiHeader.biCompression = BI_RGB;
+				bmpB = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bb, NULL, 0);
+				bmpW = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &wb, NULL, 0);
+				if (bmpB != NULL && bmpW != NULL && bb != NULL && wb != NULL)
+				{
+					// The cursor drawn over black and over white: where both are equal the pixel is fully opaque
+					HGDIOBJ old = SelectObject(dc, bmpB);
+					memset(bb, 0x00, (size_t)cw * ch * 4);
+					DrawIconEx(dc, 0, 0, hc, cw, ch, 0, NULL, DI_NORMAL);
+					SelectObject(dc, bmpW);
+					memset(wb, 0xFF, (size_t)cw * ch * 4);
+					DrawIconEx(dc, 0, 0, hc, cw, ch, 0, NULL, DI_NORMAL);
+					GdiFlush();
+					SelectObject(dc, old);
+					sp->aff = (unsigned char *)calloc((size_t)cw * ch, 1);
+					sp->x = (int *)malloc(sizeof(int) * (size_t)cw * ch);
+					sp->y = (int *)malloc(sizeof(int) * (size_t)cw * ch);
+					sp->rgb = (unsigned char *)malloc((size_t)cw * ch * 3);
+					if (sp->x != NULL && sp->y != NULL && sp->rgb != NULL && sp->aff != NULL)
+					{
+						const unsigned char *pb = (const unsigned char *)bb, *pw = (const unsigned char *)wb;
+						int n = 0;
+						for (int y = 0; y < ch; y++)
+						{
+							for (int x = 0; x < cw; x++)
+							{
+								size_t o = ((size_t)y * cw + x) * 4;
+								// alpha > 0 where the cursor changes the pixel: over black and over white the pixel differs from the background in some channel
+								if (pb[o] != 0 || pb[o + 1] != 0 || pb[o + 2] != 0 || pw[o] != 0xFF || pw[o + 1] != 0xFF || pw[o + 2] != 0xFF) { sp->aff[(size_t)y * cw + x] = 1; }
+								if (pb[o] == pw[o] && pb[o + 1] == pw[o + 1] && pb[o + 2] == pw[o + 2])
+								{
+									sp->x[n] = x; sp->y[n] = y; memcpy(sp->rgb + (size_t)n * 3, pb + o, 3);
+									n++;
+								}
+							}
+						}
+						sp->n = n; sp->w = cw; sp->h = ch; sp->hx = (int)ii.xHotspot; sp->hy = (int)ii.yHotspot; sp->hc = hc;
+						if (n >= 8) { pm_sprite_spread(sp); ok = 1; } else { pm_sprite_free(sp); }
+					}
+					else { pm_sprite_free(sp); }
+				}
+				if (bmpB != NULL) { DeleteObject(bmpB); }
+				if (bmpW != NULL) { DeleteObject(bmpW); }
+				DeleteDC(dc);
+			}
+		}
+	}
+	if (ii.hbmMask != NULL) { DeleteObject(ii.hbmMask); }
+	if (ii.hbmColor != NULL) { DeleteObject(ii.hbmColor); }
+	return ok;
 }
 
 } // extern "C"

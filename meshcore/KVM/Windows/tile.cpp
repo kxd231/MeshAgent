@@ -468,6 +468,7 @@ static int get_scaled_desktop_buffer(void **buffer, long long *bufferSize, int *
 // a copy of fullBits at 100%, the scaled image otherwise. The cursor is drawn into that copy (100%), like the GDI path does.
 // A frame is PARTIAL when the changed rectangles are known: kvm.c then only checks the tiles they touch.
 // ---------------------------------------------------------------------------------------------------------------------
+#include "dxgi_ptrmask.h"
 enum { DXS_IDLE = 0, DXS_OPEN = 1, DXS_DISABLED = 2 };
 
 static struct
@@ -496,7 +497,43 @@ static struct
 	int staleSystematicLogged;
 	int invalidCalls;			// Consecutive DXGI_ERROR_INVALID_CALL results without an image in between
 	struct { int want, rectValid; dxgi_rect rect; HCURSOR cursor; int x, y; } ov; // Cursor overlay of the previous output (100% only)
+	// System cursor composed into the DXGI image (software cursor: VMs, basic display drivers). See "Software cursor in the DXGI image" below.
+	struct
+	{
+		int hwSeen, embedded, probes, probeValid, probeX, probeY;
+		HCURSOR probeCursor;
+		pm_cache cache;						// shape masks (and bitmaps) of the cursor handles
+		int sw, sh;							// size of the persistent image, for the pre-copy hook
+		int hookState;						// 0 = nothing saved, 1 = the regions hold pixels from before the frame, 2 = the frame went into an image without them
+		int hookTouchCur;					// a rectangle of the frame touches the field at the position GetCursorInfo gave
+		dxgi_rect hookUr, hookCr;			// that field (unclipped, clipped)
+		HCURSOR hookHc;
+		POINT hookPos;
+		pm_region reg[PM_REGIONS];			// pixels from before the frame: small rectangles of the frame, and windows around the places the cursor can be in
+		int nReg;
+		dxgi_rect hist[3];					// fields of the last places where the cursor was found (windows are saved around them)
+		int nHist;
+		unsigned char *N, *G;				// raw field of the frame (with the cursor), GDI read of the field
+		size_t nCap, gCap;
+		int nValid;							// N and cur* belong to the last frame that touched the field
+		dxgi_rect curUr, curCr;
+		HCURSOR curHc;
+		POINT curPos;
+		int stale;							// pixels under the cursor may be out of date (the content of the field changed)
+		DWORD lastTouch, lastGdi;
+		int stRestores, stGdiReads, stFound, stNotFound, maskPx, logged;
+		unsigned int stGdiUs, stSearchUs;
+	} ptr;
 } gDx;
+
+static void dx_ptr_reset(void)
+{
+	pm_cache_free(&gDx.ptr.cache);
+	pm_regions_free(gDx.ptr.reg, PM_REGIONS);
+	free(gDx.ptr.N); free(gDx.ptr.G);
+	memset(&gDx.ptr, 0, sizeof(gDx.ptr));
+}
+#define DX_PTR_RESET() dx_ptr_reset()
 
 static void dx_desktop_name(char *name, int cap)
 {
@@ -522,6 +559,7 @@ static void dx_close(void)
 	if (gDx.state == DXS_OPEN) { gDx.state = DXS_IDLE; }
 	gDx.persistentValid = 0;
 	gDx.ov.want = gDx.ov.rectValid = 0;
+	DX_PTR_RESET();
 }
 
 static void dx_delay(DWORD ms)
@@ -621,12 +659,393 @@ static long long dx_stale_compare(int sw, int sh)
 }
 #endif
 
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Software cursor in the DXGI image.
+//
+// On machines without a hardware cursor plane (some virtual machines) the system composes the mouse cursor into the desktop image that
+// Desktop Duplication delivers. The GDI path (BitBlt) never contained it: the viewer draws its own pointer, and the agent draws one
+// only for the overlay (kvm_cursor_xor, mouseMove[0] != 0, 100%). A cursor in the DXGI image would show twice.
+//
+// Detection (measured, see README-kvm-perf.md): with a software cursor the duplication reports no pointer at all (LastMouseUpdateTime
+// is 0 in every frame, also while the cursor moves); with a hardware cursor it delivers the pointer separately (PointerPosition.Visible
+// == TRUE and a shape) shortly after it is opened. So: once a pointer update with Visible == TRUE has been seen, the cursor is not in
+// the image ("hardware": nothing more is done or examined until the duplication is opened again). Until then, whenever an image frame
+// arrives and the cursor is showing at a position or with a handle that was not examined yet, the cursor field of the persistent image
+// is compared with a GDI read (SRCCOPY): at least KVM_DXGI_POINTER_MIN_DIFF differing pixels mean "embedded". The state is kept between
+// frames and logged at every change.
+//
+// Taking the cursor out without reading the screen. A GDI read of the screen costs 16-30 ms on those machines whatever its size, so it
+// cannot be done for every frame. Invariant: the persistent image (fullBits) never holds the cursor. So before a frame is copied into
+// it (hook dx_precopy(), called by dxgi_capture_acquire after the rectangles are known) the pixels of the cursor field are saved (S);
+// after the copy the pixels under the SHAPE of the cursor (a mask per cursor handle: the pixels that differ between a DXGI image and a
+// GDI read, widened by one pixel) are put back from S, the rest of the field keeps the new DXGI pixels. Where the content changed under
+// the cursor, those pixels are out of date; a GDI read of the field (stale) puts the truth under the mask: KVM_DXGI_POINTER_QUIET_MS
+// after the last frame that touched the field, or every KVM_DXGI_POINTER_REFRESH_MS while frames keep touching it (video under the
+// cursor). A read in a quiet moment also corrects the mask (differences between the raw DXGI pixels N and the GDI read are added; a
+// mask that was provisional, i.e. "the whole field", is made new). A cursor handle without a mask costs one GDI read. A moving cursor
+// over static content, and a still screen, cost none: the pixels under the mask are then unchanged and nothing outside it changed.
+//
+// Race: a frame can have been composed with the cursor in A, while the field is taken at B (the position read in the hook). The trace
+// in A stays in the image until the next frame; that frame reports A as changed (the cursor was moved away from it, the rectangle holds
+// clean pixels) and overwrites it. The frame in which the cursor stopped is composed with the cursor in its final place, which is where
+// the hook reads it, so no trace outlives the last frame. The field the cursor left is not restored for the same reason.
+//
+// KVM_DXGI_POINTER_KEEP: nothing is taken out (the detection and the log stay), for comparison and as a switch.
+// ---------------------------------------------------------------------------------------------------------------------
+
+static inline const pm_rect &PMR(const dxgi_rect &r) { return *(const pm_rect *)&r; }
+
+static int dx_ptr_buf(unsigned char **p, size_t *cap, size_t need)
+{
+	unsigned char *n;
+	if (*cap >= need) { return 1; }
+	if ((n = (unsigned char *)realloc(*p, need)) == NULL) { return 0; }
+	*p = n;
+	*cap = need;
+	return 1;
+}
+
+// The field of the cursor now: ur unclipped, cr clipped to the captured rectangle (captured-rectangle pixels). 0 when the cursor is hidden or outside.
+static int dx_ptr_field(dxgi_rect *ur, dxgi_rect *cr, HCURSOR *hc, POINT *cp)
+{
+	dxgi_rect f;
+	if (!kvm_cursor_field(KVM_DXGI_POINTER_MARGIN, &f, hc, cp)) { return 0; }
+	f.left -= SCREEN_X; f.right -= SCREEN_X; f.top -= SCREEN_Y; f.bottom -= SCREEN_Y;
+	*ur = f;
+	if (f.left < 0) { f.left = 0; }
+	if (f.top < 0) { f.top = 0; }
+	if (f.right > SCREEN_WIDTH) { f.right = SCREEN_WIDTH; }
+	if (f.bottom > SCREEN_HEIGHT) { f.bottom = SCREEN_HEIGHT; }
+	if (f.right <= f.left || f.bottom <= f.top) { return 0; }
+	*cr = f;
+	return 1;
+}
+
+// GDI read (SRCCOPY, no CAPTUREBLT: that makes the system draw the cursor again, one new DXGI image per read) of cr into gDx.ptr.G, top-down, 4 bytes per pixel.
+static int dx_gdi_read(const dxgi_rect &cr)
+{
+	int w = cr.right - cr.left, h = cr.bottom - cr.top, ok = 0;
+	BITMAPINFO bi;
+	void *bits = NULL;
+	HBITMAP bmp;
+	HGDIOBJ old;
+	HDC dc;
+	double t0 = dx_qpc_ms();
+	unsigned int us;
+
+	if (w <= 0 || h <= 0 || !dx_ptr_buf(&gDx.ptr.G, &gDx.ptr.gCap, (size_t)w * h * 4)) { return 0; }
+	if ((dc = CreateCompatibleDC(hDesktopDC)) == NULL) { return 0; }
+	ZeroMemory(&bi, sizeof(bi));
+	bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+	bi.bmiHeader.biWidth = w;
+	bi.bmiHeader.biHeight = h; // bottom-up
+	bi.bmiHeader.biPlanes = 1;
+	bi.bmiHeader.biBitCount = 32;
+	bi.bmiHeader.biCompression = BI_RGB;
+	bmp = CreateDIBSection(hDesktopDC, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+	if (bmp != NULL && bits != NULL)
+	{
+		old = SelectObject(dc, bmp);
+		if (BitBlt(dc, 0, 0, w, h, hDesktopDC, SCREEN_X + cr.left, SCREEN_Y + cr.top, SRCCOPY))
+		{
+			GdiFlush();
+			for (int y = 0; y < h; y++) { memcpy(gDx.ptr.G + (size_t)y * w * 4, (const unsigned char *)bits + (size_t)(h - 1 - y) * w * 4, (size_t)w * 4); }
+			ok = 1;
+		}
+		SelectObject(dc, old);
+	}
+	if (bmp != NULL) { DeleteObject(bmp); }
+	DeleteDC(dc);
+	us = (unsigned int)((dx_qpc_ms() - t0) * 1000.0);
+	gDx.ptr.stGdiReads++;
+	gDx.ptr.stGdiUs += (us > 0 ? us : 1);
+	return ok;
+}
+
+static void dx_pointer_log(const char *reason, int diff, const dxgi_frame &f, const dxgi_rect &fld, HCURSOR hc)
+{
+	kvm_stats_log("dxgi pointer embedded=%d reason=%s diff=%d hardware_seen=%d mouse_update=%d dx_visible=%d shape_size=%u cursor=%p field=%d,%d,%d,%d patch=%s",
+		gDx.ptr.embedded, reason, diff, gDx.ptr.hwSeen, f.ptrUpdate, f.ptrVisible, f.ptrShapeSize, (void *)hc, fld.left, fld.top, fld.right, fld.bottom,
+#ifdef KVM_DXGI_POINTER_KEEP
+		"off"
+#else
+		"on"
+#endif
+	);
+}
+
+#ifndef KVM_DXGI_POINTER_KEEP
+static void dx_mask_log(const char *reason, HCURSOR hc, const pm_mask *e)
+{
+	if (gDx.ptr.logged >= 40) { return; }
+	gDx.ptr.logged++;
+	kvm_stats_log("dxgi pointer mask reason=%s cursor=%p field=%dx%d pixels=%d provisional=%d", reason, (void *)hc, e->w, e->h, e->count, e->provisional);
+}
+#endif
+
+
+#ifndef KVM_DXGI_POINTER_KEEP
+// The entry of a cursor handle (created when new): its bitmap, and for a colour cursor the mask made from it (no GDI read needed).
+static pm_mask *dx_mask_entry(HCURSOR hc, const dxgi_rect &ur)
+{
+	int w = ur.right - ur.left, h = ur.bottom - ur.top;
+	pm_mask *e = pm_cache_find(&gDx.ptr.cache, (void *)hc, w, h);
+	if (e == NULL)
+	{
+		e = pm_cache_take(&gDx.ptr.cache, (void *)hc, w, h);
+		if (kvm_cursor_sprite(hc, &e->sp)) { e->spState = 1; if (pm_mask_from_sprite(e, KVM_DXGI_POINTER_MARGIN)) { dx_mask_log("sprite", hc, e); } }
+		else { e->spState = 2; }
+	}
+	return e;
+}
+#endif
+
+// A frame has been acquired: a pointer update with Visible == TRUE means a hardware cursor.
+static void dx_pointer_latch(const dxgi_frame &f)
+{
+	if (f.ptrUpdate && f.ptrVisible && !gDx.ptr.hwSeen)
+	{
+		int was = gDx.ptr.embedded;
+		dxgi_rect none;
+		memset(&none, 0, sizeof(none));
+		gDx.ptr.hwSeen = 1;
+		gDx.ptr.embedded = 0;
+		gDx.ptr.hookState = 0;
+		gDx.ptr.stale = 0;
+		if (was || gDx.ptr.probes > 0) { dx_pointer_log("hardware_pointer", 0, f, none, NULL); } // not logged for the common case: nothing was ever examined
+	}
+}
+
+// Hook of dxgi_capture_acquire: the rectangles of a new image are known, nothing has been copied yet. Saves the pixels of the persistent image
+// where the cursor can be drawn by this frame: every small rectangle of the frame (a moving software cursor makes the frame report the
+// rectangle around its old and new place, measured: one rectangle of 16-48 pixels per frame), and windows around the places where the cursor
+// can be in a large rectangle (where GetCursorInfo says it is, and the last places where it was found).
+static void dx_precopy(int fullCopy, int rectCount, const dxgi_rect *rects)
+{
+#ifndef KVM_DXGI_POINTER_KEEP
+	dxgi_rect ur, cr, win[4], q;
+	HCURSOR hc;
+	POINT cp;
+	int nWin = 0, touch = fullCopy;
+	long long budget = 1200000;
+
+	gDx.ptr.hookState = 0;
+	gDx.ptr.nReg = 0;
+	gDx.ptr.hookTouchCur = 0;
+	if (!gDx.ptr.embedded || gDx.ptr.hwSeen) { return; }
+	if (!dx_ptr_field(&ur, &cr, &hc, &cp)) { return; }
+	for (int i = 0; i < rectCount && !touch; i++)
+	{
+		if (rects[i].left < cr.right && rects[i].right > cr.left && rects[i].top < cr.bottom && rects[i].bottom > cr.top) { touch = 1; }
+	}
+	gDx.ptr.hookUr = ur; gDx.ptr.hookCr = cr; gDx.ptr.hookHc = hc; gDx.ptr.hookPos = cp; gDx.ptr.hookTouchCur = touch;
+	if (!gDx.persistentValid) { gDx.ptr.hookState = 2; return; }
+
+	// windows: around the field GetCursorInfo gave, and around the last places where the cursor was found
+	win[nWin++] = cr;
+	for (int i = 0; i < gDx.ptr.nHist && nWin < 4; i++) { win[nWin++] = gDx.ptr.hist[i]; }
+	for (int i = 0; i < nWin; i++)
+	{
+		win[i].left -= 48; win[i].top -= 48; win[i].right += 48; win[i].bottom += 48;
+		if (win[i].left < 0) { win[i].left = 0; }
+		if (win[i].top < 0) { win[i].top = 0; }
+		if (win[i].right > SCREEN_WIDTH) { win[i].right = SCREEN_WIDTH; }
+		if (win[i].bottom > SCREEN_HEIGHT) { win[i].bottom = SCREEN_HEIGHT; }
+	}
+	for (int i = 0; i < rectCount && gDx.ptr.nReg < PM_REGIONS; i++)
+	{
+		q = rects[i];
+		if (q.left < 0) { q.left = 0; } if (q.top < 0) { q.top = 0; }
+		if (q.right > SCREEN_WIDTH) { q.right = SCREEN_WIDTH; } if (q.bottom > SCREEN_HEIGHT) { q.bottom = SCREEN_HEIGHT; }
+		if (q.right <= q.left || q.bottom <= q.top) { continue; }
+		long long area = (long long)(q.right - q.left) * (q.bottom - q.top);
+		if (area <= 65536)
+		{
+			if (budget < area || !pm_region_save(fullBits, gDx.ptr.sw, gDx.ptr.sh, &gDx.ptr.reg[gDx.ptr.nReg], PMR(q))) { continue; }
+			budget -= area; gDx.ptr.nReg++;
+		}
+		else
+		{
+			for (int k = 0; k < nWin && gDx.ptr.nReg < PM_REGIONS; k++)
+			{
+				dxgi_rect w = win[k];
+				if (w.left < q.left) { w.left = q.left; } if (w.top < q.top) { w.top = q.top; }
+				if (w.right > q.right) { w.right = q.right; } if (w.bottom > q.bottom) { w.bottom = q.bottom; }
+				if (w.right <= w.left || w.bottom <= w.top) { continue; }
+				long long a = (long long)(w.right - w.left) * (w.bottom - w.top);
+				if (budget < a || !pm_region_save(fullBits, gDx.ptr.sw, gDx.ptr.sh, &gDx.ptr.reg[gDx.ptr.nReg], PMR(w))) { continue; }
+				budget -= a; gDx.ptr.nReg++;
+			}
+		}
+	}
+	if (fullCopy)
+	{
+		// no usable metadata: the whole output is written; save the windows
+		for (int k = 0; k < nWin && gDx.ptr.nReg < PM_REGIONS; k++)
+		{
+			long long a = (long long)(win[k].right - win[k].left) * (win[k].bottom - win[k].top);
+			if (a > 0 && budget >= a && pm_region_save(fullBits, gDx.ptr.sw, gDx.ptr.sh, &gDx.ptr.reg[gDx.ptr.nReg], PMR(win[k]))) { budget -= a; gDx.ptr.nReg++; }
+		}
+	}
+	gDx.ptr.hookState = (gDx.ptr.nReg > 0) ? 1 : 0;
+#else
+	(void)fullCopy; (void)rectCount; (void)rects;
+#endif
+}
+
+// After the frame (and after the image of a frame was copied into the persistent image): detection, taking the cursor out, refreshing the
+// pixels under it from GDI. marks gets the rectangles (captured-rectangle pixels) whose tiles have to be checked although DXGI did not
+// report them; returns their number (at most 2).
+static int dx_pointer_process(const dxgi_frame &f, int gotImage, int sw, int sh, dxgi_rect *marks)
+{
+	int nMark = 0;
+	DWORD now = GetTickCount();
+	dxgi_rect ur, cr;
+	HCURSOR hc;
+	POINT cp;
+
+	if (gDx.ptr.hwSeen) { return 0; }
+
+	if (!gDx.ptr.embedded)
+	{
+		int diff;
+		if (!gotImage || !dx_ptr_field(&ur, &cr, &hc, &cp)) { return 0; } // hidden, or on another monitor: no cursor in the image
+		if (gDx.ptr.probeValid && gDx.ptr.probeCursor == hc && gDx.ptr.probeX == cp.x && gDx.ptr.probeY == cp.y) { return 0; } // examined already
+		gDx.ptr.probeValid = 1; gDx.ptr.probeCursor = hc; gDx.ptr.probeX = cp.x; gDx.ptr.probeY = cp.y;
+		gDx.ptr.probes++;
+		if (!dx_gdi_read(cr)) { return 0; }
+		diff = pm_diff_count(fullBits, sw, sh, PMR(cr), gDx.ptr.G);
+		if (diff < KVM_DXGI_POINTER_MIN_DIFF) { if (gDx.ptr.probes <= 3) { dx_pointer_log("probe_clean", diff, f, cr, hc); } return 0; }
+		gDx.ptr.embedded = 1;
+		dx_pointer_log("probe", diff, f, cr, hc);
+#ifndef KVM_DXGI_POINTER_KEEP
+		// The field holds the cursor: take the pixels under its shape from the GDI read
+		if (dx_ptr_buf(&gDx.ptr.N, &gDx.ptr.nCap, (size_t)(cr.right - cr.left) * (cr.bottom - cr.top) * 4))
+		{
+			pm_mask *e = dx_mask_entry(hc, ur);
+			pm_copy_out(fullBits, sw, sh, PMR(cr), gDx.ptr.N);
+			if (e->m == NULL) { pm_build(e, PMR(ur), PMR(cr), gDx.ptr.N, gDx.ptr.G, 1); dx_mask_log("probe", hc, e); }
+			pm_apply(e, PMR(ur), PMR(cr), fullBits, sw, sh, gDx.ptr.G);
+			gDx.ptr.maskPx = e->count;
+			gDx.ptr.curUr = ur; gDx.ptr.curCr = cr; gDx.ptr.curHc = hc; gDx.ptr.curPos = cp;
+			gDx.ptr.nValid = 1; gDx.ptr.stale = 0; gDx.ptr.lastTouch = gDx.ptr.lastGdi = now;
+			marks[nMark++] = cr;
+		}
+#endif
+		return nMark;
+	}
+
+#ifndef KVM_DXGI_POINTER_KEEP
+	if (gotImage && gDx.ptr.hookState != 0)
+	{
+		int st = gDx.ptr.hookState;
+		int found = 0, bx = 0, by = 0, hits = 0, outside = 0;
+		pm_mask *e;
+		ur = gDx.ptr.hookUr; cr = gDx.ptr.hookCr; hc = gDx.ptr.hookHc; cp = gDx.ptr.hookPos;
+		gDx.ptr.hookState = 0;
+		e = dx_mask_entry(hc, ur);
+		if (st == 1 && e->spState == 1)
+		{
+			// Where did the system put the cursor into this frame? Not necessarily where GetCursorInfo says it is now.
+			double t0 = dx_qpc_ms();
+			long long tried = 0;
+			for (int i = 0; i < gDx.ptr.nReg; i++)
+			{
+				int x = 0, y = 0, h2 = 0;
+				if (pm_find(fullBits, sw, sh, &e->sp, gDx.ptr.reg[i].r, &x, &y, &h2, 120000, &tried) && h2 > hits) { hits = h2; bx = x; by = y; found = 1; }
+				if (hits >= e->sp.n) { break; } // every opaque pixel matches: that is it
+			}
+			gDx.ptr.stSearchUs += (unsigned int)((dx_qpc_ms() - t0) * 1000.0);
+			if (found)
+			{
+				// the field around the place where it was found (same margin as the field of GetCursorInfo)
+				int dxm = (bx + e->sp.hx) - (cp.x - SCREEN_X), dym = (by + e->sp.hy) - (cp.y - SCREEN_Y);
+				ur.left += dxm; ur.right += dxm; ur.top += dym; ur.bottom += dym;
+				cr = ur;
+				if (cr.left < 0) { cr.left = 0; } if (cr.top < 0) { cr.top = 0; }
+				if (cr.right > SCREEN_WIDTH) { cr.right = SCREEN_WIDTH; } if (cr.bottom > SCREEN_HEIGHT) { cr.bottom = SCREEN_HEIGHT; }
+				cp.x = bx + e->sp.hx + SCREEN_X; cp.y = by + e->sp.hy + SCREEN_Y;
+				gDx.ptr.stFound++;
+				if (gDx.ptr.nHist < 3) { gDx.ptr.nHist++; }
+				for (int i = gDx.ptr.nHist - 1; i > 0; i--) { gDx.ptr.hist[i] = gDx.ptr.hist[i - 1]; }
+				gDx.ptr.hist[0] = cr;
+			}
+			else if (gDx.ptr.hookTouchCur) { gDx.ptr.stNotFound++; }
+		}
+		if (dx_ptr_buf(&gDx.ptr.N, &gDx.ptr.nCap, (size_t)(cr.right - cr.left) * (cr.bottom - cr.top) * 4))
+		{
+			pm_copy_out(fullBits, sw, sh, PMR(cr), gDx.ptr.N); // the raw pixels of the field: with the cursor
+			if (st == 1 && e->m != NULL && (found || e->spState != 1 || gDx.ptr.hookTouchCur))
+			{
+				// The pixels under the cursor shape come from before the frame, the rest of the field is new
+				outside = pm_restore_regions(e, PMR(ur), PMR(cr), fullBits, sw, sh, gDx.ptr.reg, gDx.ptr.nReg);
+				gDx.ptr.stRestores++;
+				if (outside > 0 || e->provisional || (e->spState == 1 && !found)) { gDx.ptr.stale = 1; }
+				gDx.ptr.curUr = ur; gDx.ptr.curCr = cr; gDx.ptr.curHc = hc; gDx.ptr.curPos = cp;
+				gDx.ptr.nValid = 1;
+				gDx.ptr.lastTouch = now;
+				gDx.ptr.maskPx = e->count;
+			}
+			else if (gDx.ptr.hookTouchCur && (st == 2 || e->m == NULL))
+			{
+				// A cursor without a mask (monochrome cursor of a new handle), or no pixels from before the frame: one GDI read
+				if (dx_gdi_read(cr))
+				{
+					if (e->m == NULL) { pm_build(e, PMR(ur), PMR(cr), gDx.ptr.N, gDx.ptr.G, 1); dx_mask_log("new_cursor", hc, e); }
+					pm_apply(e, PMR(ur), PMR(cr), fullBits, sw, sh, gDx.ptr.G);
+					marks[nMark++] = cr;
+					gDx.ptr.stale = 0;
+					gDx.ptr.lastGdi = now;
+				}
+				gDx.ptr.curUr = ur; gDx.ptr.curCr = cr; gDx.ptr.curHc = hc; gDx.ptr.curPos = cp;
+				gDx.ptr.nValid = 1;
+				gDx.ptr.lastTouch = now;
+				gDx.ptr.maskPx = e->count;
+			}
+		}
+	}
+
+	if (gDx.ptr.stale)
+	{
+		dxgi_rect ur2, cr2;
+		HCURSOR hc2;
+		POINT cp2;
+		if (!dx_ptr_field(&ur2, &cr2, &hc2, &cp2)) { gDx.ptr.stale = 0; } // hidden
+		else if (hc2 == gDx.ptr.curHc && cp2.x == gDx.ptr.curPos.x && cp2.y == gDx.ptr.curPos.y && gDx.ptr.nValid &&
+			((DWORD)(now - gDx.ptr.lastTouch) >= KVM_DXGI_POINTER_QUIET_MS || (DWORD)(now - gDx.ptr.lastGdi) >= KVM_DXGI_POINTER_REFRESH_MS))
+		{
+			// (a cursor that moved gets its new state from the next frame)
+			pm_mask *e = pm_cache_find(&gDx.ptr.cache, (void *)gDx.ptr.curHc, gDx.ptr.curUr.right - gDx.ptr.curUr.left, gDx.ptr.curUr.bottom - gDx.ptr.curUr.top);
+			if (e != NULL && dx_gdi_read(gDx.ptr.curCr))
+			{
+				int before = e->count, wasProv = e->provisional;
+				if ((DWORD)(now - gDx.ptr.lastTouch) >= KVM_DXGI_POINTER_QUIET_MS)
+				{
+					pm_build(e, PMR(gDx.ptr.curUr), PMR(gDx.ptr.curCr), gDx.ptr.N, gDx.ptr.G, e->provisional);
+					if (e->count != before || e->provisional != wasProv) { dx_mask_log("quiet", gDx.ptr.curHc, e); }
+					gDx.ptr.maskPx = e->count;
+				}
+				pm_apply(e, PMR(gDx.ptr.curUr), PMR(gDx.ptr.curCr), fullBits, sw, sh, gDx.ptr.G);
+				if (nMark < 2) { marks[nMark++] = gDx.ptr.curCr; }
+				gDx.ptr.stale = 0;
+				gDx.ptr.lastGdi = now;
+			}
+		}
+	}
+#else
+	(void)gotImage;
+#endif
+	return nMark;
+}
+
 // Returns 0 when the frame was produced (*buffer, or KVM_FRAME_UNCHANGED), 1 when this frame has to be captured with GDI.
 // On 1 nothing is allocated and the caller captures a complete GDI frame.
 static int kvm_dxgi_frame(void **buffer, long long *bufferSize, long *mouseMove, int *pixelSize, int flags, kvm_frame_info *info)
 {
 	char desk[64];
-	int sw, sh, want, changed = 0, gotImage = 0, fed = 0, kind, drawn = 0;
+	int sw, sh, want, changed = 0, gotImage = 0, fed = 0, kind, drawn = 0, nPatch = 0;
+	dxgi_rect patchRect[2];
 	int forceFull = (flags & KVM_CAPTURE_FORCE_FULL) != 0;
 	int wantImage = (flags & KVM_CAPTURE_WANT_IMAGE) != 0; // WA-2: a picture is needed although nothing changed (sharpening); the capture still waits the normal timeout for a new frame
 	unsigned int timeout;
@@ -697,6 +1116,7 @@ static int kvm_dxgi_frame(void **buffer, long long *bufferSize, long *mouseMove,
 			gDx.lastImageTick = gDx.lastStaleTick = GetTickCount();
 			gDx.staleStrikes = 0;
 			gDx.ov.want = gDx.ov.rectValid = 0;
+			DX_PTR_RESET();
 			info->dxgiEvent |= KVM_DXGI_EVENT_OPEN;
 			dx_utf8(di.adapter, ad, (int)sizeof(ad));
 			dx_utf8(di.output, out8, (int)sizeof(out8));
@@ -759,6 +1179,8 @@ static int kvm_dxgi_frame(void **buffer, long long *bufferSize, long *mouseMove,
 	timeout = (forceFull || changed) ? 0 : (gDx.persistentValid ? KVM_DXGI_TIMEOUT_MS : KVM_DXGI_FIRST_FRAME_MS);
 	dstTop = fullBits + ((size_t)(sh - 1) * sw * 4);
 	memset(&f, 0, sizeof(f));
+	gDx.ptr.sw = sw; gDx.ptr.sh = sh; gDx.ptr.hookState = 0;
+	dxgi_capture_set_precopy(dx_precopy);
 	acquireStart = dx_qpc_ms();
 	r = dxgi_capture_acquire(timeout, dstTop, -(ptrdiff_t)sw * 4, gDx.persistentValid ? 0 : 1, &f);
 	acquireMs = dx_qpc_ms() - acquireStart;
@@ -772,8 +1194,11 @@ static int kvm_dxgi_frame(void **buffer, long long *bufferSize, long *mouseMove,
 			gDx.persistentValid = 1;
 			gotImage = (f.rectCount > 0);
 			if (gotImage) { gDx.lastImageTick = GetTickCount(); gDx.staleStrikes = 0; }
+			dx_pointer_latch(f);
 			break;
 		case DXGI_CAP_NO_CHANGE:
+			dx_pointer_latch(f);
+			break;
 		case DXGI_CAP_TIMEOUT:
 			break;
 		default:
@@ -784,6 +1209,7 @@ static int kvm_dxgi_frame(void **buffer, long long *bufferSize, long *mouseMove,
 			gDx.state = DXS_IDLE;
 			gDx.persistentValid = 0;
 			gDx.ov.want = gDx.ov.rectValid = 0;
+			DX_PTR_RESET();
 			info->dxgiEvent |= (r == DXGI_CAP_LOST) ? KVM_DXGI_EVENT_LOST : KVM_DXGI_EVENT_FALLBACK;
 			if (r == DXGI_CAP_LOST)
 			{
@@ -826,6 +1252,14 @@ static int kvm_dxgi_frame(void **buffer, long long *bufferSize, long *mouseMove,
 		}
 	}
 
+	// The software cursor: detection, taking it out of the image, refreshing the pixels under it (may need tiles to be checked and a frame without a new DXGI image)
+	nPatch = dx_pointer_process(f, gotImage, sw, sh, patchRect);
+	info->ptrEmbedded = gDx.ptr.embedded;
+	info->ptrFound = gDx.ptr.stFound; info->ptrNotFound = gDx.ptr.stNotFound; info->ptrSearchUs = gDx.ptr.stSearchUs;
+	gDx.ptr.stFound = gDx.ptr.stNotFound = 0; gDx.ptr.stSearchUs = 0;
+	info->ptrRestores = gDx.ptr.stRestores; info->ptrGdiReads = gDx.ptr.stGdiReads; info->ptrGdiUs = gDx.ptr.stGdiUs; info->ptrMaskPx = gDx.ptr.maskPx;
+	gDx.ptr.stRestores = gDx.ptr.stGdiReads = 0; gDx.ptr.stGdiUs = 0;
+
 	// No image yet (the duplication gave nothing since it was opened): take the starting point from GDI. Changes after the
 	// duplication was created arrive as rectangles later and are applied on top of it.
 	if (!gDx.persistentValid)
@@ -835,7 +1269,7 @@ static int kvm_dxgi_frame(void **buffer, long long *bufferSize, long *mouseMove,
 		fed = 1;
 	}
 
-	if (!gotImage && !fed && !changed && !forceFull && !wantImage)
+	if (!gotImage && !fed && !changed && !forceFull && !wantImage && nPatch == 0)
 	{
 #ifdef KVM_STATS_LOG
 		// Safety net of the measurement branch, see dx_stale_compare()
@@ -913,6 +1347,7 @@ static int kvm_dxgi_frame(void **buffer, long long *bufferSize, long *mouseMove,
 	{
 		if ((map = (unsigned char*)calloc((size_t)TILE_HEIGHT_COUNT * TILE_WIDTH_COUNT, 1)) == NULL) { free(out); return 1; }
 		for (int i = 0; i < f.rectCount; i++) { dx_mark_overlay(map, f.rects[i]); }
+		for (int i = 0; i < nPatch; i++) { dx_mark_overlay(map, patchRect[i]); }
 		if (SCALING_FACTOR == 1024)
 		{
 			// The overlay moved or changed: the tiles under the old and the new one
@@ -1700,6 +2135,7 @@ void kvm_dxgi_thread_end(void)
 	if (gDx.state == DXS_OPEN) { gDx.state = DXS_IDLE; }
 	gDx.persistentValid = 0;
 	gDx.ov.want = gDx.ov.rectValid = 0;
+	DX_PTR_RESET();
 }
 #endif
 
