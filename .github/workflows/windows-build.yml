@@ -11,6 +11,12 @@ on:
 permissions:
   contents: read
 
+env:
+  # The x64 build links TurboJPEG (KVM tile encoding). Official libjpeg-turbo release asset and its published SHA-256 digest,
+  # the same as in kvm-perf-release.yml.
+  TURBOJPEG_URL: https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/3.2.0/libjpeg-turbo-3.2.0-vc-x64.exe
+  TURBOJPEG_SHA256: 662761d8ba8dae04aec74023ebaeceb856c2b56b9b59cfd180759d26300dda42
+
 jobs:
   windows-build:
     runs-on: ${{ matrix.platform == 'ARM64' && 'windows-11-arm' || 'windows-2022' }}
@@ -22,6 +28,16 @@ jobs:
     - uses: actions/checkout@v7
     - name: Setup Visual Studio
       uses: microsoft/setup-msbuild@v3
+    - name: Install libjpeg-turbo (verified, x64 only)
+      if: matrix.platform == 'x64'
+      shell: pwsh
+      run: |
+        $exe = "$env:RUNNER_TEMP\libjpeg-turbo.exe"
+        Invoke-WebRequest -Uri $env:TURBOJPEG_URL -OutFile $exe
+        $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+        if ($hash -ne $env:TURBOJPEG_SHA256) { throw "libjpeg-turbo checksum mismatch: $hash" }
+        Start-Process -FilePath $exe -ArgumentList '/S','/D=C:\libjpeg-turbo64' -Wait
+        if (-not (Test-Path 'C:\libjpeg-turbo64\lib\turbojpeg-static.lib')) { throw 'turbojpeg-static.lib not installed' }
     - name: Build ${{ matrix.platform }}
       run: msbuild MeshAgent-2022.sln /p:Configuration=Release /p:Platform=${{ matrix.platform }}
     - name: Upload ${{ matrix.platform }} artifacts
