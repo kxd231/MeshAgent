@@ -121,8 +121,7 @@ desktop changes. DXGI calls run under `__try/__except`: an exception switches DX
 REG_MULTI_SZ, then restart the service) forces GDI at run time.
 
 **Log.** `<directory of the exe>\<exe name without .exe>-kvm.log`, one line per event and one `stats` line per 10 s (limit 1 MB, then nothing is appended).
-**Every x64 build of this branch writes this log** (`KVM_STATS_LOG` is defined together with `KVM_DXGI` in `Debug|x64` and `Release|x64` of `MeshService-2022.vcxproj`, also with `/DKVM_DXGI_DISABLE`);
-**before a production release the log has to be switched off**: remove `KVM_DXGI` from `PreprocessorDefinitions` (this also removes DXGI) or, to keep DXGI without the log, stop defining `KVM_STATS_LOG` in `dxgi_capture.h` (the code guarded by it, including the `stale` check, is then not compiled). Lines:
+**The log is off by default.** The statistics are always collected (the adaptive quality below depends on them), but the file is written only when `MESH_KVM_STATS_LOG=1` is in the environment of the service (system environment variable, then restart the service), or in builds with `/DKVM_STATS_LOG_ALWAYS`. Lines:
 `start build=... dxgi=<0|1> env_force_gdi=<0|1>`, `dxgi open adapter=... mode=... sysmem=<0|1> desktop=<name>`, `dxgi lost|fail|ineligible|disabled|slow_init|lost_storm|stale...`,
 `stats t= period_ms= path=<dxgi|gdi|mixed> frames= full= partial= unchanged= fps= ... copy_us_avg= out_us_avg= capture_us_avg= write_ms= dirty_rects= move_rects= ...`.
 `frames` counts every iteration of the loop (also `unchanged`): the picture rate is `fps = (full + partial) / period`. `copy_us`: GPU -> persistent image,

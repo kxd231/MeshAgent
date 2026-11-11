@@ -926,10 +926,29 @@ DWORD WINAPI kvm_mainloopinput(LPVOID Param)
 
 #ifdef KVM_STATS_LOG
 // Statistics log: <exe directory>\<exe name without .exe>-kvm.log, one line per event and every KVM_STATS_PERIOD_MS.
-// Only written by the branch with the DXGI measurements; the file stops growing at KVM_STATS_LOG_MAX bytes.
+// Off by default: written only when MESH_KVM_STATS_LOG=1 is in the environment of the service (or in builds with
+// /DKVM_STATS_LOG_ALWAYS). The statistics themselves are always kept, the adaptive quality depends on them.
+// The file stops growing at KVM_STATS_LOG_MAX bytes.
 static SRWLOCK gStatsLock = SRWLOCK_INIT;
 static wchar_t gStatsPath[MAX_PATH + 16];
 static int gStatsPathReady = 0;
+static volatile LONG gStatsLogOn = -1;	// -1 = not read yet, 0 = off, 1 = on
+
+static int kvm_stats_log_enabled(void)
+{
+	LONG on = gStatsLogOn;
+	if (on < 0)
+	{
+#ifdef KVM_STATS_LOG_ALWAYS
+		on = 1;
+#else
+		char env[8];
+		on = (GetEnvironmentVariableA("MESH_KVM_STATS_LOG", env, sizeof(env)) > 0 && env[0] == '1') ? 1 : 0;
+#endif
+		InterlockedExchange(&gStatsLogOn, on);
+	}
+	return (int)on;
+}
 
 static long long kvm_qpc_frequency(void)
 {
@@ -952,6 +971,7 @@ void kvm_stats_log(const char *fmt, ...)
 	DWORD written;
 	LARGE_INTEGER size;
 
+	if (!kvm_stats_log_enabled()) { return; }
 	GetLocalTime(&st);
 	n = sprintf_s(line, sizeof(line), "%04d-%02d-%02d %02d:%02d:%02d.%03d pid=%lu ", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, (unsigned long)GetCurrentProcessId());
 	if (n < 0) { return; }
