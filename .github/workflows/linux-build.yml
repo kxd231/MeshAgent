@@ -33,7 +33,7 @@ jobs:
       - name: Build 64 Bit Alpine Linux
         run: make -j4 linux ARCHID=33 && make clean
       - name: Upload Artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           if-no-files-found: error
           name: meshagent-binaries-x86
@@ -51,7 +51,7 @@ jobs:
       - name: Build ARM64 Linux
         run: make -j4 linux ARCHID=26 && make clean
       - name: Upload Artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           if-no-files-found: error
           name: meshagent-binaries-arm
@@ -77,7 +77,7 @@ jobs:
             make -j4 linux ARCHID=32
           '
       - name: Upload Artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           if-no-files-found: error
           name: meshagent-binaries-aarch64
@@ -106,7 +106,7 @@ jobs:
             make -j4 linux ARCHID=25
           '
       - name: Upload Artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           if-no-files-found: error
           name: meshagent-binaries-armhf

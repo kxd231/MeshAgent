@@ -18,7 +18,7 @@ jobs:
       - name: Build meshagent (arm64, KVM enabled)
         run: make -j4 macos ARCHID=29
       - name: Upload artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           if-no-files-found: error
           name: meshagent-macos-arm64
@@ -33,7 +33,7 @@ jobs:
       - name: Build meshagent (x86_64, KVM enabled)
         run: make -j4 macos ARCHID=16
       - name: Upload artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           if-no-files-found: error
           name: meshagent-macos-x86_64
