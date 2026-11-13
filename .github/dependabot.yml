@@ -1,0 +1,16 @@
+# Pull requests that move the commit SHAs pinned in the workflows to newer releases of the actions. Minor and patch
+# updates come grouped in one pull request a week, a new major version in its own. Only releases at least a week old
+# are proposed. Nothing is merged automatically.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        update-types: [minor, patch]
+    commit-message:
+      prefix: CI
