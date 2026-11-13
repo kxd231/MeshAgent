@@ -54,7 +54,7 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Checkout
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ steps.tag.outputs.tag && format('refs/tags/{0}', steps.tag.outputs.tag) || github.ref }}
           persist-credentials: false
@@ -165,7 +165,7 @@ jobs:
             runner: windows-11-arm
     steps:
       - name: Checkout
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.build.outputs.tag && format('refs/tags/{0}', needs.build.outputs.tag) || github.ref }}
           persist-credentials: false

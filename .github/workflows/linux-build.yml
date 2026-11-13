@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Check out repository code
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Packages
         run: |
           sudo dpkg --add-architecture i386 &&
@@ -43,7 +43,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     steps:
       - name: Check out repository code
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Packages
         run: |
           sudo apt clean all && sudo apt update &&
@@ -62,7 +62,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     steps:
       - name: Check out repository code
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # ARCHID=32 is MeshCentral's distributed 64-bit ARM slot (meshagent_aarch64); ARCHID=26
       # above (meshagent_arm64) is the legacy twin the server marks "replaced by ARCHID 32".
       # The makefile now gates the Bootlin cross-toolchain behind CROSS=1, so a plain build uses
@@ -88,7 +88,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Check out repository code
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Enable 32-bit ARM emulation
         uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
         with:
