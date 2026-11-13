@@ -28,6 +28,29 @@ the release job. Build jobs need only read access. Public release downloads do
 not require a personal access token. MeshCentral requires a token to download
 Actions artifacts, including PR builds.
 
+## Windows x64 KVM builds
+
+The Windows x64 agent with DXGI capture and TurboJPEG (`MeshService64.exe`, for
+example the `dxgi` release) is built by **KVM perf build (Windows x64)**, from a
+tag that is not a version tag:
+
+1. Push the tag, for example `git tag dxgi-2 <commit>` and `git push origin dxgi-2`.
+   Tags cannot be moved or deleted afterwards, so a corrected build needs a new tag.
+2. The workflow builds the tag and puts `MeshService64.exe`, `MeshService64.exe.txt`
+   (size and hashes) and `kvm-dxgi-check.exe` into a draft release of that tag.
+   The run summary shows the commit, size, SHA-384 and SHA-256.
+3. Check the files, write the notes and publish the draft. Published releases are
+   immutable; a rerun stops with an error instead of replacing their files.
+4. To make MeshCentral use the new file, pin its size and SHA-384 in MeshCentral's
+   `agents/agent-defaults.json`.
+
+To retry a failed run for a tag whose release is not published yet, use
+**Actions > KVM perf build (Windows x64) > Run workflow** and enter the tag. Run
+without a tag, the workflow is a test build of the selected branch: the files stay
+a workflow artifact, `extra_cl` may add compiler options, and no release is touched.
+The build jobs have read access only; the job that creates the draft does not run
+the build.
+
 ## Existing MeshCentral binaries
 
 Run **Actions > Migrate bundled agents > Run workflow** to preserve the files

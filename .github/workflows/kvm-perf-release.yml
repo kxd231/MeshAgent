@@ -1,19 +1,33 @@
 name: KVM perf build (Windows x64)
 
-# Builds MeshService64.exe from this branch with TurboJPEG and attaches it to the release.
-# Runs only when approved: when a release is published, or started by hand (Actions -> Run workflow).
+# Builds MeshService64.exe with TurboJPEG from a tag and puts it into a DRAFT release of that tag. The owner checks the
+# hashes in the run summary, writes the notes and publishes the draft; published releases are immutable, so the files
+# cannot be replaced afterwards (docs/releases.md). Version tags (1.2.0, v1.2.0) belong to release.yml and do not start
+# this workflow. Started by hand without a tag, it is a test build: the files stay a workflow artifact, optionally built
+# with extra compiler options, and nothing is attached to a release.
 on:
-  release:
-    types: [ published ]
+  push:
+    tags:
+      - '**'
+      - '![0-9]*'
+      - '!v[0-9]*'
   workflow_dispatch:
     inputs:
+      tag:
+        description: 'Existing tag without a published release: build it into a draft release. Empty: test build of the selected branch (artifact only).'
+        required: false
+        default: ''
       extra_cl:
-        description: 'Extra compiler options for the x64 agent build (CL environment variable), e.g. /DKVM_DXGI_DISABLE for a GDI-only A/B binary'
+        description: 'Test builds only: extra compiler options for the x64 agent build (CL environment variable), e.g. /DKVM_DXGI_DISABLE for a GDI-only A/B binary'
         required: false
         default: ''
 
 permissions:
-  contents: write # upload the binary to the release
+  contents: read
+
+concurrency:
+  group: kvm-perf-build-${{ github.event_name == 'push' && github.ref_name || inputs.tag || github.run_id }}
+  cancel-in-progress: false
 
 env:
   # Official libjpeg-turbo release asset and its published SHA-256 digest
@@ -23,9 +37,27 @@ env:
 jobs:
   build:
     runs-on: windows-2022
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
     steps:
+      - name: Release tag
+        id: tag
+        shell: bash
+        env:
+          TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+          EXTRA_CL: ${{ inputs.extra_cl }}
+        run: |
+          if [ -n "$TAG" ]; then
+            if ! printf '%s\n' "$TAG" | grep -Eqx '[A-Za-z][A-Za-z0-9._-]{0,63}'; then echo "Not a release tag: $TAG" >&2; exit 1; fi
+            if [ -n "$EXTRA_CL" ]; then echo "extra_cl is for test builds only, not for a release" >&2; exit 1; fi
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
       - name: Checkout
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ steps.tag.outputs.tag && format('refs/tags/{0}', steps.tag.outputs.tag) || github.ref }}
+          persist-credentials: false
 
       - name: Install libjpeg-turbo (verified)
         shell: pwsh
@@ -66,35 +98,62 @@ jobs:
         shell: pwsh
         env:
           EXTRA_CL: ${{ inputs.extra_cl }}
+          TAG: ${{ steps.tag.outputs.tag }}
         run: |
+          $commit = git rev-parse HEAD
           $f = Get-ChildItem -Recurse -Filter MeshService64.exe | Sort-Object LastWriteTime -Descending | Select-Object -First 1
           New-Item -ItemType Directory -Force out | Out-Null
           Copy-Item $f.FullName out\MeshService64.exe
           $size = (Get-Item out\MeshService64.exe).Length
           $sha384 = (Get-FileHash out\MeshService64.exe -Algorithm SHA384).Hash.ToLower()
           $sha256 = (Get-FileHash out\MeshService64.exe -Algorithm SHA256).Hash.ToLower()
-          "MeshService64.exe size=$size`nsha384=$sha384`nsha256=$sha256`ncommit=$env:GITHUB_SHA" | Tee-Object out\MeshService64.exe.txt
-          "## MeshService64.exe`n`n- commit: $env:GITHUB_SHA`n- size: $size`n- sha384: $sha384`n- sha256: $sha256" >> $env:GITHUB_STEP_SUMMARY
+          "MeshService64.exe size=$size`nsha384=$sha384`nsha256=$sha256`ncommit=$commit" | Tee-Object out\MeshService64.exe.txt
+          "## MeshService64.exe`n`n- tag: $env:TAG`n- commit: $commit`n- size: $size`n- sha384: $sha384`n- sha256: $sha256" >> $env:GITHUB_STEP_SUMMARY
           $tool = Get-FileHash out\kvm-dxgi-check.exe -Algorithm SHA256
           "- kvm-dxgi-check.exe sha256: $($tool.Hash.ToLower())" >> $env:GITHUB_STEP_SUMMARY
           "- extra_cl: $env:EXTRA_CL" >> $env:GITHUB_STEP_SUMMARY
 
       - name: Upload artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: MeshService64
           path: out/
 
-      - name: Attach to release
-        if: github.event_name == 'release'
-        shell: pwsh
+  # The only job with write access: it never runs the build, it only puts the built files into a draft release.
+  release:
+    needs: build
+    if: needs.build.outputs.tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the draft release and upload the files
+    steps:
+      - name: Download the build
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: MeshService64
+          path: out
+
+      - name: Draft release with the files
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$env:GITHUB_REF_NAME" out\MeshService64.exe out\MeshService64.exe.txt out\kvm-dxgi-check.exe --clobber -R "$env:GITHUB_REPOSITORY"
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          files=(out/MeshService64.exe out/MeshService64.exe.txt out/kvm-dxgi-check.exe)
+          state=$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || echo none)
+          if [ "$state" = false ]; then
+            echo "Release $TAG is already published; its files cannot be replaced." >&2; exit 1
+          elif [ "$state" = true ]; then
+            gh release upload "$TAG" "${files[@]}" --clobber -R "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" "${files[@]}" --draft --verify-tag --title "$TAG" \
+              --notes "Draft made by the KVM perf build. Check the hashes in the run summary, write the notes and publish." -R "$GITHUB_REPOSITORY"
+          fi
+          echo "Draft release $TAG: MeshService64.exe sha384 $(sha384sum out/MeshService64.exe | cut -d' ' -f1)" >> "$GITHUB_STEP_SUMMARY"
 
   # Build check only: the DXGI capture is x64 only, the other platforms must still compile and behave as before.
-  # Nothing is uploaded. Runs for the same triggers as the main job (workflow_dispatch and release), never on push.
+  # Nothing is uploaded. Builds the same commit as the main job.
   other-platforms:
+    needs: build
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -106,7 +165,10 @@ jobs:
             runner: windows-11-arm
     steps:
       - name: Checkout
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ needs.build.outputs.tag && format('refs/tags/{0}', needs.build.outputs.tag) || github.ref }}
+          persist-credentials: false
 
       - name: Build Release ${{ matrix.platform }}
         shell: pwsh

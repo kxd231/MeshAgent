@@ -99,7 +99,7 @@ video run the picture and the process kept working at the limit (27.8 frames/s t
 ## 5. DXGI Desktop Duplication (WA-1)
 
 Only `meshcore/KVM/Windows` and the x64 configurations of `meshservice/MeshService-2022.vcxproj` (plus the
-workflow `.github/workflows/kvm-perf-release.yml`) are changed; the protocol and the server are not.
+workflow `.github/workflows/kvm-perf-release.yml`, see docs/releases.md) are changed; the protocol and the server are not.
 
 **Behaviour.** On x64 (`MeshService-2022`, `Release|x64` and `Debug|x64`, macro `KVM_DXGI`) the capture thread keeps the screen in the
 full resolution bitmap and updates it from `IDXGIOutputDuplication`: only the rectangles that DXGI reports as changed (and the

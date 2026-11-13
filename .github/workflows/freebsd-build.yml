@@ -19,9 +19,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository code
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Build meshagent (x86_64) in FreeBSD VM
-        uses: vmactions/freebsd-vm@v1
+        uses: vmactions/freebsd-vm@811efaaac0668df8bfb8308c3ec997b5ab50037b # v1.6.0
         with:
           release: "13.5"
           # The makefile generates ILibDuktape_Commit.h only when git works — without git the
@@ -32,7 +32,7 @@ jobs:
             git config --global --add safe.directory '*'
           run: gmake -j4 freebsd ARCHID=30
       - name: Upload artifacts
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           if-no-files-found: error
           name: meshagent-freebsd-x86_64
