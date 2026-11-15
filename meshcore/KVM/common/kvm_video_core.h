@@ -1,8 +1,8 @@
 /*
 KVM: the portable core of the H.264 video path of the agent. Portable C99, no operating system API, no encoder: time is an injected
 millisecond counter (uint32_t, wraps), so the tests are deterministic. The Windows glue (Windows/kvm_video.cpp, kvm.c, tile.cpp, kvm_adapt.cpp) calls
-these functions and does the things that need the system: the encoder, the pipe, the pixels. The specification is docs/kvm-dev/h264-protocol.md of the
-MeshCentral fork (chapters 3, 5, 8 and 9); the numbers in comments refer to it.
+these functions and does the things that need the system: the encoder, the pipe, the pixels. The numbers in comments refer to the H.264 protocol
+specification of the MeshCentral fork (not published; chapters 3, 5, 8 and 9).
 
 What is here:
   - the tile bookkeeping (kvm_vtiles): every tile is in exactly one place, NONE (the viewer has what the agent sent as JPEG, or nothing is known),

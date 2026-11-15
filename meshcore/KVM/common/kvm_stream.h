@@ -2,8 +2,8 @@
 KVM: stream protocol of the commands 240-243 (VIDEO_CTRL, STREAM_ACK, VIDEO_STATE, VIDEO_FRAME) and the end-to-end ACK window.
 
 Portable C99, no operating system API: every function works on buffers and on a state object, and time is an injected millisecond
-counter (uint32_t, wraps), so the tests are deterministic. The specification is docs/kvm-dev/h264-protocol.md of the MeshCentral fork
-(chapters 3, 4, 5.1-5.2 and 8); the numbers in comments refer to it. Values marked (T) are tunable with /D<NAME>=<value>.
+counter (uint32_t, wraps), so the tests are deterministic. The numbers in comments refer to the H.264 protocol specification
+of the MeshCentral fork (not published; chapters 3, 4, 5.1-5.2 and 8). Values marked (T) are tunable with /D<NAME>=<value>.
 
 What is here:
   - building and strict parsing of 240, 241, 242 and 243 (the frame inside MNG_JUMBO), in the validation order of chapter 4;

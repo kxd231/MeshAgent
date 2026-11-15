@@ -1242,8 +1242,8 @@ static void kvm_stats_start(void)
 
 #ifdef KVM_STREAM_ENABLED
 // ---- end-to-end ACK (commands 240-243) -------------------------------------------------------------------------------------------------------------------------
-// The protocol and the window are in meshcore/KVM/common/kvm_stream.c (portable, tested in Docker); this is the glue. Specification: docs/kvm-dev/h264-protocol.md of the
-// MeshCentral fork, chapters 3, 5 and 8; behaviour and switches: README-kvm-perf.md. Only the JPEG picture is there (no video encoder yet): op 1 is answered with reason 1.
+// The protocol and the window are in meshcore/KVM/common/kvm_stream.c (portable, tested in Docker); this is the glue. Section numbers in comments refer to
+// the H.264 protocol specification of the MeshCentral fork (not published; chapters 3, 5 and 8); behaviour and switches: README-kvm-perf.md. Only the JPEG picture is there (no video encoder yet): op 1 is answered with reason 1.
 //
 // Threads: the input thread (kvm_mainloopinput, in console mode the agent's own thread) only validates 240 / 241 and hands them over (gCtlLock): the 240 to the inbox (kvm_inbox in
 // kvm_stream.c: the veto as a state that cannot be lost, the other commands joined and rate limited), the 241 to a queue; the main loop (kvm_stream_poll, at the

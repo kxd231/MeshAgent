@@ -1,6 +1,6 @@
 /*
-KVM: rate control of the H.264 video. Portable C99, no operating system API, time is an injected millisecond counter. Specification: docs/kvm-dev/h264-protocol.md of the
-MeshCentral fork, 8.5 (target R, QP regulator) and plan B.3; the numbers in comments refer to it. Values marked (T) are tunable with /D<NAME>=<value>.
+KVM: rate control of the H.264 video. Portable C99, no operating system API, time is an injected millisecond counter. The numbers in comments refer to the
+H.264 protocol specification of the MeshCentral fork (not published), chapter 8.5 (target R, QP regulator). Values marked (T) are tunable with /D<NAME>=<value>.
 
   target R    = min(0.8 x the viewer's budget, C); 2 Mb/s without a budget before the first rate sample. 20 % of the link stays for sharpening. C is the estimate of what the link takes:
               0.85 x the measured delivery rate while the window refused a video frame or a big JPEG rectangle in the last second (the link is the limit); otherwise it does not fall, and it

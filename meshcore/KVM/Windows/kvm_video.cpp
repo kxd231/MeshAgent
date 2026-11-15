@@ -1,6 +1,6 @@
 // KVM (Windows): the H.264 video path of the agent. See kvm_video.h.
 //
-// The rules are those of docs/kvm-dev/h264-protocol.md of the MeshCentral fork (chapter 5.2 for the states, 5.3 for the key frames, 5.4 for what goes as video and what as JPEG,
+// The rules are those of the H.264 protocol specification of the MeshCentral fork (not published; chapter 5.2 for the states, 5.3 for the key frames, 5.4 for what goes as video and what as JPEG,
 // 8.2 for the window, 9 for the invariants); the numbers in the comments refer to it. The decisions that need no operating system are in ../common/kvm_video_core.c and are tested in
 // Docker; this file is the glue: the encoder (mf_h264.cpp), the tiles of tile.cpp / kvm_adapt.cpp, the pipe (kvm.c), the log.
 //
