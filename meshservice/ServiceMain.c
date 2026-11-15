@@ -78,7 +78,7 @@ extern int g_ServiceConnectFlags;
 
 #if defined(_LINKVM)
 extern DWORD WINAPI kvm_server_mainloop(LPVOID Param);
-#if defined(_WIN64)
+#if defined(_M_X64)
 extern int kvm_hwtest_main(int argc, char **argv);	// the self test of the hardware H.264 encoder (meshcore/KVM/Windows/kvm_hwtest.cpp)
 #endif
 #endif
@@ -703,7 +703,7 @@ int wmain(int argc, char* wargv[])
 		wmain_free(argv);
 		return(0);
 	}
-#if defined(_LINKVM) && defined(_WIN64)
+#if defined(_LINKVM) && defined(_M_X64)
 	if (argc > 1 && strcasecmp(argv[1], "-kvmhwtest") == 0)
 	{
 		// a short process of its own that the KVM child starts in the background: the checks of the hardware H.264 encoder, the result on stdout. No chain, no service.
