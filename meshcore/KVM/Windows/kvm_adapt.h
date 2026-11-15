@@ -27,8 +27,20 @@ Licensed under the Apache License, Version 2.0 (same as the rest of the agent).
 #define KVM_ADAPT_ENABLED 1
 #endif
 
+// the end-to-end ACK window (commands 240-243, meshcore/KVM/common/kvm_stream.c) gates the writes that WA-2 decides about, so it is part of the same build.
+// /DKVM_STREAM_DISABLE builds the agent without it (it then eats 240 and 241 like an agent from before them and never sends 242).
+#if defined(KVM_ADAPT_ENABLED) && !defined(KVM_STREAM_DISABLE)
+#define KVM_STREAM_ENABLED 1
+#endif
+
+// the H.264 video path (kvm_video.cpp, mf_h264.cpp, ../common/kvm_video_core.c) lives on top of the ACK window and the sharpening of WA-2, so it is part of the same build.
+// /DKVM_VIDEO_DISABLE builds the agent without it (the ACK layer stays; 242 answers op 1 with reason 6, the picture stays JPEG). MESH_KVM_VIDEO=0 does the same at run time.
+#if defined(KVM_STREAM_ENABLED) && !defined(KVM_VIDEO_DISABLE)
+#define KVM_VIDEO_ENABLED 1
+#endif
+
 #ifdef KVM_ADAPT_ENABLED
-#define KVM_ADAPT_MIN_FRAME_TIMER 10	// shortest frame timer (ms) the agent accepts: 10 here (the viewer offers 16 = 60 frames per second), 20 in the builds without WA-2
+#define KVM_ADAPT_MIN_FRAME_TIMER 10	// shortest frame timer (ms) the agent accepts: 10 here (the viewer offers 16 = 60 frames per second), 16 in the builds without WA-2 (20 until the pace schedule)
 
 // Thresholds, all can be overridden with /D on the compiler command line.
 #ifndef KVM_ADAPT_Q_MOTION
@@ -48,6 +60,12 @@ Licensed under the Apache License, Version 2.0 (same as the rest of the agent).
 #endif
 #ifndef KVM_ADAPT_MOTION_TILES
 #define KVM_ADAPT_MOTION_TILES 16		// ...and only while at least this many tiles changed in the previous frame (typing stays sharp)
+#endif
+#ifndef KVM_ADAPT_VIDEO_NEAR
+#define KVM_ADAPT_VIDEO_NEAR 2			// the smoothness work, video running: the first change of a tile within this many tiles (32 px) of a tile that is moving goes to the video too (the edge of a dragged window, the next frame of an animation)
+#endif
+#ifndef KVM_ADAPT_VIDEO_RECALL_MS
+#define KVM_ADAPT_VIDEO_RECALL_MS 3000	// the smoothness work, video running: the first change of a tile whose own last motion is younger than this goes to the video (the animation that comes back where the last one was); 0 = off
 #endif
 #ifndef KVM_ADAPT_SETTLE_MS
 #define KVM_ADAPT_SETTLE_MS 150			// a lossy tile that has not changed for this long is sent again in full quality
@@ -202,6 +220,27 @@ extern "C" {
 #endif
 struct tileInfo_t;
 
+// The ACK window of the viewer (kvm.c). The kinds are the KVM_GATE_* values of kvm_stream.h.
+#define KVM_ACK_BIG 0			// a JPEG rectangle of more than KVM_ADAPT_BUCKET_SMALL_TILES tiles: goes while inflight < W
+#define KVM_ACK_SMALL 1			// a small rectangle: inflight < 1.25 W
+#define KVM_ACK_SHARPEN 2		// sharpening: inflight < 0.5 W
+#ifdef KVM_STREAM_ENABLED
+int  kvm_ack_gate(int kind);			// 1 = the write may go (always while ACK is not on); 0 = the window is full, the refusal is noted (the sender was limited by the window; a big rectangle: also as "link limited")
+int  kvm_ack_peek(int kind);			// the same without noting anything
+void kvm_ack_note_held_back(void);		// something wanted to go and was not allowed (the rate samples only)
+int kvm_ack_note_link_held(void);		// a video frame was refused by the window: also "the link is the limit" for the rate control
+int  kvm_ack_force_info(unsigned long long *rate, unsigned long long *inflight, unsigned *window);	// 1 while the window is on: the delivery rate (last measured one while there is no sample), the bytes in flight and W
+#else
+static __inline int  kvm_ack_gate(int kind) { (void)kind; return 1; }
+static __inline int  kvm_ack_peek(int kind) { (void)kind; return 1; }
+static __inline void kvm_ack_note_held_back(void) {}
+static __inline int kvm_ack_note_link_held(void) { return 1; }
+static __inline int  kvm_ack_force_info(unsigned long long *rate, unsigned long long *inflight, unsigned *window) { (void)rate; (void)inflight; (void)window; return 0; }
+#endif
+
+int  kvm_adapt_viewer_budget_kbps(void);								// the budget of the viewer (command 5, kbit/s; 0 = none): the video respects it (kvm_video_rc.h)
+unsigned long long kvm_adapt_sharpen_bytes_total(void);				// bytes of sharpening packets since the process began
+int  kvm_adapt_ack_capable(void);										// 1: WA-2 can use the window of the viewer (adaptive path on, picture type JPEG / WebP)
 void kvm_adapt_set_budget(int kbps);									// the viewer chose a budget (command 5): kbit/s, 0 = none; called from the input thread, takes effect at the next window
 void kvm_adapt_session_start(void);									// start of the KVM loop: reads MESH_KVM_ADAPT, resets the regulator, logs "adapt start"
 void kvm_adapt_session_end(void);									// end of the KVM loop: last statistics
@@ -209,12 +248,14 @@ void kvm_adapt_iteration(void);										// every iteration of the loop: regulat
 int  kvm_adapt_want_image(void);									// 1: a picture is wanted although nothing changed (lossy tiles are due for sharpening)
 void kvm_adapt_frame_begin(void);									// before the tile loop of a frame with a picture
 void kvm_adapt_note_crc(struct tileInfo_t *t, int crc);				// after the CRC of a tile was computed (t->crc still has the previous value)
-int  kvm_adapt_class(const struct tileInfo_t *t);					// 0 = full class, 1 = motion class
+int  kvm_adapt_class(const struct tileInfo_t *t, int row, int col);	// 0 = full class, 1 = motion class (row, col: the place of the tile; the video looks at the tiles around it)
+void kvm_adapt_note_source(int srcClass, int full);					// the smoothness work, before kvm_adapt_frame_begin: where the pixels of this frame come from (0 GDI, 1 DXGI) and whether it is a complete frame: the first frame of another source is not motion
 void kvm_adapt_params(int cls, int motionSub, int fullSub, int *q, int *sub); // quality and subsampling for a tile class
 void kvm_adapt_sent(int row0, int col0, int row1, int col1, int cls, int q, int lossySub, long long bytes); // a rectangle of tiles was encoded
 int  kvm_adapt_sharpen_next(void *desktop, long long budgetLeft, void **packet, long long *size); // 1: *packet must be written (and freed)
 long long kvm_adapt_sharpen_budget(void);							// bytes that may be sharpened after this frame
 void kvm_adapt_note_write(unsigned int us, long long bytes, int sharpen);	// time blocked in a write to the pipe and its size (sharpen: the packet is a sharpening)
+void kvm_adapt_note_video_frame(void);									// a video frame went out: the video moves, the sharpening is limited to its share
 int  kvm_adapt_user_scale(int ns);									// command 5 brought the scale of the viewer: returns the scale to ask for (viewer scale x budget multiplier)
 int  kvm_adapt_bucket_closed(int tiles, unsigned int oldestDeferredAt);
 int  kvm_adapt_max_rect_tiles(void);									// under a budget: the most tiles a rectangle may have (0 = no limit)
@@ -222,7 +263,7 @@ void kvm_adapt_note_input(void);										// the viewer sent a mouse or key comm
 void kvm_adapt_note_refresh(void);									// the viewer asked for a REFRESH (the full picture is not movement)								// 1: the budget holds back a rectangle of this many tiles now (it is deferred)
 int  kvm_adapt_force_motion(int tiles);								// 1: this rectangle of the full class is sent in the quality of the ladder step (budget, low step)
 int  kvm_adapt_gate_closed(int cls);									// 1: the motion frame limit holds this rectangle (class cls) back in this frame
-void kvm_adapt_defer(int row0, int col0, int row1, int col1);			// the rectangle was held back: the tiles must be looked at again and sent in the next allowed frame
+void kvm_adapt_defer(int row0, int col0, int row1, int col1, int cls);	// the rectangle (of the class cls) was held back: the tiles must be looked at again and sent in the next allowed frame
 int  kvm_adapt_frame_deferred(void);									// 1: this frame held something back (keeps the loop pace and the capture overlap)
 int  kvm_adapt_jpeg_opt(int sharpen, int tiles);								// 1: encode with optimized Huffman tables (sharpen: the call is the sharpening of still tiles)
 void kvm_adapt_note_encode(int sharpen, unsigned int us, int tiles);	// time of one JPEG encode and the number of tiles in it
@@ -235,7 +276,7 @@ void kvm_adapt_stats_flush(int final);								// writes "adapt stats" and resets
 
 #else // !KVM_ADAPT_ENABLED: stubs, the behaviour of WA-1
 
-#define KVM_ADAPT_MIN_FRAME_TIMER 20
+#define KVM_ADAPT_MIN_FRAME_TIMER 16	// 20 before; the viewer's High (60 frames per second) sends 16 and an agent that ignored it would stay at the previous timer
 
 struct tileInfo_t;
 static __inline void kvm_adapt_set_budget(int kbps) { (void)kbps; }
@@ -245,11 +286,13 @@ static __inline void kvm_adapt_iteration(void) {}
 static __inline int  kvm_adapt_want_image(void) { return 0; }
 static __inline void kvm_adapt_frame_begin(void) {}
 static __inline void kvm_adapt_note_crc(struct tileInfo_t *t, int crc) { (void)t; (void)crc; }
-static __inline int  kvm_adapt_class(const struct tileInfo_t *t) { (void)t; return 0; }
+static __inline int  kvm_adapt_class(const struct tileInfo_t *t, int row, int col) { (void)t; (void)row; (void)col; return 0; }
+static __inline void kvm_adapt_note_source(int srcClass, int full) { (void)srcClass; (void)full; }
 static __inline void kvm_adapt_sent(int row0, int col0, int row1, int col1, int cls, int q, int lossySub, long long bytes) { (void)row0; (void)col0; (void)row1; (void)col1; (void)cls; (void)q; (void)lossySub; (void)bytes; }
 static __inline int  kvm_adapt_sharpen_next(void *desktop, long long budgetLeft, void **packet, long long *size) { (void)desktop; (void)budgetLeft; (void)packet; (void)size; return 0; }
 static __inline long long kvm_adapt_sharpen_budget(void) { return 0; }
 static __inline void kvm_adapt_note_write(unsigned int us, long long bytes, int sharpen) { (void)us; (void)bytes; (void)sharpen; }
+static __inline void kvm_adapt_note_video_frame(void) {}
 static __inline int  kvm_adapt_user_scale(int ns) { return ns; }
 static __inline int  kvm_adapt_bucket_closed(int tiles, unsigned int oldestDeferredAt) { (void)tiles; (void)oldestDeferredAt; return 0; }
 static __inline int  kvm_adapt_max_rect_tiles(void) { return 0; }
@@ -257,7 +300,7 @@ static __inline void kvm_adapt_note_input(void) {}
 static __inline void kvm_adapt_note_refresh(void) {}
 static __inline int  kvm_adapt_force_motion(int tiles) { (void)tiles; return 0; }
 static __inline int  kvm_adapt_gate_closed(int cls) { (void)cls; return 0; }
-static __inline void kvm_adapt_defer(int row0, int col0, int row1, int col1) { (void)row0; (void)col0; (void)row1; (void)col1; }
+static __inline void kvm_adapt_defer(int row0, int col0, int row1, int col1, int cls) { (void)row0; (void)col0; (void)row1; (void)col1; (void)cls; }
 static __inline int  kvm_adapt_frame_deferred(void) { return 0; }
 static __inline int  kvm_adapt_jpeg_opt(int sharpen, int tiles) { (void)sharpen; (void)tiles; return 0; }
 static __inline void kvm_adapt_note_encode(int sharpen, unsigned int us, int tiles) { (void)sharpen; (void)us; (void)tiles; }

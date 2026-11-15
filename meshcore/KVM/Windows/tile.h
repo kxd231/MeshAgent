@@ -20,6 +20,15 @@ limitations under the License.
 #include <tchar.h>
 #include "dxgi_capture.h" // KVM_STATS_LOG / KVM_DXGI_ENABLED, and the capture module interface on x64
 #include "kvm_adapt.h"   // KVM_ADAPT_ENABLED and the WA-2 interface (stubs elsewhere)
+#ifdef KVM_VIDEO_ENABLED
+#include "../common/kvm_fbuf.h"
+// the pictures of the capture come from a cache of buffers with a reference count (the encoder thread holds one too); the main loop gives them back with KVM_BUF_FREE
+#define KVM_BUF_GET(n) kvm_fbuf_get((size_t)(n))
+#define KVM_BUF_FREE(p) kvm_fbuf_release(p)
+#else
+#define KVM_BUF_GET(n) malloc((size_t)(n))
+#define KVM_BUF_FREE(p) free(p)
+#endif
 
 #if defined(_cplus_plus) || defined(__cplusplus) || defined(_cplusplus)
 extern "C"
@@ -77,11 +86,15 @@ enum KVM_FRAME_KIND_ENUM {
 };
 enum KVM_FRAME_SOURCE_ENUM { KVM_SOURCE_GDI = 0, KVM_SOURCE_DXGI = 1 };
 enum KVM_DXGI_EVENT_ENUM { KVM_DXGI_EVENT_OPEN = 1, KVM_DXGI_EVENT_LOST = 2, KVM_DXGI_EVENT_FALLBACK = 4, KVM_DXGI_EVENT_DISABLED = 8 };
+// the choice of the capture source (meshcore/KVM/common/kvm_capsrc.h). capMode: the state after this frame; capEvents: what happened while capturing it.
+enum KVM_CAP_MODE_ENUM { KVM_CAP_MODE_DXGI = 0, KVM_CAP_MODE_GDI = 1, KVM_CAP_MODE_PROBE = 2 };
+enum KVM_CAP_EVENT_ENUM { KVM_CAP_EV_TO_GDI = 1, KVM_CAP_EV_PROBE = 2, KVM_CAP_EV_RECOVERED = 4, KVM_CAP_EV_PROBE_FAILED = 8, KVM_CAP_EV_INCONCLUSIVE = 16 };
 #define KVM_CAPTURE_FORCE_FULL 1	// get_desktop_buffer flag: the frame must be KVM_FRAME_FULL (refresh, new geometry, previous frame not fully processed)
 #define KVM_CAPTURE_WANT_IMAGE 2	// get_desktop_buffer flag, reserved: an image even if nothing changed
 
 typedef struct kvm_frame_info {
 	int kind, source;				// KVM_FRAME_*_ENUM, KVM_SOURCE_*
+	int srcClass;					// where the pixels of this frame come from: 0 = GDI (also the fill of the persistent image of DXGI from GDI), 1 = the duplication of DXGI
 	int idleWait;					// The capture already waited for changes: the main loop skips its frame pause
 	unsigned char *tileDirty;		// KVM_FRAME_PARTIAL only: TILE_HEIGHT_COUNT x TILE_WIDTH_COUNT bytes (row 0 = top), owned by the caller (free())
 	int dirtyRects, moveRects;		// Statistics of the DXGI frame
@@ -90,7 +103,9 @@ typedef struct kvm_frame_info {
 	unsigned int outUs;				// Time spent making the output buffer (copy of the whole image and cursor, or scaling)
 	unsigned int staleUs;			// Time of the check of the DXGI image against GDI done in this call (0 = none)
 	int staleSuspect;				// That check found differences (1 = first time, 2 = second time in a row)
+	int dwmFrames;					// DXGI image: AccumulatedFrames (the frames of the DWM that this image stands for), 0 for other frames
 	int dxgiEvent;					// KVM_DXGI_EVENT_ENUM bits that happened while capturing this frame
+	int capMode, capEvents;			// KVM_CAP_MODE_ENUM after this frame, KVM_CAP_EVENT_ENUM bits that happened while capturing it
 	int ptrEmbedded;				// DXGI frame: the system cursor is composed into the desktop image (software cursor) and was taken out again
 	unsigned int ptrGdiUs;			// Software cursor: time of the GDI reads of the cursor field made for this frame, and how many (ptrGdiReads)
 	int ptrGdiReads, ptrRestores, ptrMaskPx, ptrFound, ptrNotFound;	// found/not found: the cursor looked for in the rectangles of the frame
@@ -105,6 +120,11 @@ int desktop_buffer_fits(long long bufferSize, int pixelSize);
 BITMAPINFO get_bmp_info(int width, int height);
 void set_tile_compression(int type, int level);
 void reset_capture_bitmap();
+long long kvm_dxgi_adapter_luid(void);	// the adapter (LUID, high << 32 | low) of the output that DXGI captures now, 0 = none known (GDI)
+int kvm_dxgi_adapter_sig(unsigned *ven, unsigned *dev, unsigned *sub, unsigned *rev);	// the PCI ids of that adapter (1 = known)
+int kvm_capture_is_dxgi(void);
+int kvm_capture_state(void);			// 0 = not known yet, 1 = GDI is the source, 2 = DXGI is open and the source (the encoder is chosen when it is not 0)
+int kvm_capture_file_gdi(void);			// the file <exe>-kvm-capture.txt says "gdi": the capture is GDI for this process like MESH_KVM_FORCE_GDI=1 (read at the start of the process; 0 where there is no DXGI capture)			// 1 while the picture comes from DXGI (an active output); 0 in GDI mode (closed lid) and in the shadow probe of DXGI
 void release_desktop_dc();
 void switch_to_desktop_context();
 #ifdef KVM_STATS_LOG

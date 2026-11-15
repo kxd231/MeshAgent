@@ -65,7 +65,11 @@ typedef enum RemoteManagementCommands
 	MNG_USERCONSENT = 63,					// Used to notify management console of user consent state
 	MNG_DEBUG = 64,							// Debug/Logging Message for ILibRemoteLogging
 	MNG_ERROR = 65,
-	MNG_ENCAPSULATE_AGENT_COMMAND = 70
+	MNG_ENCAPSULATE_AGENT_COMMAND = 70,
+	MNG_KVM_VIDEO_CTRL = 240,				// KVM stream: viewer / multiplexer / meshcore -> agent: video on or off, ACK only, repair, veto (size 16)
+	MNG_KVM_STREAM_ACK = 241,				// KVM stream: viewer -> agent: the viewer consumed the stream up to a position (size 16)
+	MNG_KVM_VIDEO_STATE = 242,				// KVM stream: agent -> viewer: video / ACK state and the reason (size 16)
+	MNG_KVM_VIDEO_FRAME = 243				// KVM stream: agent -> viewer: H.264 frame or position marker, always inside MNG_JUMBO
 }RemoteManagementCommands;
 
 

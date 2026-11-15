@@ -4,6 +4,12 @@
 // the input thread changes encCompression / encType (read here as plain ints) and answers a refresh by clearing tileInfo[][].crc / flags (not touched here).
 
 #include "tile.h"
+#include "kvm_video.h"
+#include "../common/kvm_sharpen.h"
+#include "../common/kvm_motion.h"
+#ifdef KVM_VIDEO_ENABLED
+#include "../common/kvm_video_core.h"
+#endif
 
 #ifdef KVM_ADAPT_ENABLED
 
@@ -63,10 +69,21 @@ static struct
 	double bkTok, bkSTok, bkSmall; int lastPassSmall; DWORD bkTick;	// byte bucket of the budget: motion / full rectangles and the part reserved for sharpening (bytes; negative = debt)
 	double starvedMs; long long bucketDefers, bucketDefersTotal;	// time of the window with an empty bucket, rectangles held back by it
 	long long deferredTiles, deferredRects, encUs, encTiles, encN, sharpEncUs, sharpEncTiles, sharpEncN, sentBytesTotal;
+	// sharpening while the video runs must not be starved by the window / the budget (kvm_video_core.h KVM_VIDEO_SHARPEN_*)
+	DWORD sharpDueSince, sharpForcedAt; int sharpForcing; long long sharpForcedCount;
+	// the class of a tile while the video runs (kvm_motion.h: the frame of motion of the last 250 ms, the tiles around a moving one), the source of the pixels, the series of motion for the log
+	kvm_motion motion;
+	kvm_series series;
+	int srcChange, lastSrc, haveSrc; unsigned srcDiff;	// this frame is the first complete one from another source of pixels (GDI fill -> the first copy of DXGI, a probe, DXGI -> GDI)
+	unsigned iterJpegTiles; DWORD iterJpegAt;	// the JPEG rectangles that this iteration sent (a picture, written to the log as one)
+#ifdef KVM_VIDEO_ENABLED
+	kvm_sharp sharp;					// the governor of the sharpening while the video moves (bucket of the share, window per packet)
+#endif
 } gA;
 
 static volatile LONG gClientBudget = -1;	// kbit/s chosen by the viewer (written by the input thread), -1 = none
 static volatile LONG gClientBudgetSeq = 0;
+static unsigned long long gSharpenBytesAll = 0;	// bytes of sharpening since the process began (the "video rc" log line)
 static volatile DWORD gLastInput = 0;		// timeGetTime() of the last mouse / key command of a viewer (input thread)
 static volatile DWORD gRefreshTick = 0;		// ... of the last REFRESH
 static volatile DWORD gScaleSentTick = 0;	// timeGetTime() when the agent last asked for another size of the picture (the viewer echoes the scale it was given for a few seconds)
@@ -118,16 +135,23 @@ static int motion_quality(int level, int step)
 	return b < q ? b : q;
 }
 
-static int type_ok(void) { return (encType == 1 || encType == 4) && (PIXEL_SIZE == 3 || PIXEL_SIZE == 4); }
+// encType is written by the input thread (command 5): read it with an interlocked access (the main loop thread decides about the window and the sharpening with it)
+static int enc_type(void) { return (int)InterlockedCompareExchange((volatile LONG *)&encType, 0, 0); }
+
+static int type_ok(void) { int t = enc_type(); return (t == 1 || t == 4) && (PIXEL_SIZE == 3 || PIXEL_SIZE == 4); }
 
 static int is_lossy(const tileInfo_t *t, int qUser)
 {
 	return t->sentQ != 0 && (t->sentQ < qUser || t->sentSub);
 }
 
-static int is_candidate(const tileInfo_t *t)
+// a tile that waits for the next video frame is not sharpened (it is going to be painted by the frame): kvm_video_tile_pending
+// the comparison is signed. A video frame stamps the tiles it paints with the clock AFTER the encoder, which is later than gA.now of the start of the iteration; in unsigned
+// arithmetic that difference was about 4.29e9 and every painted tile counted as "still for 150 ms" (measured: 63-70 % of the bytes were sharpening). A time stamp that is
+// later than gA.now means "changed just now".
+static int is_candidate(const tileInfo_t *t, int row, int col)
 {
-	return is_lossy(t, gA.qUser) && !t->deferred && (DWORD)(gA.now - t->lastChange) >= KVM_ADAPT_SETTLE_MS && t->flags != (char)TILE_MARKED_NOT_SENT && t->crc == t->contentCrc;
+	return is_lossy(t, gA.qUser) && !t->deferred && kvm_sharp_settled(gA.now, t->lastChange, KVM_ADAPT_SETTLE_MS) && t->flags != (char)TILE_MARKED_NOT_SENT && t->crc == t->contentCrc && !kvm_video_tile_pending(row, col);
 }
 
 static double rate_limit(void) { return gA.level >= 4 ? gA.acceptRate * KVM_ADAPT_RATE_FRACTION_PCT / 100.0 : 0.0; }
@@ -301,7 +325,11 @@ int kvm_adapt_user_scale(int ns)
 void kvm_adapt_session_start(void)
 {
 	char env[16] = "";
+	kvm_motion_free(&gA.motion);
 	memset(&gA, 0, sizeof(gA));
+	kvm_motion_init(&gA.motion);
+	kvm_motion_set(&gA.motion, KVM_ADAPT_MOTION_MS, KVM_ADAPT_MOTION_STREAK, KVM_ADAPT_MOTION_TILES, KVM_ADAPT_VIDEO_NEAR, KVM_ADAPT_VIDEO_RECALL_MS);
+	kvm_series_init(&gA.series);
 	gA.envOff = (GetEnvironmentVariableA("MESH_KVM_ADAPT", env, sizeof(env)) > 0 && env[0] == '0') ? 1 : 0;
 	gA.sessionOn = 1;
 	gA.sessionStart = gA.winStart = gA.lastFrameTick = gA.tokenTick = timeGetTime();
@@ -309,6 +337,9 @@ void kvm_adapt_session_start(void)
 	gA.gateOrigin = gA.sessionStart;
 	gA.qUser = clamp_q(encCompression);
 	gA.dueIn = 0x7FFFFFFF;
+#ifdef KVM_VIDEO_ENABLED
+	kvm_sharp_init(&gA.sharp, gA.sessionStart);
+#endif
 	gA.budgetKbps = KVM_ADAPT_BUDGET_KBPS; gA.hardFps = KVM_ADAPT_MOTION_FPS; gA.jpegOpt = KVM_ADAPT_JPEG_OPT;
 	if (GetEnvironmentVariableA("MESH_KVM_BUDGET_KBPS", env, sizeof(env)) > 0 && env[0] >= '0' && env[0] <= '9') { gA.budgetKbps = atoi(env); gA.budgetSrc = 1; }
 	if (GetEnvironmentVariableA("MESH_KVM_MOTION_FPS", env, sizeof(env)) > 0 && env[0] >= '0' && env[0] <= '9') { gA.hardFps = atoi(env); }
@@ -328,6 +359,7 @@ void kvm_adapt_session_start(void)
 void kvm_adapt_session_end(void)
 {
 	gA.sessionOn = 0;
+	kvm_motion_free(&gA.motion);
 	if (gUserScale != 0) { SCALING_FACTOR_NEW = (int)gUserScale; } // the next session of this process must not take the reduced scale for the one of its viewer
 	InterlockedExchange(&gUserScale, 0); InterlockedExchange(&gScaleMult, 1024);
 	InterlockedExchange(&gClientBudget, -1); // the budget of this viewer ends with its session (a value that arrives before the next session starts is kept by the start)
@@ -395,7 +427,7 @@ void kvm_adapt_iteration(void)
 			for (int col = 0; col < TILE_WIDTH_COUNT; col++)
 			{
 				if (r[col].deferred) { gA.deferredCount++; if (oldestDef == 0 || (int)(r[col].deferredAt - oldestDef) < 0) { oldestDef = r[col].deferredAt; } }
-				if (is_lossy(&r[col], qUser) && r[col].crc == r[col].contentCrc)
+				if (is_lossy(&r[col], qUser) && r[col].crc == r[col].contentCrc && !kvm_video_tile_pending(row, col))
 				{
 					int due = (int)(r[col].lastChange + KVM_ADAPT_SETTLE_MS - now);
 					gA.lossyCount++;
@@ -418,17 +450,18 @@ static void scale_update(DWORD now)
 	DWORD since;
 	if (gUserScale == 0) { return; }
 	act = (gA.sessionOn && !gA.envOff && type_ok()) ? 1 : 0;
-	if (act && gA.budgetKbps > 0) { wanted = ladder_scale(gA.bStep); }
+	if (act && gA.budgetKbps > 0 && !kvm_video_on()) { wanted = ladder_scale(gA.bStep); } // (the step of 75 % is not used while the video runs, v1: every change of the size is a new generation)
 	calm = ((DWORD)(now - gA.lastMotionChange) >= KVM_ADAPT_SCALE_RESTORE_MS) ? 1 : 0;
 	desired = (wanted < 1024 && calm) ? 1024 : wanted;
 	if (desired != mult)
 	{
 		down = desired < mult;
 		since = (DWORD)(now - gA.scaleChangeTick);
-		recentInput = (gLastInput != 0 && (DWORD)(now - gLastInput) < KVM_ADAPT_SCALE_INPUT_MS) ? 1 : 0;
+		recentInput = kvm_sharp_recent(now, gLastInput, KVM_ADAPT_SCALE_INPUT_MS) ? 1 : 0;	// signed: the input thread may stamp it after `now` was read
 		if (down && (since < KVM_ADAPT_SCALE_DOWN_MS || (int)(gA.scaleBanUntil - now) > 0)) { allowed = 0; }
 		else if (!down && !(calm || !act || gA.budgetKbps <= 0) && since < KVM_ADAPT_SCALE_UP_MS) { allowed = 0; }
 		else if (act && gA.budgetKbps > 0 && recentInput) { allowed = 0; } // the viewer is using the mouse or the keyboard: its clicks around a change of the size would land beside
+		if (allowed && !kvm_video_scale_allowed(down)) { allowed = 0; } // v1: while the video runs or waits for its encoder the picture does not get smaller; the way back to the viewer's scale is allowed 10 s after the last generation
 		if (allowed)
 		{
 			InterlockedExchange(&gScaleMult, desired);
@@ -445,6 +478,21 @@ static void scale_update(DWORD now)
 	if (SCALING_FACTOR_NEW != (int)r) { SCALING_FACTOR_NEW = (int)r; }
 }
 
+int kvm_adapt_viewer_budget_kbps(void)
+{
+	// the budget the viewer asked for (command 5), also before the next window of the regulator has taken it over; else the one of the environment / the build
+	return (gClientBudget >= 0) ? (int)gClientBudget : (gA.budgetKbps > 0 ? gA.budgetKbps : 0);
+}
+
+unsigned long long kvm_adapt_sharpen_bytes_total(void) { return gSharpenBytesAll; }
+
+int kvm_adapt_ack_capable(void)
+{
+	// like type_ok(), but also before the first frame (PIXEL_SIZE is not known yet) and not depending on the frame being processed
+	const int t = enc_type(); // read with an interlocked access: the input thread writes it. PIXEL_SIZE is written by the main loop thread, the one that calls this.
+	return (gA.sessionOn && !gA.envOff && (t == 1 || t == 4) && (PIXEL_SIZE == 0 || PIXEL_SIZE == 3 || PIXEL_SIZE == 4)) ? 1 : 0;
+}
+
 int kvm_adapt_want_image(void)
 {
 	if (!gA.sessionOn) { return 0; }
@@ -455,15 +503,24 @@ int kvm_adapt_want_image(void)
 	{
 		int hold = 0;
 		if (gA.budgetKbps > 0 && gA.active) { bk_refill(timeGetTime()); hold = (gA.bkTok <= 0.0) ? 1 : 0; }
+		if (!hold && gA.active && !kvm_ack_peek(KVM_ACK_BIG)) { hold = 1; } // the window of the viewer is full too: nothing could be sent now
 		if (!hold) { gA.wantImage++; return 1; }
 	}
+	if (kvm_video_want_image()) { gA.wantImage++; return 1; } // tiles wait for the next video frame and the window allows it: a picture is needed even if nothing changed
 	if (gA.envOff || !type_ok()) { return 0; }
-	if (gA.lossyCount > 0 && gA.dueIn <= 0 && (DWORD)(gA.now - gA.lastContentChange) >= KVM_ADAPT_SETTLE_MS) // while the screen changes, new frames come by themselves
+	if (gA.lossyCount > 0 && gA.dueIn <= 0 && kvm_sharp_settled(gA.now, gA.lastContentChange, KVM_ADAPT_SETTLE_MS) && kvm_ack_peek(KVM_ACK_SHARPEN)) // while the screen changes, new frames come by themselves
 	{
 		gA.wantImage++;
 		return 1;
 	}
 	return 0;
+}
+
+void kvm_adapt_note_source(int srcClass, int full)
+{
+	// only a complete frame can show the difference between two sources of pixels; the first frame of a session has nothing before it to differ from
+	gA.srcChange = (full && gA.haveSrc && srcClass != gA.lastSrc) ? 1 : 0;
+	gA.lastSrc = srcClass; gA.haveSrc = 1;
 }
 
 void kvm_adapt_frame_begin(void)
@@ -475,6 +532,8 @@ void kvm_adapt_frame_begin(void)
 	if (++gA.stamp == 0) { gA.stamp = 1; } // 0 is the value of a tile that was never looked at
 	// A frame in which no tile changed (the capture was asked for an image only to look at held-back or lossy tiles again) keeps the count of the last
 	// frame that changed something; otherwise the next frame of a moving picture would be taken for "no motion" and sent in full quality.
+	if (gA.motion.rows != TILE_HEIGHT_COUNT || gA.motion.cols != TILE_WIDTH_COUNT) { (void)kvm_motion_resize(&gA.motion, TILE_HEIGHT_COUNT, TILE_WIDTH_COUNT); } // the grid of the stamps follows the picture
+	kvm_motion_frame(&gA.motion, gA.lastFrameTick, (unsigned)gA.realChanged); // the frame of motion of the last 250 ms (the video's rule looks at it instead of the frame before this one)
 	if (gA.realChanged >= KVM_ADAPT_MOTION_TILES) { gA.lastMotionChange = gA.lastFrameTick; } // movement: a frame with many tiles that really changed (not a caret, a clock, or a picture seen for the first time)
 	gA.realChanged = 0;
 	if ((DWORD)(now - gA.lastFrameTick) > KVM_ADAPT_MOTION_MS) { gA.prevChanged = 0; }
@@ -503,20 +562,41 @@ void kvm_adapt_note_crc(struct tileInfo_t *t, int crc)
 	if (t->crc == 0xFF) { t->refresh = 1; } // sent only because the viewer was reset, not because of a change
 	if (crc != t->contentCrc)
 	{
-		t->streak = (t->streak > 0 && (DWORD)(gA.now - t->lastChange) <= KVM_ADAPT_MOTION_MS) ? (unsigned char)(t->streak < 255 ? t->streak + 1 : 255) : 1;
+		// the first complete frame from another source of pixels (the fill from GDI, then the first copy of DXGI; a probe of DXGI; DXGI -> GDI) differs from the picture before it in a
+		// part of the tiles for no reason on the screen: that is not a change of the content, so no streak, not moved, not a frame of motion
+		t->streak = (unsigned char)kvm_motion_note_change(&gA.motion, t->streak, kvm_sharp_elapsed_ms(gA.now, t->lastChange), gA.srcChange);
 		t->lastChange = gA.now;
-		if (t->contentCrc != 0x7FFFFFFF) { gA.realChanged++; } // a tile that was never looked at (new geometry, new session) is not motion
+		if (!gA.srcChange)
+		{
+			if (t->contentCrc != 0x7FFFFFFF)	// a tile that was never looked at (new geometry, new session) is not motion
+			{
+				gA.realChanged++;
+#ifdef KVM_VIDEO_ENABLED
+				if (gA.realChanged == KVM_ADAPT_MOTION_TILES && kvm_video_on()) { kvm_series_motion(&gA.series, gA.now, (uint32_t)kvm_video_r_kbps()); }	// a frame of motion
+#endif
+			}
+			gA.changedThisFrame++;
+		}
 		t->contentCrc = crc;
-		gA.changedThisFrame++;
 		gA.lastContentChange = gA.now;
+		// the smoothness work, the safety net: a tile that still differs after a change of the source (with the alpha byte the same on both paths it is a real difference in colour, if any) is not sent at once. The
+		// viewer is taken to have it (crc), the tile is marked lossy, and the sharpening repaints it 150 ms after, behind the motion and with the share of the bucket (never as an IDR or a sharp JPEG in front of it)
+		if (kvm_motion_source_absorb(gA.srcChange, t->crc == 0xFF)) { t->crc = crc; t->sentQ = 1; t->sentSub = 1; gA.srcDiff++; }
 	}
 }
 
-int kvm_adapt_class(const struct tileInfo_t *t)
+int kvm_adapt_class(const struct tileInfo_t *t, int row, int col)
 {
 	if (!gA.active) { return 0; }
-	if (t->deferred) { return 1; } // held back as motion, it is sent as motion (and sharpened later)
-	if (t->streak >= KVM_ADAPT_MOTION_STREAK && (DWORD)(gA.now - t->lastChange) <= KVM_ADAPT_MOTION_MS && gA.prevChanged >= KVM_ADAPT_MOTION_TILES) { return 1; }
+	if (t->deferred == 1) { return 1; } // held back as motion, it is sent as motion (and sharpened later)
+	if (t->deferred == 2) { return 0; } // held back by the window in the frame of another source of pixels: it is a picture, not motion, and goes as one when the window allows (not as video)
+	if (kvm_video_on())
+	{
+		// with the video running a tile is motion when it has changed twice in a row while a frame of motion was seen in the last 250 ms (not "in the frame before this one"), or when it is
+		// within two tiles of one that is (the first change of the edge of a dragged window, the next frame of an animation). A tile that is sent only because of a REFRESH is not (a JPEG of the user's quality)
+		if (!t->refresh && kvm_motion_class(&gA.motion, gA.now, row, col, t->streak, kvm_sharp_elapsed_ms(gA.now, t->lastChange))) { return 1; }
+	}
+	else if (t->streak >= KVM_ADAPT_MOTION_STREAK && kvm_sharp_elapsed_ms(gA.now, t->lastChange) <= (int32_t)KVM_ADAPT_MOTION_MS && gA.prevChanged >= KVM_ADAPT_MOTION_TILES) { return 1; }
 	if (gA.levelFrame >= 1 && t->refresh) { return 1; } // under congestion a refresh is sent in the motion class and sharpened later
 	return 0;
 }
@@ -548,11 +628,15 @@ void kvm_adapt_sent(int row0, int col0, int row1, int col1, int cls, int q, int 
 			t->refresh = 0;
 			t->deferred = 0;
 			t->deferredAt = 0;
+			kvm_video_tile_jpeg(r, c); // sent as JPEG: not pending for the video, not a VIDEO tile (I3)
 		}
 	}
 	{
 		int nt = (row1 - row0 + 1) * (col1 - col0 + 1);
 		if (nt > 0 && bytes > 0) { double per = (double)bytes / (double)nt; gA.bytesPerTile = gA.bytesPerTile > 0.0 ? 0.9 * gA.bytesPerTile + 0.1 * per : per; }
+#ifdef KVM_VIDEO_ENABLED
+		if (nt > 0 && kvm_video_on()) { if (gA.iterJpegTiles == 0) { gA.iterJpegAt = gA.now; } gA.iterJpegTiles += (unsigned)nt; } // a JPEG paint of this iteration
+#endif
 	}
 	if (cls == 1)
 	{
@@ -579,7 +663,7 @@ int kvm_adapt_gate_closed(int cls)
 	return (gA.active && cls == 1 && !gA.gateOpen) ? 1 : 0;
 }
 
-void kvm_adapt_defer(int row0, int col0, int row1, int col1)
+void kvm_adapt_defer(int row0, int col0, int row1, int col1, int cls)
 {
 	for (int r = row0; r <= row1; r++)
 	{
@@ -587,7 +671,8 @@ void kvm_adapt_defer(int row0, int col0, int row1, int col1)
 		{
 			tileInfo_t *t = &tileInfo[r][c];
 			if (!t->deferred) { t->deferredAt = timeGetTime(); if (t->deferredAt == 0) { t->deferredAt = 1; } if (gA.oldestDeferred == 0 || (int)(t->deferredAt - gA.oldestDeferred) < 0) { gA.oldestDeferred = t->deferredAt; } }
-			t->deferred = 1; gA.deferredTiles++;
+			t->deferred = (t->deferred == 2 || (cls == 0 && gA.srcChange && kvm_video_on())) ? 2 : 1; // 2: a full-class tile of the frame of another source stays full class when it is looked at again
+			gA.deferredTiles++;
 		}
 	}
 	gA.deferredRects++;
@@ -614,10 +699,19 @@ void kvm_adapt_note_encode(int sharpen, unsigned int us, int tiles)
 	else { gA.encUs += us; gA.encTiles += tiles; gA.encN++; }
 }
 
-long long kvm_adapt_sharpen_budget(void)
+#ifdef KVM_VIDEO_ENABLED
+// the JPEG rectangles of the iteration (if any) are one picture, written to the series at the time of the first of them
+static void series_flush_jpeg(void)
+{
+	if (gA.iterJpegTiles > 0) { kvm_series_write(&gA.series, gA.iterJpegAt, 0, gA.iterJpegTiles, (uint32_t)kvm_video_interval_ms()); gA.iterJpegTiles = 0; }
+}
+#endif
+
+static long long sharpen_budget_normal(void)
 {
 	long long b;
 	if (!gA.active) { return 0; }
+	if (!kvm_ack_peek(KVM_ACK_SHARPEN)) { if (gA.lossyCount > 0) { kvm_ack_note_held_back(); } return 0; } // sharpening only below half of the window of the viewer; the refusal feeds the rate samples only, not "link limited" (the 0.5 W gate says nothing about the capacity)
 	b = KVM_ADAPT_SHARPEN_BYTES;
 	if (gA.level >= 4) { b /= 4; } else if (gA.level >= 1) { b /= 2; }
 	if (gA.budgetKbps > 0)
@@ -639,10 +733,87 @@ long long kvm_adapt_sharpen_budget(void)
 	return b;
 }
 
+// the first video path: while the video runs, the tiles it painted are blurred until they are sharpened, and the sharpening is what makes the picture converge. A closed
+// window (the video fills it), an empty bucket or the token limit must not hold it back for ever: once a tile has been due for KVM_VIDEO_SHARPEN_WAIT_MS without a single packet of the
+// normal budget, a packet goes anyway. Its size and rhythm come from kvm_vcore_force_sharpen: 20 % of the delivery rate at most (8.5), 4-16 KiB, and not while the window is more than
+// twice full (the review of a fixed 64 KiB/s would have been all of a 0.5 Mb/s link).
+static long long video_sharpen_force(void)
+{
+#ifdef KVM_VIDEO_ENABLED
+	DWORD now;
+	unsigned long long rate = 0, inflight = 0;
+	unsigned w = 0;
+	uint32_t bytes = 0;
+	if (!kvm_video_on() || gA.lossyCount <= 0 || gA.dueIn > 0) { gA.sharpDueSince = 0; return 0; }
+	now = timeGetTime();
+	if (gA.sharpDueSince == 0) { gA.sharpDueSince = (now != 0) ? now : 1; return 0; }
+	if ((DWORD)(now - gA.sharpDueSince) < KVM_VIDEO_SHARPEN_WAIT_MS) { return 0; }
+	if (!kvm_ack_force_info(&rate, &inflight, &w)) { return 0; }
+	if (!kvm_vcore_force_sharpen(rate, kvm_adapt_viewer_budget_kbps() > 0 ? (unsigned)kvm_adapt_viewer_budget_kbps() : 0u, inflight, w, gA.sharpForcedAt != 0, gA.sharpForcedAt, now, &bytes)) { return 0; }
+	return (long long)bytes;
+#else
+	return 0;
+#endif
+}
+
+// the sharpening governor: while the video runs, how much of the iteration's budget the sharpening may send (the bucket of its share, a quarter of the window), and the state for the packets (kvm_sharp_*).
+// The rate is the smaller of the delivery rate and the viewer's budget. Returns the budget (0 = nothing now).
+static long long governed_budget(long long b)
+{
+#ifdef KVM_VIDEO_ENABLED
+	unsigned long long rate = 0, inflight = 0;
+	unsigned w = 0;
+	const DWORD now = timeGetTime();
+	const int budget = kvm_adapt_viewer_budget_kbps();
+	if (!kvm_video_on()) { return b; }
+	if (kvm_video_pending() > 0) { kvm_sharp_motion(&gA.sharp, now); }
+	if (!kvm_ack_force_info(&rate, &inflight, &w)) { rate = 0; w = 0; }
+	if (budget > 0 && (rate == 0 || rate > (unsigned long long)budget * 125ull)) { rate = (unsigned long long)budget * 125ull; }
+	return (long long)kvm_sharp_begin(&gA.sharp, now, rate, w, b);
+#else
+	return b;
+#endif
+}
+
+long long kvm_adapt_sharpen_budget(void)
+{
+	long long b;
+	if (!gA.active) { return 0; }
+	gA.now = timeGetTime();	// one clock for the frame and for the sharpening that follows it (a tile painted by the frame has a time stamp after the start of the iteration)
+#ifdef KVM_VIDEO_ENABLED
+	if (kvm_video_on())
+	{
+		// a frame with many real changes is a movement however it went out (JPEG too: the first frame of an animation, the edge of a window), and a movement lasts max(3 intervals, 100 ms)
+		series_flush_jpeg();
+		kvm_sharp_set_interval(&gA.sharp, (uint32_t)kvm_video_interval_ms());
+		if (gA.realChanged >= KVM_ADAPT_MOTION_TILES) { kvm_sharp_motion(&gA.sharp, gA.now); }
+	}
+#endif
+	if (gA.srcChange) { kvm_stats_log("adapt source_change tiles_differ=%u tiles=%d alpha_cleared=1", gA.srcDiff, TILE_WIDTH_COUNT * TILE_HEIGHT_COUNT); gA.srcDiff = 0; }	// how many tiles the first frame of another source still has with another hash
+	gA.sharpForcing = 0;
+	b = sharpen_budget_normal();
+	if (b > 0) { b = governed_budget(b); }
+	if (b <= 0)
+	{
+		const long long f = video_sharpen_force();
+		if (f > 0) { gA.sharpForcing = 1; gA.sharpForcedAt = timeGetTime(); gA.sharpForcedCount++; b = f; }
+	}
+	return b;
+}
+
 int kvm_adapt_sharpen_next(void *desktop, long long budgetLeft, void **packet, long long *size)
 {
 	int total, n;
 	if (!gA.active || budgetLeft <= 0 || tileInfo == NULL || TILE_WIDTH_COUNT <= 0) { return 0; }
+#ifdef KVM_VIDEO_ENABLED
+	if (kvm_video_on() && !gA.sharpForcing)
+	{
+		// the window is looked at before EVERY packet (inflight < 0.5 W), not once per iteration: 96 KiB went out after a single look (the forced packet has its own limits)
+		unsigned long long rate = 0, inflight = 0;
+		unsigned w = 0;
+		if (kvm_ack_force_info(&rate, &inflight, &w) && !kvm_sharp_window_ok_at(&gA.sharp, timeGetTime(), inflight, w)) { if (gA.lossyCount > 0) { kvm_ack_note_held_back(); } return 0; } // (a quarter of W for a second after a movement)
+	}
+#endif
 	total = TILE_WIDTH_COUNT * TILE_HEIGHT_COUNT;
 	if (gA.cursor >= total || gA.cursor < 0) { gA.cursor = 0; }
 	for (n = 0; n < total; n++)
@@ -650,8 +821,8 @@ int kvm_adapt_sharpen_next(void *desktop, long long budgetLeft, void **packet, l
 		int idx = (gA.cursor + n) % total, row = idx / TILE_WIDTH_COUNT, col = idx % TILE_WIDTH_COUNT, run = 1, q = 0;
 		void *buf = NULL;
 		long long sz = 0;
-		if (!is_candidate(&tileInfo[row][col])) { continue; }
-		while (run < KVM_ADAPT_SHARPEN_RUN && col + run < TILE_WIDTH_COUNT && is_candidate(&tileInfo[row][col + run])) { run++; }
+		if (!is_candidate(&tileInfo[row][col], row, col)) { continue; }
+		while (run < KVM_ADAPT_SHARPEN_RUN && col + run < TILE_WIDTH_COUNT && is_candidate(&tileInfo[row][col + run], row, col + run)) { run++; }
 		if (kvm_adapt_encode_sharp(col * TILE_WIDTH, row * TILE_HEIGHT, run * TILE_WIDTH, TILE_HEIGHT, desktop, &buf, &sz, &q) != 0 || buf == NULL)
 		{
 			// The encoder failed: wait another settle time before the next try
@@ -663,12 +834,15 @@ int kvm_adapt_sharpen_next(void *desktop, long long budgetLeft, void **packet, l
 		for (int c = 0; c < run; c++)
 		{
 			tileInfo_t *t = &tileInfo[row][col + c];
-			long long settle = (long long)(DWORD)(gA.now - t->lastChange);
+			long long settle = (long long)kvm_sharp_elapsed_ms(gA.now, t->lastChange);
+			if (settle < 0) { settle = 0; }
 			t->sentQ = (unsigned char)q; t->sentSub = 0; t->refresh = 0;
+			kvm_video_tile_jpeg(row, col + c); // a VIDEO tile that is sharpened is a JPEG tile again (I3)
 			gA.settleSum += settle; gA.settleN++;
 			if (settle > gA.settleMax) { gA.settleMax = settle; }
 		}
-		gA.sharpenRects++; gA.sharpenTiles += run; gA.sharpenBytes += sz;
+		gA.sharpenRects++; gA.sharpenTiles += run; gA.sharpenBytes += sz; gSharpenBytesAll += (unsigned long long)sz;
+		if (!gA.sharpForcing) { gA.sharpDueSince = 0; } // progress by the normal budget: the time limit starts again (a forced packet does not count)
 		gA.cursor = (idx + run) % total;
 		*packet = buf;
 		*size = sz;
@@ -681,7 +855,10 @@ int kvm_adapt_bucket_closed(int tiles, unsigned int rectOldest)
 {
 	DWORD now;
 	DWORD oldest;
-	if (!gA.active || gA.budgetKbps <= 0) { return 0; }
+	if (!gA.active) { return 0; }
+	// the window of the viewer (end-to-end ACK): a rectangle that does not fit is held back like one the byte bucket refuses (the tiles are "deferred" and looked at again)
+	if (!kvm_ack_gate(tiles <= KVM_ADAPT_BUCKET_SMALL_TILES ? KVM_ACK_SMALL : KVM_ACK_BIG)) { return 1; }
+	if (gA.budgetKbps <= 0) { return 0; }
 	now = timeGetTime();
 	bk_refill(now);
 	gA.lastPassSmall = 0;
@@ -717,10 +894,32 @@ int kvm_adapt_force_motion(int tiles)
 	return (gA.active && gA.budgetKbps > 0 && gA.bStepFrame >= KVM_ADAPT_ALLMOTION_STEP && tiles > KVM_ADAPT_BUCKET_SMALL_TILES) ? 1 : 0;
 }
 
+void kvm_adapt_note_video_frame(void)
+{
+#ifdef KVM_VIDEO_ENABLED
+	if (gA.sessionOn)
+	{
+		const DWORD now = timeGetTime();
+		kvm_sharp_motion(&gA.sharp, now);
+		series_flush_jpeg();
+		kvm_series_write(&gA.series, now, 1, 0, (uint32_t)kvm_video_interval_ms());
+	}
+#endif
+}
+
 void kvm_adapt_note_write(unsigned int us, long long bytes, int sharpen)
 {
 	gA.winWriteUs += us;
 	gA.winBytes += bytes;
+#ifdef KVM_VIDEO_ENABLED
+	if (sharpen && gA.sessionOn && kvm_video_on())
+	{
+		// the packet is charged to the bucket of the share (a forced one pays but is never refused) and to R of the video while the video moves
+		const DWORD now = timeGetTime();
+		if (gA.sharpForcing) { kvm_sharp_forced(&gA.sharp, now, bytes); } else { kvm_sharp_sent(&gA.sharp, now, bytes); }
+		kvm_video_note_sharpen((unsigned)(bytes > 0 ? bytes : 0), kvm_sharp_active(&gA.sharp, now));
+	}
+#endif
 	if (gA.active && gA.budgetKbps > 0) { bk_debit(timeGetTime(), (double)bytes, sharpen); }
 	if (gA.level >= 4) { gA.tokens -= (double)bytes; }
 }
@@ -755,6 +954,28 @@ void kvm_adapt_stats_flush(int final)
 		(int)(gA.bkForgiven / 1024.0), (int)gScaleMult, gA.scaleChanges, gA.budgetKbps, kBudgetSrc[gA.budgetSrc], gA.bucketDefers, (int)(gA.bkTok / 1024.0), gA.winN > 0 ? gA.winKbpsSum / gA.winN : 0LL, gA.winKbpsMax, gA.bStep, gA.bStepMax, gA.bSteps, gA.qMotionN > 0 ? gA.qMotionMin : 0, gA.qMotionN > 0 ? gA.qMotionSum / gA.qMotionN : 0LL, gA.lastCap > 0 ? gA.lastCap : 0,
 		gA.deferredTiles, gA.deferredRects, gA.encN, gA.encN > 0 ? gA.encUs / gA.encN : 0LL, gA.encTiles > 0 ? gA.encUs / gA.encTiles : 0LL, gA.sharpEncN, gA.sharpEncN > 0 ? gA.sharpEncUs / gA.sharpEncN : 0LL, gA.sharpEncTiles > 0 ? gA.sharpEncUs / gA.sharpEncTiles : 0LL,
 		gA.loopN, gA.loopN > 0 ? gA.loopWaitUs / gA.loopN : 0LL, gA.loopN > 0 ? gA.loopProcUs / gA.loopN : 0LL, gA.loopN > 0 ? gA.loopPauseUs / gA.loopN : 0LL);
+	if (gA.sharpForcedCount > 0) { kvm_stats_log("adapt sharpen_forced=%lld", gA.sharpForcedCount); gA.sharpForcedCount = 0; }
+#ifdef KVM_VIDEO_ENABLED
+	{
+		// one short line a period when there was motion with the video on: the series, the gaps between the pictures, the share of JPEG, the classes of the tiles
+		char line[400];
+		if (kvm_video_on() && kvm_series_format(&gA.series, timeGetTime(), (uint32_t)kvm_video_interval_ms(), line, sizeof(line)) > 0)
+		{
+			kvm_stats_log("%s class_streak=%u class_near=%u class_plain=%u", line, (unsigned)gA.motion.sStreak, (unsigned)gA.motion.sNear, (unsigned)gA.motion.sPlain);
+		}
+		kvm_motion_clear_stats(&gA.motion);
+	}
+#endif
+#ifdef KVM_VIDEO_ENABLED
+	if (gA.sharp.sActiveIters > 0 || gA.sharp.sBytesActive > 0 || gA.sharp.sBytesIdle > 0 || gA.sharp.sBytesForced > 0)
+	{
+		// the governor of the sharpening while the video moves (kb: bytes sent in a movement / outside it / forced; iterations: with and without a movement; refusals: the bucket was empty / a quarter of the window was reached / the window gate of a packet)
+		kvm_stats_log("adapt sharp_gov active_kb=%llu idle_kb=%llu forced_kb=%llu iters_active=%u iters_idle=%u bucket_refused=%u iter_capped=%u window_refused=%u bucket_kb=%d",
+					  (unsigned long long)(gA.sharp.sBytesActive / 1024), (unsigned long long)(gA.sharp.sBytesIdle / 1024), (unsigned long long)(gA.sharp.sBytesForced / 1024), gA.sharp.sActiveIters, gA.sharp.sIdleIters,
+					  gA.sharp.sBucketRefused, gA.sharp.sIterCapped, gA.sharp.sWindowRefused, (int)(gA.sharp.tokens / 1024));
+		kvm_sharp_clear_stats(&gA.sharp);
+	}
+#endif
 	gA.levelMax = gA.level; gA.wantImage = 0; gA.rateSkips = 0;
 	gA.rectsMotion = gA.rectsFull = gA.bytesMotion = gA.bytesFull = gA.sharpenRects = gA.sharpenTiles = gA.sharpenBytes = gA.settleSum = gA.settleN = gA.settleMax = 0;
 	gA.blockPctMax = 0;

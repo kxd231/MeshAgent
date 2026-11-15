@@ -34,7 +34,7 @@ Licensed under the Apache License, Version 2.0 (same as the rest of the agent).
 #define KVM_STATS_PERIOD_MS 10000		// statistics line period
 #endif
 #ifndef KVM_STATS_LOG_MAX
-#define KVM_STATS_LOG_MAX (1024 * 1024)	// no more lines are appended once the log file is this large
+#define KVM_STATS_LOG_MAX (1024 * 1024)	// the log file is renamed to <name>.1 and restarted when it is this large (kvm_stats_log)
 #endif
 #endif
 
@@ -120,11 +120,18 @@ typedef struct dxgi_info {
 	wchar_t adapter[128]; wchar_t output[32];   // DXGI_ADAPTER_DESC1.Description, DXGI_OUTPUT_DESC.DeviceName
 	int width, height, rotation, systemMemory;  // ModeDesc size, output rotation, DesktopImageInSystemMemory
 	unsigned int vendorId, deviceId;
+	unsigned int subsysId, revision;		// the adapter of the output (the hardware H.264 encoder is chosen for it; the key of the cache of its self test)
+	long long luid;							// DXGI_ADAPTER_DESC1.AdapterLuid, (high part << 32) | low part
 } dxgi_info;
 
 // Creates a new factory, looks for the attached output whose DesktopCoordinates equal (x, y, x+w, y+h), creates a device on
 // that output's adapter and the duplication. Closes any previous duplication first. info may be NULL.
 dxgi_result dxgi_capture_init(int x, int y, int w, int h, dxgi_info *info);
+
+// Lists what DXGI knows about the outputs, for the log: "<adapter>|<output> <left>,<top>,<right>,<bottom> att=<0|1> rot=<n>;..." (UTF-8, no quotes), from a new factory, so it
+// shows the present topology: an output that is not attached to the desktop (panel off, lid closed) and the output that became the active one. Returns the length written.
+// Not for the frame loop (a factory and the enumeration take a few ms); the agent calls it when the source of the picture changes.
+int dxgi_capture_describe_outputs(char *out, int cap);
 
 // Releases the frame held from the previous call and waits up to timeoutMs for the next one. For a new image the changed
 // rectangles (and move destinations), or everything when wantFull, are copied to dst. dstTop is the address of the top row,
@@ -157,6 +164,8 @@ void kvm_mark_rect_tiles(unsigned char *map, int tilesX, int tilesY, int tileW, 
 // Counts the pixels whose bytes 0..2 differ between two top-down addressed images of w x h pixels (strides in bytes, negative for
 // bottom-up buffers). Pixels inside 'skip' (may be NULL) are not compared.
 long long kvm_count_pixel_diff(const unsigned char *aTop, ptrdiff_t aStride, const unsigned char *bTop, ptrdiff_t bStride, int w, int h, const dxgi_rect *skip);
+// The same with two rectangles that are not compared (either may be NULL): the cursor fields of two captures made at different moments.
+long long kvm_count_pixel_diff2(const unsigned char *aTop, ptrdiff_t aStride, const unsigned char *bTop, ptrdiff_t bStride, int w, int h, const dxgi_rect *skipA, const dxgi_rect *skipB);
 // XORs the current mouse cursor into dst at (x, y), the way the GDI path draws it. covered gets the touched rectangle (may be empty).
 // Returns 1 if something was drawn.
 int kvm_cursor_xor(unsigned char *dstTop, ptrdiff_t dstStride, int dstW, int dstH, int x, int y, dxgi_rect *covered);

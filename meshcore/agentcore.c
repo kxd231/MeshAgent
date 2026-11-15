@@ -61,6 +61,7 @@ int gRemoteMouseRenderDefault = 0;
 #ifdef _LINKVM
 	#ifdef WIN32
 		#include "KVM/Windows/kvm.h"
+		#include "KVM/Windows/kvm_adapt.h" // KVM_STREAM_ENABLED: the x64 build with the commands 240-243
 	#endif
 		#ifdef _POSIX
 			#ifndef __APPLE__
@@ -1347,6 +1348,11 @@ duk_ret_t ILibDuktape_MeshAgent_getRemoteDesktop(duk_context *ctx)
 
 	duk_push_object(ctx);															// [MeshAgent][RemoteDesktop]
 	ILibDuktape_WriteID(ctx, "MeshAgent.kvmSession");
+#if defined(_LINKVM) && defined(WIN32) && defined(KVM_STREAM_ENABLED)
+	// This agent understands the commands 240-243 (end-to-end ACK, H.264 video): agents/meshcore.js only adds its input path, the veto and the key frames of recordings for an
+	// agent that says so. Builds without the stream layer (x86, ARM64, /DKVM_STREAM_DISABLE, other systems) leave the property out and keep the old path (pipe(kvm)).
+	duk_push_int(ctx, 1); duk_put_prop_string(ctx, -2, "kvmVideoProtocol");
+#endif
 	duk_dup(ctx, -1);																// [MeshAgent][RemoteDesktop][RemoteDesktop]
 	duk_put_prop_string(ctx, -3, REMOTE_DESKTOP_STREAM);							// [MeshAgent][RemoteDesktop]
 	ptrs = (RemoteDesktop_Ptrs*)Duktape_PushBuffer(ctx, sizeof(RemoteDesktop_Ptrs));// [MeshAgent][RemoteDesktop][buffer]

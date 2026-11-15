@@ -559,6 +559,7 @@ powershell -ExecutionPolicy Unrestricted $(ProjectDir)prebuild.ps1 $(ProjectDir)
     <ClCompile Include="..\meshcore\agentcore.c" />
     <ClCompile Include="..\meshcore\KVM\Windows\input.c" />
     <ClCompile Include="..\meshcore\KVM\Windows\kvm.c" />
+    <ClCompile Include="..\meshcore\KVM\common\kvm_pace.c" />
     <ClCompile Include="..\meshcore\KVM\Windows\tile.cpp" />
     <ClCompile Include="..\meshcore\meshinfo.c" />
     <ClCompile Include="..\meshcore\wincrypto.cpp" />

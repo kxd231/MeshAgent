@@ -19,6 +19,11 @@ limitations under the License.
 #include <stdio.h>
 #include <math.h>
 #include "tile.h"
+#include "kvm_video.h"
+#include "../common/kvm_capsrc.h"
+#ifdef KVM_ADAPT_ENABLED
+#include "../common/kvm_motion.h"
+#endif
 #include <gdiplus.h>
 #include "meshcore/meshdefines.h"
 #ifdef _TURBOJPEG
@@ -391,6 +396,11 @@ static int capture_full_gdi()
 {
 	if (BitBlt(hFullDC, 0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, hDesktopDC, SCREEN_X, SCREEN_Y, SRCCOPY) == FALSE) { KVMDEBUG("BitBlt() returned FALSE", 0); return 1; }
 	GdiFlush();
+	// the tile hash counts the 4th byte of every pixel. DXGI delivers it as 0 (dxgi_capture.cpp copy_region), GDI leaves what it likes (0xFF on a desktop with DWM): the first copy of DXGI after
+	// the fill from GDI then differed in 2022 of 2040 tiles with the same colours. Here GDI gets the same 0.
+#ifdef KVM_ADAPT_ENABLED
+	if (fullBits != NULL && fullWidth > 0 && fullHeight > 0) { kvm_clear_alpha(fullBits, (size_t)fullWidth * (size_t)fullHeight * 4u); }
+#endif
 	return 0;
 }
 
@@ -423,7 +433,7 @@ static int scale_full_to_buffer(void **buffer, long long *bufferSize, int *pixel
 	}
 
 	*bufferSize = (long long)dw * dh * 4;
-	if ((*buffer = malloc((size_t)*bufferSize)) == NULL) { KVMDEBUG("malloc() failed", 0); *bufferSize = 0; return 1; }
+	if ((*buffer = KVM_BUF_GET(*bufferSize)) == NULL) { KVMDEBUG("malloc() failed", 0); *bufferSize = 0; return 1; }
 	*pixelSize = 4;
 
 	{
@@ -489,12 +499,7 @@ static struct
 	int noOutputTries;			// Consecutive "no output with these coordinates" results (the topology can still be changing)
 	int lostCount;				// ACCESS_LOST results in the current minute (a storm of them is slowed down)
 	DWORD lostWindowStart;
-	DWORD lastImageTick;		// GetTickCount() of the last image that changed something (for the check against GDI)
-	DWORD lastStaleTick;
-	int staleStrikes;
-	int staleAfterReinit;		// A re-created duplication was caused by a stale check: the next difference means a systematic one
-	int staleSystematic;		// GDI and DXGI differ permanently (e.g. HDR): the check only measures and logs from now on
-	int staleSystematicLogged;
+	int staleSystematicLogged;	// lines of `dxgi stale_systematic` written for the current latch (the latch itself, the counters and the timing are in gCap, kvm_capsrc.h)
 	int invalidCalls;			// Consecutive DXGI_ERROR_INVALID_CALL results without an image in between
 	struct { int want, rectValid; dxgi_rect rect; HCURSOR cursor; int x, y; } ov; // Cursor overlay of the previous output (100% only)
 	// System cursor composed into the DXGI image (software cursor: VMs, basic display drivers). See "Software cursor in the DXGI image" below.
@@ -552,6 +557,120 @@ static void dx_utf8(const wchar_t *w, char *out, int cap)
 	for (char *c = out; *c != 0; c++) { if (*c == '"') { *c = '\''; } }
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// the choice of the capture source. The decisions are made by kvm_capsrc.c (portable, tested in Docker); this is the glue: it measures,
+// does what the module says and writes the log. Capture thread only. Lines of the log (MeshAgent-kvm.log):
+//   capture mode=gdi reason=dxgi_silent|dxgi_unavailable retries=<failed probes> ...      DXGI is not the source any more (DXGI delivered nothing although GDI saw changes, or it cannot be created)
+//   capture probe try=<n> retries=<failed probes> gdi_ms=<time in GDI> outputs=<what DXGI lists now>   DXGI is tried again (the outputs are listed again) IN THE SHADOW: GDI stays the source,
+//                                                                                          the duplication is only polled and its images go to a private copy (gShadow)
+//   capture probe failed reason=... retries=<n> next_ms=<pause> ...                        the probe did not succeed: longer pause (the picture never stopped)
+//   capture mode=dxgi reason=recovered gdi_ms=<time in GDI> probes=<n> updates=<n>         DXGI delivered images that agree with GDI: it is the source again from the next frame
+//   capture probe inconclusive ...                                                         a static screen: no evidence either way; GDI stays, the next probe after the same pause
+//   dxgi stale_suspect|stale|stale_systematic ... kind=silent|differs                      the comparison with GDI; `silent` = nothing arrived from DXGI since the persistent image began
+//
+// The proof of silence is GDI against GDI: a reference capture (CAPTUREBLT, like the comparison) is taken when a persistent image begins (the image was filled from GDI, or a full copy
+// of DXGI arrived), and the screen changing since then with no image from DXGI is silence, whatever the persistent image looks like (HDR, layered windows, the cursor).
+// ---------------------------------------------------------------------------------------------------------------------
+static void dx_close(void);
+static void cap_free_buffers(void);
+static kvm_capsrc gCap;
+static int gCapInit;
+static int gCapEv;				// KVM_CAP_EV_* since the last frame was returned (get_desktop_buffer moves it into the frame info)
+
+static uint32_t cap_now(void)
+{
+	uint32_t now = (uint32_t)GetTickCount();
+	if (!gCapInit) { gCapInit = 1; kvm_capsrc_init(&gCap, now); }
+	return now;
+}
+
+#ifdef KVM_DXGI_ENABLED
+extern "C" int kvm_capturefile_read(void);	// kvm_hwtest.cpp: <exe>-kvm-capture.txt says "gdi"
+#endif
+static volatile LONGLONG gDxLuid;	// the adapter of the output of the open duplication
+static volatile LONG gDxVen, gDxDev, gDxSub, gDxRev;	// ... and its PCI ids (the key of the entry "the enumeration of the encoders hangs")
+
+static int cap_mode_value(void)
+{
+	if (!gCapInit) { return KVM_CAP_MODE_DXGI; }
+	if (gDx.state == DXS_DISABLED) { return KVM_CAP_MODE_GDI; }	// MESH_KVM_FORCE_GDI, an exception, DXGI unsupported: the module is not asked any more
+	if (kvm_capsrc_probation(&gCap)) { return KVM_CAP_MODE_PROBE; }	// GDI is the source, DXGI is tried in its shadow
+	return kvm_capsrc_mode(&gCap) == KVM_CAPSRC_MODE_GDI ? KVM_CAP_MODE_GDI : KVM_CAP_MODE_DXGI;
+}
+
+// Probes can repeat for hours with a closed lid: the first ones are logged in full, then every tenth.
+static int cap_log_probe(void) { return gCap.st.probes <= 12 || (gCap.st.probes % 10) == 0; }
+
+static void cap_outputs(char *buf, int cap)
+{
+	dxgi_capture_describe_outputs(buf, cap);
+	if (buf[0] == 0) { lstrcpynA(buf, "none", cap); }
+}
+
+static void cap_reset(const char *why)
+{
+	uint32_t now = cap_now();
+	int wasGdi = (kvm_capsrc_mode(&gCap) == KVM_CAPSRC_MODE_GDI);
+	kvm_capsrc_reset(&gCap, now);
+	gDx.staleSystematicLogged = 0;
+	if (wasGdi) { kvm_stats_log("capture reset why=%s mode=gdi: DXGI is tried at once", why); }
+}
+
+// DXGI cannot be used now (no output, rotated, errors, strikes): GDI; in probation: a failed probe. The duplication is closed.
+static void cap_unavailable(const char *reason, kvm_frame_info *info)
+{
+	uint32_t now = cap_now();
+	char outs[640];
+	int act = kvm_capsrc_unavailable(&gCap, now);
+	UNREFERENCED_PARAMETER(info);
+	dx_close();
+	gDx.hasNextTry = 0;
+	cap_outputs(outs, (int)sizeof(outs));
+	if (act == KVM_CAPSRC_ACT_PROBE_FAILED)
+	{
+		gCapEv |= KVM_CAP_EV_PROBE_FAILED;
+		if (cap_log_probe()) { kvm_stats_log("capture probe failed reason=%s retries=%d next_ms=%u gdi_ms=%u outputs=\"%s\"", reason, gCap.fails, (unsigned int)kvm_capsrc_probe_interval(&gCap), (unsigned int)kvm_capsrc_gdi_ms(&gCap, now), outs); }
+	}
+	else
+	{
+		gCapEv |= KVM_CAP_EV_TO_GDI;
+		kvm_stats_log("capture mode=gdi reason=%s detail=%s retries=%d next_probe_ms=%u outputs=\"%s\"", kvm_capsrc_reason_name(gCap.reason), reason, gCap.fails, (unsigned int)kvm_capsrc_probe_interval(&gCap), outs);
+	}
+}
+
+static int gShadowFresh;		// a probe began and nothing was taken from the duplication yet
+
+static void cap_probe_start(kvm_frame_info *info)
+{
+	uint32_t now = cap_now();
+	char outs[640];
+	UNREFERENCED_PARAMETER(info);
+	kvm_capsrc_probe_begin(&gCap, now);
+	// Everything that kept DXGI from being tried is forgotten: the outputs are listed again by dxgi_capture_init()
+	gDx.ineligible = 0; gDx.noOutputTries = 0; gDx.failDesktop[0] = 0; gDx.hasNextTry = 0; gDx.transients = 0; gDx.invalidCalls = 0; gDx.strikes = 0;
+	gDx.staleSystematicLogged = 0;
+	gShadowFresh = 1;
+	gCapEv |= KVM_CAP_EV_PROBE;
+	if (cap_log_probe())
+	{
+		cap_outputs(outs, (int)sizeof(outs));
+		kvm_stats_log("capture probe try=%u retries=%d gdi_ms=%u outputs=\"%s\"", (unsigned int)gCap.st.probes, gCap.fails, (unsigned int)kvm_capsrc_gdi_ms(&gCap, now), outs);
+	}
+}
+
+static void cap_recovered(void)
+{
+	gCapEv |= KVM_CAP_EV_RECOVERED;
+	gDx.staleSystematicLogged = 0;
+	kvm_stats_log("capture mode=dxgi reason=recovered gdi_ms=%u probes=%u updates=%u total_gdi_ms=%u", (unsigned int)gCap.lastGdiMs, (unsigned int)gCap.st.probes, (unsigned int)gCap.lastProbeUpdates, (unsigned int)kvm_capsrc_gdi_ms(&gCap, cap_now()));
+	// The probe was a shadow: the duplication is open, but what it delivered went into a private copy. DXGI is the source from the next frame on and the persistent image begins again
+	// (a first frame, or a fill from GDI after 100 ms).
+	gDx.persistentValid = 0;
+	gDx.framesSinceOpen = 0;
+	gDx.ov.want = gDx.ov.rectValid = 0;
+	cap_free_buffers();
+}
+
 // Closes the duplication. The next frame goes through GDI until it is opened again.
 static void dx_close(void)
 {
@@ -560,6 +679,7 @@ static void dx_close(void)
 	gDx.persistentValid = 0;
 	gDx.ov.want = gDx.ov.rectValid = 0;
 	DX_PTR_RESET();
+	cap_free_buffers();
 }
 
 static void dx_delay(DWORD ms)
@@ -585,7 +705,12 @@ static void dx_strike(const char *desk, kvm_frame_info *info)
 		lstrcpynA(gDx.failDesktop, desk, (int)sizeof(gDx.failDesktop));
 		return;
 	}
-	if (++gDx.strikes >= KVM_DXGI_MAX_STRIKES) { dx_disable("strikes", info); }
+	if (++gDx.strikes >= KVM_DXGI_MAX_STRIKES)
+	{
+		// Not for the life of the process any more: GDI, and DXGI is tried again after a pause (a panel that came on, a driver that recovered)
+		gDx.strikes = 0;
+		cap_unavailable("strikes", info);
+	}
 }
 
 // reset_capture_bitmap() (desktop switch): close the duplication without penalty, the next frame tries again at once.
@@ -596,6 +721,7 @@ static void dx_reset(void)
 	gDx.ineligible = 0;
 	gDx.noOutputTries = 0;
 	gDx.hasNextTry = 0;
+	cap_reset("desktop");
 }
 
 static void dx_mark_overlay(unsigned char *map, const dxgi_rect &r)
@@ -612,75 +738,259 @@ static double dx_qpc_ms(void)
 	return (double)t.QuadPart * 1000.0 / (double)freq.QuadPart;
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// the GDI captures of the comparisons (a reference and the one of the moment), the private copy of a probe in the shadow, and the step that compares and acts.
+// ---------------------------------------------------------------------------------------------------------------------
+static unsigned char *gShadow;				// the images of a probe (top-down, sw x sh x 4): the duplication is polled, GDI stays the source
+static int gShadowW, gShadowH, gShadowValid;	// gShadowValid: a full copy arrived, later images are applied on top of it
+
 #ifdef KVM_STATS_LOG
-// Safety net of the measurement branch: when DXGI has reported no change for a while, the persistent image is compared with a
-// fresh GDI capture (outside the cursor). Differences twice in a row mean that the duplication stopped reporting. Returns the
-// number of differing pixels, -1 when the check could not be made.
-static int g_staleBox[4]; // rectangle around the differences of the last dx_stale_compare()
-static long long dx_stale_compare(int sw, int sh)
+// A GDI capture with CAPTUREBLT (layered windows are part of the screen, as in the DXGI image) in a DIB section, with the cursor field of that moment. The reference of kvm_capsrc.h
+// and the capture of the comparison in progress swap places, so a reference costs no copy.
+typedef struct cap_snap { HBITMAP bmp; void *bits; int w, h; dxgi_rect cur; } cap_snap;
+static cap_snap gSnapRef, gSnapNow;
+static int g_staleBox[4]; // rectangle around the differences of the last comparison
+
+static void cap_snap_free(cap_snap *s)
+{
+	if (s->bmp != NULL) { DeleteObject(s->bmp); }
+	memset(s, 0, sizeof(*s));
+}
+
+// Captures the screen into s (a DIB section of sw x sh, bottom-up). Returns 1 on success; on failure s is freed.
+static int cap_snap_grab(cap_snap *s, int sw, int sh)
 {
 	BITMAPINFO bi;
-	void *bits = NULL;
-	HBITMAP bmp;
-	HGDIOBJ old;
 	HDC dc;
+	HGDIOBJ old;
 	CURSORINFO ci;
-	dxgi_rect skip;
-	long long diff = -1;
+	int ok = 0;
 
-	dc = CreateCompatibleDC(hDesktopDC);
-	if (dc == NULL) { return -1; }
-	ZeroMemory(&bi, sizeof(bi));
-	bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-	bi.bmiHeader.biWidth = sw;
-	bi.bmiHeader.biHeight = sh;
-	bi.bmiHeader.biPlanes = 1;
-	bi.bmiHeader.biBitCount = 32;
-	bi.bmiHeader.biCompression = BI_RGB;
-	bmp = CreateDIBSection(hDesktopDC, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
-	if (bmp != NULL && bits != NULL)
+	if (s->bmp == NULL || s->w != sw || s->h != sh)
 	{
-		old = SelectObject(dc, bmp);
-		// CAPTUREBLT: layered windows are part of the DXGI image, the capture of the GDI path leaves them out
-		if (BitBlt(dc, 0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, hDesktopDC, SCREEN_X, SCREEN_Y, SRCCOPY | CAPTUREBLT))
+		cap_snap_free(s);
+		ZeroMemory(&bi, sizeof(bi));
+		bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+		bi.bmiHeader.biWidth = sw;
+		bi.bmiHeader.biHeight = sh;
+		bi.bmiHeader.biPlanes = 1;
+		bi.bmiHeader.biBitCount = 32;
+		bi.bmiHeader.biCompression = BI_RGB;
+		s->bmp = CreateDIBSection(hDesktopDC, &bi, DIB_RGB_COLORS, &s->bits, NULL, 0);
+		if (s->bmp == NULL || s->bits == NULL) { cap_snap_free(s); return 0; }
+		s->w = sw; s->h = sh;
+	}
+	dc = CreateCompatibleDC(hDesktopDC);
+	if (dc == NULL) { cap_snap_free(s); return 0; }
+	old = SelectObject(dc, s->bmp);
+	if (BitBlt(dc, 0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, hDesktopDC, SCREEN_X, SCREEN_Y, SRCCOPY | CAPTUREBLT)) { GdiFlush(); ok = 1; }
+	SelectObject(dc, old);
+	DeleteDC(dc);
+	if (!ok) { cap_snap_free(s); return 0; }
+	ZeroMemory(&ci, sizeof(ci));
+	ci.cbSize = sizeof(ci);
+	GetCursorInfo(&ci);
+	s->cur.left = ci.ptScreenPos.x - SCREEN_X - 64; s->cur.right = s->cur.left + 192;
+	s->cur.top = ci.ptScreenPos.y - SCREEN_Y - 64; s->cur.bottom = s->cur.top + 192;
+	return 1;
+}
+
+// Memory only while it is of use: the capture of a comparison is dropped when the comparison is over (or it became the reference), and a reference that images have outdated
+// (and no new one is wanted) is dropped too.
+static void cap_snap_trim(void)
+{
+	cap_snap_free(&gSnapNow);
+	if (!kvm_capsrc_ref_usable(&gCap) && !kvm_capsrc_ref_wanted(&gCap)) { cap_snap_free(&gSnapRef); }
+}
+
+// The module asked for a reference (a persistent image began): take it, or adopt the capture of the comparison that was just made (haveGrab).
+static void cap_ref_service(int sw, int sh, int haveGrab)
+{
+	if (!kvm_capsrc_ref_wanted(&gCap)) { return; }
+	if (!haveGrab && !cap_snap_grab(&gSnapNow, sw, sh)) { kvm_capsrc_ref_done(&gCap, 0); cap_snap_trim(); return; }
+	{ cap_snap t = gSnapRef; gSnapRef = gSnapNow; gSnapNow = t; }
+	kvm_capsrc_ref_done(&gCap, 1);
+	cap_snap_trim();
+}
+
+// Rectangle around the differences of two bottom-up images of SCREEN_WIDTH x SCREEN_HEIGHT pixels (the rectangles skipA and skipB left out): x0,y0 inclusive, x1,y1 exclusive, top-down
+static void cap_diff_box(const unsigned char *a, const unsigned char *b, int sw, int sh, const dxgi_rect &skipA, const dxgi_rect &skipB)
+{
+	int x0 = SCREEN_WIDTH, y0 = SCREEN_HEIGHT, x1 = 0, y1 = 0;
+	for (int y = 0; y < SCREEN_HEIGHT; y++)
+	{
+		const unsigned char *pa = a + ((size_t)(sh - 1 - y) * sw * 4), *pb = b + ((size_t)(sh - 1 - y) * sw * 4);
+		const int inA = (y >= skipA.top && y < skipA.bottom), inB = (y >= skipB.top && y < skipB.bottom);
+		for (int x = 0; x < SCREEN_WIDTH; x++)
 		{
-			GdiFlush();
-			ZeroMemory(&ci, sizeof(ci));
-			ci.cbSize = sizeof(ci);
-			GetCursorInfo(&ci);
-			skip.left = ci.ptScreenPos.x - SCREEN_X - 64; skip.right = skip.left + 192;
-			skip.top = ci.ptScreenPos.y - SCREEN_Y - 64; skip.bottom = skip.top + 192;
-			diff = kvm_count_pixel_diff(fullBits + ((size_t)(sh - 1) * sw * 4), -(ptrdiff_t)sw * 4, (unsigned char*)bits + ((size_t)(sh - 1) * sw * 4), -(ptrdiff_t)sw * 4, SCREEN_WIDTH, SCREEN_HEIGHT, &skip);
-			g_staleBox[0] = g_staleBox[1] = g_staleBox[2] = g_staleBox[3] = 0;
-			if (diff > 0)
+			if (inA && x >= skipA.left && x < skipA.right) { continue; }
+			if (inB && x >= skipB.left && x < skipB.right) { continue; }
+			if (pa[x * 4] != pb[x * 4] || pa[x * 4 + 1] != pb[x * 4 + 1] || pa[x * 4 + 2] != pb[x * 4 + 2])
 			{
-				// Rectangle around the differences (same skip field as the count): x0,y0 inclusive, x1,y1 exclusive, in screen pixels, top-down
-				int x0 = SCREEN_WIDTH, y0 = SCREEN_HEIGHT, x1 = 0, y1 = 0;
-				for (int y = 0; y < SCREEN_HEIGHT; y++)
-				{
-					const unsigned char *pa = fullBits + ((size_t)(sh - 1 - y) * sw * 4), *pb = (const unsigned char*)bits + ((size_t)(sh - 1 - y) * sw * 4);
-					for (int x = 0; x < SCREEN_WIDTH; x++)
-					{
-						if (y >= skip.top && y < skip.bottom && x >= skip.left && x < skip.right) { continue; }
-						if (pa[x * 4] != pb[x * 4] || pa[x * 4 + 1] != pb[x * 4 + 1] || pa[x * 4 + 2] != pb[x * 4 + 2])
-						{
-							if (x < x0) { x0 = x; }
-							if (x + 1 > x1) { x1 = x + 1; }
-							if (y < y0) { y0 = y; }
-							if (y + 1 > y1) { y1 = y + 1; }
-						}
-					}
-				}
-				g_staleBox[0] = x0; g_staleBox[1] = y0; g_staleBox[2] = x1; g_staleBox[3] = y1;
+				if (x < x0) { x0 = x; }
+				if (x + 1 > x1) { x1 = x + 1; }
+				if (y < y0) { y0 = y; }
+				if (y + 1 > y1) { y1 = y + 1; }
 			}
 		}
-		SelectObject(dc, old);
 	}
-	if (bmp != NULL) { DeleteObject(bmp); }
-	DeleteDC(dc);
-	return diff;
+	g_staleBox[0] = x0; g_staleBox[1] = y0; g_staleBox[2] = x1; g_staleBox[3] = y1;
 }
+#else
+static void cap_ref_service(int sw, int sh, int haveGrab) { UNREFERENCED_PARAMETER(sw); UNREFERENCED_PARAMETER(sh); UNREFERENCED_PARAMETER(haveGrab); }
 #endif
+
+static void cap_free_buffers(void)
+{
+#ifdef KVM_STATS_LOG
+	cap_snap_free(&gSnapRef);
+	cap_snap_free(&gSnapNow);
+#endif
+	free(gShadow);
+	gShadow = NULL;
+	gShadowW = gShadowH = 0;
+	gShadowValid = 0;
+}
+
+// Compares the pictures when the module says it is time and does what it decides. pTop / pStride: the persistent image (the private copy in a probe, NULL: there is none yet).
+// Returns 1 when the duplication was closed and this frame has to come from GDI, 0 otherwise. The safety net of the measurement branch (KVM_STATS_LOG): the pace is the module's.
+static int cap_compare_step(int sw, int sh, const unsigned char *pTop, ptrdiff_t pStride, uint32_t now, kvm_frame_info *info)
+{
+#ifdef KVM_STATS_LOG
+	double t0;
+	long long dP = -1, dR = -1, diff;
+	int act, grabbed, viaRef;
+	int sinceOpen, sinceImage, wasSystematic;
+	unsigned int updates;
+
+	if (!kvm_capsrc_compare_due(&gCap, now)) { return 0; }
+	t0 = dx_qpc_ms();
+	sinceOpen = (int)(now - gCap.openAt);
+	sinceImage = (int)(now - gCap.lastImage);
+	updates = gCap.updates;
+	wasSystematic = gCap.systematic;
+	viaRef = (gCap.updates == 0 || gCap.systematic);	// where the decision rests on GDI against the reference
+	grabbed = cap_snap_grab(&gSnapNow, sw, sh);
+	if (grabbed)
+	{
+		const ptrdiff_t nowStride = -(ptrdiff_t)sw * 4;
+		const unsigned char *nowTop = (const unsigned char*)gSnapNow.bits + ((size_t)(sh - 1) * sw * 4);
+		if (pTop != NULL) { dP = kvm_count_pixel_diff(pTop, pStride, nowTop, nowStride, SCREEN_WIDTH, SCREEN_HEIGHT, &gSnapNow.cur); }
+		if (kvm_capsrc_ref_usable(&gCap) && gSnapRef.bits != NULL && gSnapRef.w == sw && gSnapRef.h == sh)
+		{
+			const unsigned char *refTop = (const unsigned char*)gSnapRef.bits + ((size_t)(sh - 1) * sw * 4);
+			dR = kvm_count_pixel_diff2(refTop, nowStride, nowTop, nowStride, SCREEN_WIDTH, SCREEN_HEIGHT, &gSnapRef.cur, &gSnapNow.cur);
+		}
+		g_staleBox[0] = g_staleBox[1] = g_staleBox[2] = g_staleBox[3] = 0;
+		if (viaRef && dR > 0) { cap_diff_box((const unsigned char*)gSnapRef.bits, (const unsigned char*)gSnapNow.bits, sw, sh, gSnapRef.cur, gSnapNow.cur); }
+		else if (dP > 0 && pStride < 0) { cap_diff_box(pTop - ((size_t)(sh - 1) * sw * 4), (const unsigned char*)gSnapNow.bits, sw, sh, gSnapNow.cur, gSnapNow.cur); }
+	}
+	diff = (viaRef && dR > 0) ? dR : dP;
+	info->staleUs = (unsigned int)((dx_qpc_ms() - t0) * 1000.0);
+	act = kvm_capsrc_compare_result(&gCap, now, dP, dR);
+	cap_ref_service(sw, sh, grabbed);	// the capture just made is the new reference when the module wants one (behind the latch)
+	cap_snap_trim();
+	if (diff > 0) { info->staleSuspect = (act == KVM_CAPSRC_ACT_REOPEN || act == KVM_CAPSRC_ACT_TO_GDI || act == KVM_CAPSRC_ACT_PROBE_FAILED) ? 2 : 1; }
+	switch (act)
+	{
+		case KVM_CAPSRC_ACT_SUSPECT:
+			kvm_stats_log("dxgi stale_suspect px=%lld ref_px=%lld box=%d,%d,%d,%d kind=%s updates=%u since_open_ms=%d since_image_ms=%d", dP, dR, g_staleBox[0], g_staleBox[1], g_staleBox[2], g_staleBox[3], updates == 0 ? "silent" : "differs", updates, sinceOpen, sinceImage);
+			break;
+		case KVM_CAPSRC_ACT_REOPEN:
+			// DXGI delivered images and then differs from GDI: the duplication is created again (as before the capture source choice); if it is silent after that, GDI takes over
+			kvm_stats_log("dxgi stale px=%lld box=%d,%d,%d,%d kind=differs updates=%u since_open_ms=%d since_image_ms=%d action=reopen", dP, g_staleBox[0], g_staleBox[1], g_staleBox[2], g_staleBox[3], updates, sinceOpen, sinceImage);
+			dx_close();
+			gDx.hasNextTry = 0;
+			return 1;
+		case KVM_CAPSRC_ACT_SYSTEMATIC:
+			// Images arrive and GDI and DXGI still differ (HDR, a layered window): measured and logged only; the latch ends when the pictures agree again, after KVM_CAPSRC_SYSTEMATIC_MS, or on a new desktop or geometry
+			gDx.staleSystematicLogged = 1;
+			kvm_stats_log("dxgi stale_systematic px=%lld kind=differs updates=%u", dP, updates);
+			break;
+		case KVM_CAPSRC_ACT_CLEARED:
+			gDx.staleSystematicLogged = 0;
+			kvm_stats_log("dxgi stale_systematic_cleared reason=equal");
+			break;
+		case KVM_CAPSRC_ACT_TO_GDI:
+		case KVM_CAPSRC_ACT_PROBE_FAILED:
+		{
+			char outs[640];
+			cap_outputs(outs, (int)sizeof(outs));
+			dx_close();
+			gDx.hasNextTry = 0;
+			if (act == KVM_CAPSRC_ACT_TO_GDI)
+			{
+				gCapEv |= KVM_CAP_EV_TO_GDI;
+				kvm_stats_log("capture mode=gdi reason=%s retries=%d px=%lld ref_px=%lld box=%d,%d,%d,%d updates=%u since_open_ms=%d since_image_ms=%d%s next_probe_ms=%u outputs=\"%s\"",
+					kvm_capsrc_reason_name(gCap.reason), gCap.fails, dP, dR, g_staleBox[0], g_staleBox[1], g_staleBox[2], g_staleBox[3], updates, sinceOpen, sinceImage, wasSystematic ? " after_latch=1" : "", (unsigned int)kvm_capsrc_probe_interval(&gCap), outs);
+			}
+			else
+			{
+				gCapEv |= KVM_CAP_EV_PROBE_FAILED;
+				if (cap_log_probe()) { kvm_stats_log("capture probe failed reason=%s retries=%d px=%lld ref_px=%lld updates=%u since_open_ms=%d next_ms=%u gdi_ms=%u outputs=\"%s\"", kvm_capsrc_reason_name(gCap.reason), gCap.fails, dP, dR, updates, sinceOpen, (unsigned int)kvm_capsrc_probe_interval(&gCap), (unsigned int)kvm_capsrc_gdi_ms(&gCap, now), outs); }
+			}
+			return 1; // this frame comes from GDI (complete)
+		}
+		case KVM_CAPSRC_ACT_RECOVERED:
+			cap_recovered();
+			break;
+		default:
+			if (diff > 0 && gCap.systematic && gDx.staleSystematicLogged < 5) { gDx.staleSystematicLogged++; kvm_stats_log("dxgi stale_systematic px=%lld kind=differs updates=%u", dP, updates); }
+			break;
+	}
+#else
+	UNREFERENCED_PARAMETER(sw); UNREFERENCED_PARAMETER(sh); UNREFERENCED_PARAMETER(pTop); UNREFERENCED_PARAMETER(pStride); UNREFERENCED_PARAMETER(now); UNREFERENCED_PARAMETER(info);
+#endif
+	return 0;
+}
+
+// A probe in the shadow of GDI: the picture of this frame comes from GDI, so nothing stops while DXGI is tried. The duplication is polled without waiting; its images go to a
+// private copy, which is compared with GDI like the persistent image would be. kvm_capsrc.c decides when DXGI has proven itself (it becomes the source from the next frame) and when not.
+static void cap_shadow_poll(int sw, int sh, kvm_frame_info *info)
+{
+	dxgi_frame f;
+	dxgi_result r;
+	uint32_t now;
+	int gotFull = 0;
+
+	if (gShadow == NULL || gShadowW != sw || gShadowH != sh)
+	{
+		free(gShadow);
+		gShadowValid = 0;
+		gShadow = (unsigned char*)malloc((size_t)sw * sh * 4);
+		if (gShadow == NULL) { gShadowW = gShadowH = 0; cap_unavailable("no_memory", info); return; }
+		gShadowW = sw; gShadowH = sh;
+	}
+	memset(&f, 0, sizeof(f));
+	dxgi_capture_set_precopy(NULL);
+	r = dxgi_capture_acquire(0, gShadow, (ptrdiff_t)sw * 4, gShadowValid ? 0 : 1, &f);
+	now = (uint32_t)GetTickCount();
+	switch (r)
+	{
+		case DXGI_CAP_OK:
+			if (f.rectCount > 0)
+			{
+				kvm_capsrc_image(&gCap, now, f.fullCopy);
+				if (f.fullCopy) { gShadowValid = 1; gotFull = 1; }
+			}
+			break;
+		case DXGI_CAP_NO_CHANGE:
+		case DXGI_CAP_TIMEOUT:
+			break;
+		default:
+			// The module is closed (access lost, an error): this probe is over, the next one comes after a longer pause
+			cap_unavailable(dxgi_result_name(r), info);
+			return;
+	}
+	if (gShadowFresh)
+	{
+		// Nothing yet from the duplication: the reference is a GDI capture of this moment (the first full copy, when it comes, replaces it)
+		gShadowFresh = 0;
+		if (!gotFull) { kvm_capsrc_fed(&gCap); }
+	}
+	cap_ref_service(sw, sh, 0);
+	(void)cap_compare_step(sw, sh, gShadowValid ? gShadow : NULL, (ptrdiff_t)sw * 4, now, info);
+}
 
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1106,7 +1416,7 @@ static int dx_pointer_process(const dxgi_frame &f, int gotImage, int sw, int sh,
 static int kvm_dxgi_frame(void **buffer, long long *bufferSize, long *mouseMove, int *pixelSize, int flags, kvm_frame_info *info)
 {
 	char desk[64];
-	int sw, sh, want, changed = 0, gotImage = 0, fed = 0, kind, drawn = 0, nPatch = 0;
+	int sw, sh, want, changed = 0, gotImage = 0, fed = 0, kind, drawn = 0, nPatch = 0, shadow = 0;
 	dxgi_rect patchRect[2];
 	int forceFull = (flags & KVM_CAPTURE_FORCE_FULL) != 0;
 	int wantImage = (flags & KVM_CAPTURE_WANT_IMAGE) != 0; // WA-2: a picture is needed although nothing changed (sharpening); the capture still waits the normal timeout for a new frame
@@ -1120,6 +1430,7 @@ static int kvm_dxgi_frame(void **buffer, long long *bufferSize, long *mouseMove,
 	void *out = NULL;
 	long long outSize = 0;
 	int outPixel = 4;
+	uint32_t now = cap_now();
 
 	if (gDx.state == DXS_DISABLED) { return 1; }
 	if (!gDx.envChecked)
@@ -1127,6 +1438,7 @@ static int kvm_dxgi_frame(void **buffer, long long *bufferSize, long *mouseMove,
 		char env[8] = "";
 		gDx.envChecked = 1;
 		if (GetEnvironmentVariableA("MESH_KVM_FORCE_GDI", env, sizeof(env)) > 0 && env[0] == '1') { dx_disable("env", info); return 1; }
+		if (kvm_capturefile_read()) { dx_disable("file", info); return 1; }	// the file of the capture (Run Commands, no restart of the service): the next session
 	}
 
 	// Scaling up is done with StretchBlt on the GDI path. Scaling down and 100% use the full resolution image.
@@ -1139,7 +1451,41 @@ static int kvm_dxgi_frame(void **buffer, long long *bufferSize, long *mouseMove,
 	gDx.upscaleLogged = 0;
 
 	// The duplication is bound to one output: a new capture rectangle needs a new duplication.
-	if (gDx.state == DXS_OPEN && (gDx.tgtX != SCREEN_X || gDx.tgtY != SCREEN_Y || gDx.tgtW != SCREEN_WIDTH || gDx.tgtH != SCREEN_HEIGHT)) { dx_close(); }
+	if (gDx.state == DXS_OPEN && (gDx.tgtX != SCREEN_X || gDx.tgtY != SCREEN_Y || gDx.tgtW != SCREEN_WIDTH || gDx.tgtH != SCREEN_HEIGHT)) { dx_close(); cap_reset("geometry"); }
+
+	// GDI mode (DXGI was silent or could not be created): every frame goes through GDI, exactly as with MESH_KVM_FORCE_GDI. When a probe is due DXGI is tried in
+	// the shadow: the duplication is created and polled, but the picture of every frame still comes from GDI until the module has proof that DXGI works. A new geometry
+	// (another output became the active one) makes the probe due at once.
+	if (kvm_capsrc_mode(&gCap) == KVM_CAPSRC_MODE_GDI)
+	{
+		int act;
+		if (gDx.tgtX != SCREEN_X || gDx.tgtY != SCREEN_Y || gDx.tgtW != SCREEN_WIDTH || gDx.tgtH != SCREEN_HEIGHT) { cap_reset("geometry"); }
+		if (!kvm_capsrc_probation(&gCap))
+		{
+			if (!kvm_capsrc_probe_due(&gCap, now)) { return 1; }
+			cap_probe_start(info);
+		}
+		// A probe that ran out: success (images arrived, no difference noted), failure (the duplication could not be kept open) or nothing to learn (static screen)
+		act = kvm_capsrc_tick(&gCap, now, gDx.state == DXS_OPEN);
+		if (act == KVM_CAPSRC_ACT_RECOVERED) { cap_recovered(); return 1; }
+		if (act == KVM_CAPSRC_ACT_INCONCLUSIVE)
+		{
+			gCapEv |= KVM_CAP_EV_INCONCLUSIVE;
+			if (cap_log_probe()) { kvm_stats_log("capture probe inconclusive: nothing arrived from DXGI and the pictures agree (static screen), GDI stays retries=%d next_ms=%u", gCap.fails, (unsigned int)kvm_capsrc_probe_interval(&gCap)); }
+			dx_close();
+			gDx.hasNextTry = 0;
+			return 1;
+		}
+		if (act == KVM_CAPSRC_ACT_PROBE_FAILED)
+		{
+			dx_close();
+			gDx.hasNextTry = 0;
+			gCapEv |= KVM_CAP_EV_PROBE_FAILED;
+			if (cap_log_probe()) { kvm_stats_log("capture probe failed reason=%s retries=%d next_ms=%u", kvm_capsrc_reason_name(gCap.reason), gCap.fails, (unsigned int)kvm_capsrc_probe_interval(&gCap)); }
+			return 1;
+		}
+		shadow = 1;
+	}
 
 	if (gDx.state == DXS_IDLE)
 	{
@@ -1167,6 +1513,13 @@ static int kvm_dxgi_frame(void **buffer, long long *bufferSize, long *mouseMove,
 		ir = dxgi_capture_init(SCREEN_X, SCREEN_Y, SCREEN_WIDTH, SCREEN_HEIGHT, &di);
 		if (dx_qpc_ms() - initStart > 1000.0) { kvm_stats_log("dxgi slow_init ms=%d result=%s", (int)(dx_qpc_ms() - initStart), dxgi_result_name(ir)); }
 		gDx.tgtX = SCREEN_X; gDx.tgtY = SCREEN_Y; gDx.tgtW = SCREEN_WIDTH; gDx.tgtH = SCREEN_HEIGHT;
+		if (ir != DXGI_CAP_OK && ir != DXGI_CAP_UNSUPPORTED && kvm_capsrc_probation(&gCap))
+		{
+			// A probe: no retries with delays, no strikes. The result is one failed probe (the pause grows).
+			info->dxgiEvent |= KVM_DXGI_EVENT_FALLBACK;
+			cap_unavailable(dxgi_result_name(ir), info);
+			return 1;
+		}
 		if (ir == DXGI_CAP_OK)
 		{
 			char ad[256], out8[64];
@@ -1175,14 +1528,14 @@ static int kvm_dxgi_frame(void **buffer, long long *bufferSize, long *mouseMove,
 			gDx.persistentValid = 0;
 			gDx.transients = 0;
 			gDx.noOutputTries = 0;
-			gDx.lastImageTick = gDx.lastStaleTick = GetTickCount();
-			gDx.staleStrikes = 0;
+			kvm_capsrc_opened(&gCap, now);
+			gDxLuid = (LONGLONG)di.luid; gDxVen = (LONG)di.vendorId; gDxDev = (LONG)di.deviceId; gDxSub = (LONG)di.subsysId; gDxRev = (LONG)di.revision;
 			gDx.ov.want = gDx.ov.rectValid = 0;
 			DX_PTR_RESET();
 			info->dxgiEvent |= KVM_DXGI_EVENT_OPEN;
 			dx_utf8(di.adapter, ad, (int)sizeof(ad));
 			dx_utf8(di.output, out8, (int)sizeof(out8));
-			kvm_stats_log("dxgi open adapter=\"%s\" vendor=0x%04x output=%s mode=%dx%d rot=%d sysmem=%d desktop=%s", ad, di.vendorId, out8, di.width, di.height, di.rotation, di.systemMemory, desk);
+			if (!kvm_capsrc_probation(&gCap) || cap_log_probe()) { kvm_stats_log("dxgi open adapter=\"%s\" vendor=0x%04x output=%s mode=%dx%d rot=%d sysmem=%d desktop=%s", ad, di.vendorId, out8, di.width, di.height, di.rotation, di.systemMemory, desk); }
 		}
 		else if (ir == DXGI_CAP_NO_OUTPUT || ir == DXGI_CAP_ROTATED)
 		{
@@ -1195,6 +1548,8 @@ static int kvm_dxgi_frame(void **buffer, long long *bufferSize, long *mouseMove,
 			}
 			gDx.ineligible = 1;
 			kvm_stats_log("dxgi ineligible reason=%s rect=%d,%d,%d,%d desktop=%s", ir == DXGI_CAP_ROTATED ? "rotated" : "no_output", SCREEN_X, SCREEN_Y, SCREEN_WIDTH, SCREEN_HEIGHT, desk);
+			// Not for good: the output can be attached again (panel on) or another one can become the active output. GDI now, DXGI is tried again after a pause.
+			cap_unavailable(ir == DXGI_CAP_ROTATED ? "rotated" : "no_output", info);
 			return 1;
 		}
 		else
@@ -1220,6 +1575,7 @@ static int kvm_dxgi_frame(void **buffer, long long *bufferSize, long *mouseMove,
 	// From here on the duplication is open.
 	sw = adjust_screen_size(SCREEN_WIDTH);
 	sh = adjust_screen_size(SCREEN_HEIGHT);
+	if (shadow) { cap_shadow_poll(sw, sh, info); return 1; }
 	if (ensure_full_capture(sw, sh) != 0) { return 1; }
 	if (gDx.seenFullGen != fullCaptureGen) { gDx.seenFullGen = fullCaptureGen; gDx.persistentValid = 0; }
 
@@ -1246,6 +1602,7 @@ static int kvm_dxgi_frame(void **buffer, long long *bufferSize, long *mouseMove,
 	acquireStart = dx_qpc_ms();
 	r = dxgi_capture_acquire(timeout, dstTop, -(ptrdiff_t)sw * 4, gDx.persistentValid ? 0 : 1, &f);
 	acquireMs = dx_qpc_ms() - acquireStart;
+	now = (uint32_t)GetTickCount();
 
 	switch (r)
 	{
@@ -1255,7 +1612,12 @@ static int kvm_dxgi_frame(void **buffer, long long *bufferSize, long *mouseMove,
 			gDx.invalidCalls = 0;
 			gDx.persistentValid = 1;
 			gotImage = (f.rectCount > 0);
-			if (gotImage) { gDx.lastImageTick = GetTickCount(); gDx.staleStrikes = 0; }
+			if (gotImage)
+			{
+				info->dwmFrames = f.accumulatedFrames;
+				kvm_capsrc_image(&gCap, now, f.fullCopy);
+				if (f.fullCopy) { cap_ref_service(sw, sh, 0); }	// a persistent image begins: the reference is a GDI capture of this moment
+			}
 			dx_pointer_latch(f);
 			break;
 		case DXGI_CAP_NO_CHANGE:
@@ -1329,55 +1691,15 @@ static int kvm_dxgi_frame(void **buffer, long long *bufferSize, long *mouseMove,
 		if (capture_full_gdi() != 0) { return 1; }
 		gDx.persistentValid = 1;
 		fed = 1;
+		kvm_capsrc_fed(&gCap);
+		cap_ref_service(sw, sh, 0);
 	}
 
 	if (!gotImage && !fed && !changed && !forceFull && !wantImage && nPatch == 0)
 	{
-#ifdef KVM_STATS_LOG
-		// Safety net of the measurement branch, see dx_stale_compare()
-		if ((DWORD)(GetTickCount() - gDx.lastImageTick) >= KVM_STALE_QUIET_MS && (DWORD)(GetTickCount() - gDx.lastStaleTick) >= KVM_STATS_PERIOD_MS)
-		{
-			double t0 = dx_qpc_ms();
-			long long diff = dx_stale_compare(sw, sh);
-			info->staleUs = (unsigned int)((dx_qpc_ms() - t0) * 1000.0);
-			gDx.lastStaleTick = GetTickCount();
-			if (diff > 0 && gDx.staleSystematic)
-			{
-				// Known to differ permanently: measure and log only (no re-creation, no GDI frames)
-				if (gDx.staleSystematicLogged < 5) { gDx.staleSystematicLogged++; kvm_stats_log("dxgi stale_systematic px=%lld", diff); }
-			}
-			else if (diff > 0)
-			{
-				info->staleSuspect = ++gDx.staleStrikes;
-				if (gDx.staleAfterReinit)
-				{
-					// The picture of a freshly created duplication already differs: GDI and DXGI see the screen differently (HDR, a layered window...)
-					gDx.staleSystematic = 1;
-					gDx.staleSystematicLogged = 1;
-					gDx.staleStrikes = 0;
-					kvm_stats_log("dxgi stale_systematic px=%lld", diff);
-				}
-				else
-				{
-					kvm_stats_log("dxgi %s px=%lld box=%d,%d,%d,%d", gDx.staleStrikes >= 2 ? "stale" : "stale_suspect", diff, g_staleBox[0], g_staleBox[1], g_staleBox[2], g_staleBox[3]);
-					if (gDx.staleStrikes >= 2)
-					{
-						// The duplication does not report what is on the screen: build it again, this frame comes from GDI (complete)
-						gDx.staleStrikes = 0;
-						gDx.staleAfterReinit = 1;
-						dx_close();
-						gDx.hasNextTry = 0;
-						return 1;
-					}
-				}
-			}
-			else
-			{
-				gDx.staleStrikes = 0;
-				gDx.staleAfterReinit = 0;
-			}
-		}
-#endif
+		// Safety net of the measurement branch, see cap_compare_step(). When and how often is decided by kvm_capsrc.c: the pace of before the capture source choice in the steady state,
+		// a short window after the duplication was opened while nothing has arrived, and one confirming comparison after a difference.
+		if (cap_compare_step(sw, sh, fullBits + ((size_t)(sh - 1) * sw * 4), -(ptrdiff_t)sw * 4, now, info)) { return 1; }
 		// Nothing to send. A timeout was the wait for changes, the main loop does not need its pause after it.
 		info->kind = KVM_FRAME_UNCHANGED;
 		info->source = KVM_SOURCE_DXGI;
@@ -1394,7 +1716,7 @@ static int kvm_dxgi_frame(void **buffer, long long *bufferSize, long *mouseMove,
 	if (SCALING_FACTOR == 1024)
 	{
 		outSize = (long long)sw * sh * 4;
-		if ((out = malloc((size_t)outSize)) == NULL) { return 1; }
+		if ((out = KVM_BUF_GET(outSize)) == NULL) { return 1; }
 		memcpy(out, fullBits, (size_t)outSize);
 		if (want) { drawn = kvm_cursor_xor((unsigned char*)out + ((size_t)(sh - 1) * sw * 4), -(ptrdiff_t)sw * 4, sw, sh, mouseMove[1], mouseMove[2], &cur); }
 	}
@@ -1407,7 +1729,7 @@ static int kvm_dxgi_frame(void **buffer, long long *bufferSize, long *mouseMove,
 
 	if (kind == KVM_FRAME_PARTIAL)
 	{
-		if ((map = (unsigned char*)calloc((size_t)TILE_HEIGHT_COUNT * TILE_WIDTH_COUNT, 1)) == NULL) { free(out); return 1; }
+		if ((map = (unsigned char*)calloc((size_t)TILE_HEIGHT_COUNT * TILE_WIDTH_COUNT, 1)) == NULL) { KVM_BUF_FREE(out); return 1; }
 		for (int i = 0; i < f.rectCount; i++) { dx_mark_overlay(map, f.rects[i]); }
 		for (int i = 0; i < nPatch; i++) { dx_mark_overlay(map, patchRect[i]); }
 		if (SCALING_FACTOR == 1024)
@@ -1430,6 +1752,7 @@ static int kvm_dxgi_frame(void **buffer, long long *bufferSize, long *mouseMove,
 	*pixelSize = outPixel;
 	info->kind = kind;
 	info->source = KVM_SOURCE_DXGI;
+	info->srcClass = (fed && !gotImage) ? 0 : 1;	// the persistent image was filled from GDI in this call (the first frame of a duplication that gave nothing yet), else its pixels are the duplication's
 	info->tileDirty = map;
 	info->dirtyRects = f.dirtyCount;
 	info->moveRects = f.moveCount;
@@ -1788,7 +2111,7 @@ int get_tile_at(int x, int y, void** buffer, long long *bufferSize, void *deskto
 	}
 
 	tileInfo[row][col].flags = (char)TILE_MARKED_NOT_SENT;
-	startClass = kvm_adapt_class(&tileInfo[row][col]); // Only tiles of the same class are coalesced into one rectangle (one quality)
+	startClass = kvm_adapt_class(&tileInfo[row][col], row, col); // Only tiles of the same class are coalesced into one rectangle (one quality)
 
 
 	// COALESCING SECTION
@@ -1812,7 +2135,7 @@ int get_tile_at(int x, int y, void** buffer, long long *bufferSize, void *deskto
 		if (CRC != tileInfo[row][rightcol].crc || tileInfo[row][rightcol].flags == (char)TILE_MARKED_NOT_SENT || KVM_TILE_DEFERRED(&tileInfo[row][rightcol])) // If the tile has changed, increment the capturewidth.
 		{
 			tileInfo[row][rightcol].crc = CRC; 
-			if (kvm_adapt_class(&tileInfo[row][rightcol]) != startClass)
+			if (kvm_adapt_class(&tileInfo[row][rightcol], row, rightcol) != startClass)
 			{
 				// Changed, but another quality: it is sent by itself later (marked, not "don't send": the change must not get lost)
 				tileInfo[row][rightcol].flags = (char)TILE_MARKED_NOT_SENT;
@@ -1865,7 +2188,7 @@ int get_tile_at(int x, int y, void** buffer, long long *bufferSize, void *deskto
 			{
 				tileInfo[botrow][rcol].flags = (char)TILE_MARKED_NOT_SENT;
 				tileInfo[botrow][rcol].crc = CRC;
-				if (kvm_adapt_class(&tileInfo[botrow][rcol]) != startClass)
+				if (kvm_adapt_class(&tileInfo[botrow][rcol], botrow, rcol) != startClass)
 				{
 					// Changed, but another quality: this row does not join the rectangle; the tile stays marked and is sent by itself later
 					fail = 1;
@@ -1919,6 +2242,17 @@ int get_tile_at(int x, int y, void** buffer, long long *bufferSize, void *deskto
 		}
 	}
 
+	// while the H.264 video runs, a rectangle of the motion class is not sent as JPEG: its tiles wait in pendingVideo (I2) for the next frame, which paints the sum of them.
+	// The tiles keep their new CRC (what the viewer will have once the frame is consumed); a tile that changes again meanwhile is looked at again as any other.
+	if (kvm_video_claim_rect(row, col, botrow, rightcol, startClass))
+	{
+		for (int r = row; r <= botrow; r++)
+		{
+			for (int c = col; c <= rightcol; c++) { tileInfo[r][c].flags = (char)TILE_SENT; }
+		}
+		return 0;
+	}
+
 	// WA-2b: the motion frame limit holds this rectangle back. The tiles keep their new CRC and are marked as deferred: the next frame looks at them
 	// again whether or not the capture lists them as changed (the change must not get lost), and sends them in the class they were held back in.
 	// The same holds back what the budget (byte bucket) does not allow now: it is sent later, in the quality of the ladder step, and sharpened after that.
@@ -1928,10 +2262,11 @@ int get_tile_at(int x, int y, void** buffer, long long *bufferSize, void *deskto
 		{
 			for (int c = col; c <= rightcol; c++) { tileInfo[r][c].flags = (char)TILE_SENT; }
 		}
-		kvm_adapt_defer(row, col, botrow, rightcol);
+		kvm_adapt_defer(row, col, botrow, rightcol, startClass);
 		return 0;
 	}
 
+	kvm_video_before_jpeg(row, col, botrow, rightcol);	// a frame in flight that covers a tile of this rectangle is written before the JPEG
 	int retval = 0;
 	int firstTime = 1;
 	// Under a budget, at a low ladder step, a larger rectangle of the full class is sent in the quality of the step as well (and sharpened later)
@@ -2021,6 +2356,7 @@ int get_desktop_buffer(void **buffer, long long *bufferSize, long* mouseMove, in
 	memset(info, 0, sizeof(*info)); // GDI frames are always complete: kind = KVM_FRAME_FULL, source = KVM_SOURCE_GDI
 	info->kind = KVM_FRAME_FULL;
 	info->source = KVM_SOURCE_GDI;
+	info->capMode = KVM_CAP_MODE_GDI; // the DXGI block below says otherwise
 	*buffer = NULL; // If anything fails, this will be the indication.
 	*bufferSize = 0;
 	*pixelSize = 0;
@@ -2041,6 +2377,10 @@ int get_desktop_buffer(void **buffer, long long *bufferSize, long* mouseMove, in
 	{
 		DWORD exceptionCode = 0;
 		int dxr = dxgi_frame_guarded(buffer, bufferSize, mouseMove, pixelSize, flags, info, &exceptionCode);
+		const int capEvents = gCapEv, capMode = cap_mode_value(); // where the picture comes from, and what changed in the choice of the source while this frame was captured
+		gCapEv = 0;
+		info->capMode = capMode;
+		info->capEvents = capEvents;
 		if (dxr == 0) { return 0; }
 		if (dxr < 0)
 		{
@@ -2058,6 +2398,8 @@ int get_desktop_buffer(void **buffer, long long *bufferSize, long* mouseMove, in
 			info->kind = KVM_FRAME_FULL;
 			info->source = KVM_SOURCE_GDI;
 			info->dxgiEvent = events;
+			info->capMode = capMode;
+			info->capEvents = capEvents;
 			*buffer = NULL;
 			*bufferSize = 0;
 			*pixelSize = 0;
@@ -2161,10 +2503,13 @@ int get_desktop_buffer(void **buffer, long long *bufferSize, long* mouseMove, in
 
 	*bufferSize = bmpInfo.bmiHeader.biSizeImage;
 	*pixelSize = bmpInfo.bmiHeader.biBitCount / 8;
-	if ((*buffer = malloc((size_t)*bufferSize)) == NULL) { KVMDEBUG("malloc() failed", 0); return 1; }
+	if ((*buffer = KVM_BUF_GET(*bufferSize)) == NULL) { KVMDEBUG("malloc() failed", 0); return 1; }
 	
 	bmpInfo.bmiHeader.biCompression = BI_RGB;
-	if (GetDIBits(hDesktopDC, hCapturedBitmap, 0, bmpInfo.bmiHeader.biHeight, *buffer, &bmpInfo, DIB_RGB_COLORS) == 0) { KVMDEBUG("GetDIBits() failed", 0); free(*buffer); return(1); }
+	if (GetDIBits(hDesktopDC, hCapturedBitmap, 0, bmpInfo.bmiHeader.biHeight, *buffer, &bmpInfo, DIB_RGB_COLORS) == 0) { KVMDEBUG("GetDIBits() failed", 0); KVM_BUF_FREE(*buffer); return(1); }
+#ifdef KVM_ADAPT_ENABLED
+	if (bmpInfo.bmiHeader.biBitCount == 32) { kvm_clear_alpha((unsigned char *)*buffer, (size_t)*bufferSize); }	// the same 0 in the 4th byte as DXGI (the tile hash counts it)
+#endif
 
 	return 0;
 }
@@ -2200,7 +2545,7 @@ short initialize_gdiplus()
 	TILE_WIDTH = 32;
 	TILE_HEIGHT = 32;
 	COMPRESSION_RATIO = 100;
-	FRAME_RATE_TIMER = 50;
+	FRAME_RATE_TIMER = 33;	// the default of the viewer (Medium); a new child after UAC or the lock screen gets the viewer's commands again, this is for the builds that cannot (no stream layer)
 	SCALING_FACTOR = 1024;
 	SCALING_FACTOR_NEW = 1024;
 
@@ -2263,6 +2608,7 @@ void kvm_dxgi_thread_end(void)
 	gDx.persistentValid = 0;
 	gDx.ov.want = gDx.ov.rectValid = 0;
 	DX_PTR_RESET();
+	cap_free_buffers();
 }
 #endif
 
@@ -2278,6 +2624,26 @@ int kvm_subsamp_value(void)
 }
 #endif
 
+#ifdef KVM_DXGI_ENABLED
+long long kvm_dxgi_adapter_luid(void) { return (long long)gDxLuid; }
+int kvm_dxgi_adapter_sig(unsigned *ven, unsigned *dev, unsigned *sub, unsigned *rev) { if (gDxLuid == 0) { return 0; } *ven = (unsigned)gDxVen; *dev = (unsigned)gDxDev; *sub = (unsigned)gDxSub; *rev = (unsigned)gDxRev; return 1; }
+int kvm_capture_is_dxgi(void) { return gCapInit && cap_mode_value() == KVM_CAP_MODE_DXGI; }
+// 0 = not known yet (before the first frame of the capture, or DXGI is the choice but not open: the first open is under way or the duplication is being made again), 1 = GDI is the source (or will be: forced, DXGI
+// unsupported, the lid is closed, the probation), 2 = DXGI is open and the source. The choice of the encoder waits for 0 to pass (a start before the first open is no "lid closed").
+int kvm_capture_state(void)
+{
+	// the count of images is read as the capture thread writes it (a plain int, the same pattern as the rest of this function); it starts from 0 at every open of the duplication (dx_close, the open itself)
+	return kvm_capsrc_known_state(gCapInit, gDx.state == DXS_DISABLED, gCapInit && (kvm_capsrc_probation(&gCap) || kvm_capsrc_mode(&gCap) == KVM_CAPSRC_MODE_GDI), gDx.state == DXS_OPEN, *(volatile int *)&gDx.framesSinceOpen);
+}
+int kvm_capture_file_gdi(void) { return kvm_capturefile_read(); }
+#else
+long long kvm_dxgi_adapter_luid(void) { return 0; }
+int kvm_dxgi_adapter_sig(unsigned *ven, unsigned *dev, unsigned *sub, unsigned *rev) { (void)ven; (void)dev; (void)sub; (void)rev; return 0; }
+int kvm_capture_is_dxgi(void) { return 0; }
+int kvm_capture_state(void) { return 1; }
+int kvm_capture_file_gdi(void) { return 0; }
+#endif
+
 // Forces the capture bitmap to be re-created on the next frame (e.g. after a desktop switch).
 void reset_capture_bitmap()
 {
@@ -2290,7 +2656,7 @@ void set_tile_compression(int type, int level)
 	encCompression = level;
 	if (encCompression < 1) { encCompression = 1; } // Guard against bad values.
 	if (encCompression > 90) { encCompression = 90; }
-	if (type >= 1 && type <= 4) { encType = type; }
+	if (type >= 1 && type <= 4) { InterlockedExchange((volatile LONG *)&encType, (LONG)type); } // the main loop reads it (kvm_adapt_ack_capable) from another thread
 	// Note: no early return when tilebuffer == NULL, with TurboJPEG the tile buffer is never allocated for JPEG.
 	KVMDEBUG("set_tile_compression() type", type);
 	KVMDEBUG("set_tile_compression() level", level);

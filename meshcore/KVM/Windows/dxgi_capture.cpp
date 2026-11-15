@@ -11,6 +11,7 @@
 
 #include <d3d11.h>
 #include <dxgi1_2.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #if defined(_M_X64) || defined(__SSE2__)
@@ -242,6 +243,9 @@ dxgi_result dxgi_capture_init(int x, int y, int w, int h, dxgi_info *info)
 			copy_wide(info->adapter, sizeof(info->adapter) / sizeof(wchar_t), ad.Description);
 			info->vendorId = ad.VendorId;
 			info->deviceId = ad.DeviceId;
+			info->subsysId = ad.SubSysId;
+			info->revision = ad.Revision;
+			info->luid = ((long long)ad.AdapterLuid.HighPart << 32) | (long long)(unsigned long)ad.AdapterLuid.LowPart;
 		}
 		copy_wide(info->output, sizeof(info->output) / sizeof(wchar_t), od.DeviceName);
 		info->width = w;
@@ -283,6 +287,56 @@ done:
 	safe_release(factory);
 	if (result != DXGI_CAP_OK) { dxgi_capture_shutdown(); }
 	return result;
+}
+
+int dxgi_capture_describe_outputs(char *out, int cap)
+{
+	IDXGIFactory1 *factory = NULL;
+	int n = 0;
+
+	if (out == NULL || cap <= 0) { return 0; }
+	out[0] = 0;
+	if (!load_libs()) { return 0; }
+	if (FAILED(g_createFactory1(__uuidof(IDXGIFactory1), (void **)&factory))) { return 0; }
+	for (UINT ai = 0; ; ai++)
+	{
+		IDXGIAdapter1 *a = NULL;
+		DXGI_ADAPTER_DESC1 ad;
+		char an[96];
+		if (FAILED(factory->EnumAdapters1(ai, &a))) { break; }
+		memset(&ad, 0, sizeof(ad));
+		an[0] = 0;
+		if (SUCCEEDED(a->GetDesc1(&ad)))
+		{
+			int k = WideCharToMultiByte(CP_UTF8, 0, ad.Description, -1, an, (int)sizeof(an) - 1, NULL, NULL);
+			if (k <= 0) { k = 1; }
+			an[k - 1 < (int)sizeof(an) - 1 ? k - 1 : (int)sizeof(an) - 1] = 0;
+			for (char *q = an; *q != 0; q++) { if (*q == '"' || *q == ';' || *q == '|') { *q = '\''; } }
+		}
+		for (UINT oi = 0; ; oi++)
+		{
+			IDXGIOutput *o = NULL;
+			DXGI_OUTPUT_DESC d;
+			char on[48];
+			int k, w;
+			if (FAILED(a->EnumOutputs(oi, &o))) { break; }
+			memset(&d, 0, sizeof(d));
+			if (SUCCEEDED(o->GetDesc(&d)))
+			{
+				k = WideCharToMultiByte(CP_UTF8, 0, d.DeviceName, -1, on, (int)sizeof(on) - 1, NULL, NULL);
+				if (k <= 0) { k = 1; }
+				on[k - 1 < (int)sizeof(on) - 1 ? k - 1 : (int)sizeof(on) - 1] = 0;
+				w = _snprintf_s(out + n, (size_t)(cap - n), _TRUNCATE, "%s%s|%s %ld,%ld,%ld,%ld att=%d rot=%d", n > 0 ? ";" : "", an, on,
+					d.DesktopCoordinates.left, d.DesktopCoordinates.top, d.DesktopCoordinates.right, d.DesktopCoordinates.bottom, d.AttachedToDesktop ? 1 : 0, (int)d.Rotation);
+				if (w < 0 || w >= cap - n) { n = cap - 1; out[n] = 0; o->Release(); a->Release(); safe_release(factory); return n; }
+				n += w;
+			}
+			o->Release();
+		}
+		a->Release();
+	}
+	safe_release(factory);
+	return n;
 }
 
 dxgi_result dxgi_capture_acquire(unsigned int timeoutMs, unsigned char *dstTop, ptrdiff_t dstStride, int wantFull, dxgi_frame *frame)
@@ -604,15 +658,16 @@ void kvm_mark_rect_tiles(unsigned char *map, int tilesX, int tilesY, int tileW, 
 	}
 }
 
-long long kvm_count_pixel_diff(const unsigned char *aTop, ptrdiff_t aStride, const unsigned char *bTop, ptrdiff_t bStride, int w, int h, const dxgi_rect *skip)
+long long kvm_count_pixel_diff2(const unsigned char *aTop, ptrdiff_t aStride, const unsigned char *bTop, ptrdiff_t bStride, int w, int h, const dxgi_rect *skipA, const dxgi_rect *skipB)
 {
 	long long diff = 0;
 	for (int y = 0; y < h; y++)
 	{
 		const unsigned char *a = aTop + ((ptrdiff_t)y * aStride), *b = bTop + ((ptrdiff_t)y * bStride);
-		int inSkipRows = (skip != NULL && y >= skip->top && y < skip->bottom);
+		int inRowsA = (skipA != NULL && y >= skipA->top && y < skipA->bottom);
+		int inRowsB = (skipB != NULL && y >= skipB->top && y < skipB->bottom);
 		int x = 0;
-		if (!inSkipRows)
+		if (!inRowsA && !inRowsB)
 		{
 #ifdef DXGI_SSE2
 			const __m128i mask = _mm_set1_epi32(0x00FFFFFF), zero = _mm_setzero_si128();
@@ -633,11 +688,17 @@ long long kvm_count_pixel_diff(const unsigned char *aTop, ptrdiff_t aStride, con
 		for (; x < w; x++)
 		{
 			const unsigned char *pa = a + ((size_t)x * 4), *pb = b + ((size_t)x * 4);
-			if (inSkipRows && x >= skip->left && x < skip->right) { continue; }
+			if (inRowsA && x >= skipA->left && x < skipA->right) { continue; }
+			if (inRowsB && x >= skipB->left && x < skipB->right) { continue; }
 			if (pa[0] != pb[0] || pa[1] != pb[1] || pa[2] != pb[2]) { diff++; }
 		}
 	}
 	return diff;
+}
+
+long long kvm_count_pixel_diff(const unsigned char *aTop, ptrdiff_t aStride, const unsigned char *bTop, ptrdiff_t bStride, int w, int h, const dxgi_rect *skip)
+{
+	return kvm_count_pixel_diff2(aTop, aStride, bTop, bStride, w, h, skip, NULL);
 }
 
 int kvm_cursor_xor(unsigned char *dstTop, ptrdiff_t dstStride, int dstW, int dstH, int x, int y, dxgi_rect *covered)

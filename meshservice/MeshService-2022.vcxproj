@@ -824,6 +824,30 @@ powershell -ExecutionPolicy Unrestricted $(ProjectDir)prebuild.ps1 $(ProjectDir)
     <ClCompile Include="..\meshcore\KVM\Windows\dxgi_capture.cpp" />
     <ClCompile Include="..\meshcore\KVM\Windows\kvm_adapt.cpp" />
     <ClCompile Include="..\meshcore\KVM\Windows\kvm.c" />
+    <ClCompile Include="..\meshcore\KVM\common\kvm_pace.c" />
+    <ClCompile Include="..\meshcore\KVM\common\kvm_auto.c" Condition="'$(Platform)'=='x64'" />
+    <ClCompile Include="..\meshcore\KVM\common\kvm_stream.c" Condition="'$(Platform)'=='x64'" />
+    <ClCompile Include="..\meshcore\KVM\common\kvm_video_core.c" Condition="'$(Platform)'=='x64'" />
+    <ClCompile Include="..\meshcore\KVM\common\kvm_video_rc.c" Condition="'$(Platform)'=='x64'" />
+    <ClCompile Include="..\meshcore\KVM\common\kvm_sharpen.c" Condition="'$(Platform)'=='x64'" />
+    <ClCompile Include="..\meshcore\KVM\common\kvm_qpdet.c" Condition="'$(Platform)'=='x64'" />
+    <ClCompile Include="..\meshcore\KVM\common\kvm_motion.c" Condition="'$(Platform)'=='x64'" />
+    <ClCompile Include="..\meshcore\KVM\common\kvm_capsrc.c" Condition="'$(Platform)'=='x64'" />
+    <ClCompile Include="..\meshcore\KVM\common\kvm_yuv.c" Condition="'$(Platform)'=='x64'" />
+    <ClCompile Include="..\meshcore\KVM\common\kvm_nv12view.c" Condition="'$(Platform)'=='x64'" />
+    <ClCompile Include="..\meshcore\KVM\common\kvm_annexb.c" Condition="'$(Platform)'=='x64'" />
+    <ClCompile Include="..\meshcore\KVM\Windows\kvm_video.cpp" Condition="'$(Platform)'=='x64'" />
+    <ClCompile Include="..\meshcore\KVM\Windows\mf_h264.cpp" Condition="'$(Platform)'=='x64'" />
+    <ClCompile Include="..\meshcore\KVM\Windows\mf_h264_hw.cpp" Condition="'$(Platform)'=='x64'" />
+    <ClCompile Include="..\meshcore\KVM\Windows\kvm_hwtest.cpp" Condition="'$(Platform)'=='x64'" />
+    <ClCompile Include="..\meshcore\KVM\Windows\kvm_hwtest_core.c" Condition="'$(Platform)'=='x64'" />
+    <ClCompile Include="..\meshcore\KVM\common\kvm_hwpolicy.c" Condition="'$(Platform)'=='x64'" />
+    <ClCompile Include="..\meshcore\KVM\common\kvm_synth.c" Condition="'$(Platform)'=='x64'" />
+    <ClCompile Include="..\meshcore\KVM\common\kvm_h264_rules.c" Condition="'$(Platform)'=='x64'" />
+    <ClCompile Include="..\meshcore\KVM\Windows\kvm_encthr.cpp" Condition="'$(Platform)'=='x64'" />
+    <ClCompile Include="..\meshcore\KVM\Windows\kvm_encbe_mf.cpp" Condition="'$(Platform)'=='x64'" />
+    <ClCompile Include="..\meshcore\KVM\common\kvm_encjob.c" Condition="'$(Platform)'=='x64'" />
+    <ClCompile Include="..\meshcore\KVM\common\kvm_fbuf.c" Condition="'$(Platform)'=='x64'" />
     <ClCompile Include="..\meshcore\KVM\Windows\tile.cpp" />
     <ClCompile Include="..\meshcore\meshinfo.c" />
     <ClCompile Include="..\meshcore\wincrypto.cpp" />
@@ -881,6 +905,31 @@ powershell -ExecutionPolicy Unrestricted $(ProjectDir)prebuild.ps1 $(ProjectDir)
     <ClInclude Include="..\meshcore\KVM\Windows\kvm.h" />
     <ClInclude Include="..\meshcore\KVM\Windows\dxgi_capture.h" />
     <ClInclude Include="..\meshcore\KVM\Windows\kvm_adapt.h" />
+    <ClInclude Include="..\meshcore\KVM\common\kvm_pace.h" />
+    <ClInclude Include="..\meshcore\KVM\common\kvm_auto.h" />
+    <ClInclude Include="..\meshcore\KVM\common\kvm_stream.h" />
+    <ClInclude Include="..\meshcore\KVM\common\kvm_stdin.h" />
+    <ClInclude Include="..\meshcore\KVM\common\kvm_video_core.h" />
+    <ClInclude Include="..\meshcore\KVM\common\kvm_video_rc.h" />
+    <ClInclude Include="..\meshcore\KVM\common\kvm_sharpen.h" />
+    <ClInclude Include="..\meshcore\KVM\common\kvm_qpdet.h" />
+    <ClInclude Include="..\meshcore\KVM\common\kvm_motion.h" />
+    <ClInclude Include="..\meshcore\KVM\common\kvm_capsrc.h" />
+    <ClInclude Include="..\meshcore\KVM\common\kvm_yuv.h" />
+    <ClInclude Include="..\meshcore\KVM\common\kvm_nv12view.h" />
+    <ClInclude Include="..\meshcore\KVM\common\kvm_annexb.h" />
+    <ClInclude Include="..\meshcore\KVM\Windows\kvm_video.h" />
+    <ClInclude Include="..\meshcore\KVM\Windows\mf_h264.h" />
+    <ClInclude Include="..\meshcore\KVM\Windows\mf_h264_priv.h" />
+    <ClInclude Include="..\meshcore\KVM\Windows\kvm_encbe_mfhw.h" />
+    <ClInclude Include="..\meshcore\KVM\Windows\kvm_hwtest.h" />
+    <ClInclude Include="..\meshcore\KVM\Windows\kvm_hwtest_core.h" />
+    <ClInclude Include="..\meshcore\KVM\common\kvm_hwpolicy.h" />
+    <ClInclude Include="..\meshcore\KVM\common\kvm_synth.h" />
+    <ClInclude Include="..\meshcore\KVM\common\kvm_h264_rules.h" />
+    <ClInclude Include="..\meshcore\KVM\Windows\kvm_encthr.h" />
+    <ClInclude Include="..\meshcore\KVM\common\kvm_encjob.h" />
+    <ClInclude Include="..\meshcore\KVM\common\kvm_fbuf.h" />
     <ClInclude Include="..\meshcore\KVM\Windows\tile.h" />
     <ClInclude Include="..\meshcore\meshdefines.h" />
     <ClInclude Include="..\meshcore\meshinfo.h" />
