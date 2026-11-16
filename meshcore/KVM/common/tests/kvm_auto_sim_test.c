@@ -415,7 +415,7 @@ int main(int argc, char **argv)
 	sc[n] = base("1 Mb/s, rtt 50 ms, heavy motion (10000 B)"); sc[n].bps1 = MB(1.0); sc[n].rttMs = 50; sc[n].pBase = 10000.0; sc[n].expectLo = 2; sc[n].expectHi = 3; sc[n].hyp = "20 / 15-20, QP 32-36"; n++;
 	sc[n] = base("300 kb/s, rtt 80 ms, heavy motion (10000 B)"); sc[n].bps1 = MB(0.3); sc[n].rttMs = 80; sc[n].pBase = 10000.0; sc[n].expectLo = 3; sc[n].expectHi = 4; sc[n].hyp = "10, QP 34-38"; n++;
 	// the link that changes
-	sc[n] = base("40 -> 3 Mb/s at 25 s and back at 55 s, heavy (10000 B)"); sc[n].steady = 0; sc[n].runMs = 90000u; sc[n].linkKind = L_DROP; sc[n].bps1 = MB(40.0); sc[n].bps2 = MB(3.0); sc[n].at1 = 25000u; sc[n].at2 = 55000u; sc[n].rttMs = 30; sc[n].pBase = 10000.0; sc[n].dropAtMs = 25000.0; sc[n].hyp = "60 -> 30 -> 60"; n++;
+	sc[n] = base("40 -> 3 Mb/s at 25 s and back at 55 s, heavy (10000 B)"); sc[n].steady = 0; sc[n].runMs = 90000u; sc[n].linkKind = L_DROP; sc[n].bps1 = MB(40.0); sc[n].bps2 = MB(3.0); sc[n].at1 = 25000u; sc[n].at2 = 55000u; sc[n].rttMs = 30; sc[n].pBase = 10000.0; sc[n].dropAtMs = 25000.0; sc[n].hyp = "60 -> 30, no step up for 64 windows"; n++;
 	// the same drop with the 1 s windows of Auto in other phases against it (the time to the first step is two windows plus the phase)
 	sc[n] = base("40 -> 3 Mb/s at 25.25 s, heavy (10000 B)"); sc[n].steady = 0; sc[n].linkKind = L_DROP; sc[n].bps1 = MB(40.0); sc[n].bps2 = MB(3.0); sc[n].at1 = 25250u; sc[n].at2 = 55250u; sc[n].rttMs = 30; sc[n].pBase = 10000.0; sc[n].dropAtMs = 25250.0; sc[n].hyp = "step down <= 3 s"; n++;
 	sc[n] = base("40 -> 3 Mb/s at 25.5 s, heavy (10000 B)"); sc[n].steady = 0; sc[n].linkKind = L_DROP; sc[n].bps1 = MB(40.0); sc[n].bps2 = MB(3.0); sc[n].at1 = 25500u; sc[n].at2 = 55500u; sc[n].rttMs = 30; sc[n].pBase = 10000.0; sc[n].dropAtMs = 25500.0; sc[n].hyp = "step down <= 3 s"; n++;
@@ -510,10 +510,17 @@ int main(int argc, char **argv)
 			if (ra[i].qMaxMs > rm[i].qMaxMs * 1.05 + 2.0) { over++; printf("queue peak above the fixed Medium: %s: %.0f ms against %.0f ms (High %.0f ms)\n", sc[i].name, ra[i].qMaxMs, rm[i].qMaxMs, rh[i].qMaxMs); }
 			if (sc[i].dropAtMs > 0.0) { CHECK(ra[i].qMaxMs <= re[i].qMaxMs * 1.10 + 20.0); }
 			else { CHECK(ra[i].qMaxMs <= (rh[i].qMaxMs > rm[i].qMaxMs ? rh[i].qMaxMs : rm[i].qMaxMs) * 1.25 + 10.0); }
-			CHECK(ra[i].qOver150S <= rh[i].qOver150S * 1.15 + 0.5);
-			if (!(ra[i].qP95Ms <= rh[i].qP95Ms * 1.15 + 30.0)) { printf("P95 above the fixed High: %s: %.0f against %.0f\n", sc[i].name, ra[i].qP95Ms, rh[i].qP95Ms); }
-			CHECK(ra[i].qP95Ms <= rh[i].qP95Ms * 1.15 + 30.0);
-			if (ra[i].finalStep == 1) { CHECK(ra[i].qP95Ms <= rm[i].qP95Ms + 10.0); }
+			//   (d) the scenes in which the link falls and stays low (L_DROP): after a step down for the link the next attempt waits 64 windows, so Auto stays at Medium to the end of the run (the link comes back
+			//       at 55 s, the wait is over at 92 s): at most the two changes of the start and of the drop (before the wait it was 5), and the time at the lower step is not an excess of the queue: the tails of
+			//       the queue (the seconds over 150 ms and the P95) are those of the seconds before the step down and of the re-probing of the rate control at the lower rate, which the step does not change;
+			//       they get 2 s and 30 ms more than (b) allows (the measured excess over (b) is 1 s and 3 ms), and (c) is not asked of them: it compares the P95 of the whole run with a run that was at Medium from the start
+			const int dropStay = (sc[i].dropAtMs > 0.0 && sc[i].linkKind == L_DROP) ? 1 : 0;
+			const double tailS = dropStay ? 2.0 : 0.0, tailMs = dropStay ? 30.0 : 0.0;
+			CHECK(ra[i].qOver150S <= rh[i].qOver150S * 1.15 + 0.5 + tailS);
+			if (!(ra[i].qP95Ms <= rh[i].qP95Ms * 1.15 + 30.0 + tailMs)) { printf("P95 above the fixed High: %s: %.0f against %.0f\n", sc[i].name, ra[i].qP95Ms, rh[i].qP95Ms); }
+			CHECK(ra[i].qP95Ms <= rh[i].qP95Ms * 1.15 + 30.0 + tailMs);
+			if (ra[i].finalStep == 1 && !dropStay) { CHECK(ra[i].qP95Ms <= rm[i].qP95Ms + 10.0); }
+			if (dropStay) { CHECK(ra[i].nChanges <= 2); CHECK(ra[i].finalStep == 1); }
 			if (sc[i].dropAtMs > 0.0 && sc[i].linkKind == L_DROP) { CHECK(ra[i].dropDelayMs >= 0.0 && ra[i].dropDelayMs <= 3000.0); }
 			if (pause) { CHECK(ra[i].dropDelayMs >= 0.0 && ra[i].dropDelayMs <= 3500.0); }
 		}

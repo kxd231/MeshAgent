@@ -884,6 +884,106 @@ static void test_patience(void)
 	CHECK_EQ(winU(&a, &good), 1);
 }
 
+// a step down because of the link is not tried again sooner than KVM_AUTO_LINK_WAIT windows; a failed attempt doubles from there to the ceiling; the CPU, the capture and a ceiling from outside keep the patience they had
+static void test_link_wait(void)
+{
+	kvm_auto a;
+	kvm_auto_win good, linkBad, slow;
+	kvm_auto_env e;
+	int i;
+	CHECK_EQ(KVM_AUTO_LINK_WAIT, 64);
+	good = win_at(1, 24);
+	linkBad = win_at(1, 35);															// the QP over the ceiling of 30 frames a second
+	slow = win_at(0, 26); slow.made = 40; slow.pendingIters = 40; slow.qpN = 40; slow.qpSum = 40u * 26u;	// 40 frames a second at 60: the machine
+	// the first step down is the link (the patience was 4): the next attempt is the 64th good window, not the 4th
+	begin(&a, 1);
+	CHECK_EQ((int)a.upNeed, 4);
+	CHECK_EQ(winU(&a, &linkBad), 0); CHECK_EQ(winU(&a, &linkBad), 1);
+	CHECK_EQ((int)a.step, 2); CHECK_EQ(gD.reason, KVM_AUTO_R_LINK); CHECK_EQ((int)a.upNeed, KVM_AUTO_LINK_WAIT);
+	good = win_at(2, 26);
+	for (i = 0; i < KVM_AUTO_LINK_WAIT - 1; i++) { CHECK_EQ(winU(&a, &good), 0); }
+	CHECK_EQ((int)a.goodStreak, KVM_AUTO_LINK_WAIT - 1); CHECK_EQ((int)a.step, 2);
+	CHECK_EQ(winU(&a, &good), 1); CHECK_EQ((int)a.step, 1); CHECK_EQ(gD.reason, KVM_AUTO_R_BACK);
+	// that attempt fails (the link queues again): down within 10 s, the wait is 64 * 2 capped at 120, and it is 120 from then on
+	linkBad = win_at(1, 35);
+	CHECK_EQ(winU(&a, &linkBad), 0); CHECK_EQ(winU(&a, &linkBad), 1);
+	CHECK_EQ((int)a.step, 2); CHECK_EQ(gD.reason, KVM_AUTO_R_LINK); CHECK_EQ((int)a.upNeed, KVM_AUTO_UP_MAX);
+	for (i = 0; i < KVM_AUTO_UP_MAX - 1; i++) { CHECK_EQ(winU(&a, &good), 0); }
+	CHECK_EQ(winU(&a, &good), 1); CHECK_EQ((int)a.step, 1);
+	CHECK_EQ(winU(&a, &linkBad), 0); CHECK_EQ(winU(&a, &linkBad), 1);
+	CHECK_EQ((int)a.upNeed, KVM_AUTO_UP_MAX);
+	// the wait is a floor, not a reset: a patience that is above it stays (nothing here shortens it)
+	begin(&a, 1);
+	a.upNeed = 100;
+	CHECK_EQ(winU(&a, &linkBad), 0); CHECK_EQ(winU(&a, &linkBad), 1); CHECK_EQ((int)a.upNeed, 100);
+	// a step up that held for 60 s gives the first patience back, also after a wait for the link
+	begin(&a, 1);
+	CHECK_EQ(winU(&a, &linkBad), 0); CHECK_EQ(winU(&a, &linkBad), 1); CHECK_EQ((int)a.upNeed, KVM_AUTO_LINK_WAIT);
+	for (i = 0; i < KVM_AUTO_LINK_WAIT - 1; i++) { CHECK_EQ(winU(&a, &good), 0); }
+	CHECK_EQ(winU(&a, &good), 1); CHECK_EQ((int)a.step, 1);
+	{ kvm_auto_win held = win_at(1, 29); for (i = 0; i < 59; i++) { (void)winU(&a, &held); } CHECK_EQ((int)a.upNeed, KVM_AUTO_LINK_WAIT); (void)winU(&a, &held); CHECK_EQ((int)a.upNeed, KVM_AUTO_UP_WINDOWS); }
+	// the machine: a step down for the CPU or the capture keeps the first patience (4 windows), also in the same run that has the link in it
+	begin(&a, 0);
+	CHECK_EQ(winU(&a, &slow), 0); CHECK_EQ(winU(&a, &slow), 1);
+	CHECK(gD.reason == KVM_AUTO_R_CPU || gD.reason == KVM_AUTO_R_CAPTURE); CHECK_EQ((int)a.upNeed, KVM_AUTO_UP_WINDOWS);
+	good = win_at(a.step, 24);
+	for (i = 0; i < KVM_AUTO_UP_WINDOWS - 1; i++) { CHECK_EQ(winU(&a, &good), 0); }
+	CHECK_EQ(winU(&a, &good), 1); CHECK_EQ(gD.reason, KVM_AUTO_R_BACK);
+	begin(&a, 0);
+	{ kvm_auto_win cap = win_at(0, 26); cap.capP75Ms = 30; cap.made = 50; cap.pendingIters = 50; cap.qpN = 50; cap.qpSum = 50u * 26u;
+	  CHECK_EQ(winU(&a, &cap), 0); CHECK_EQ(winU(&a, &cap), 1); CHECK_EQ(gD.reason, KVM_AUTO_R_CAPTURE); CHECK_EQ((int)a.upNeed, KVM_AUTO_UP_WINDOWS); }
+	// a ceiling from outside (the screen, the battery saver, the budget) is no link either
+	begin(&a, 0);
+	e = env_at(gT + 10); e.maxFps = 30; e.maxReason = KVM_AUTO_R_SCREEN;
+	CHECK_EQ(kvm_auto_decide(&a, NULL, &e, &gD), 1); CHECK_EQ((int)a.upNeed, KVM_AUTO_UP_WINDOWS);
+	// a failed attempt after a step down for the machine doubles as before: 4 -> 8 (the link wait does not apply)
+	begin(&a, 1);
+	good = win_at(1, 24); slow = win_at(0, 26); slow.made = 40; slow.pendingIters = 40; slow.qpN = 40; slow.qpSum = 40u * 26u;
+	for (i = 0; i < 3; i++) { CHECK_EQ(winU(&a, &good), 0); }
+	CHECK_EQ(winU(&a, &good), 1); CHECK_EQ(winU(&a, &slow), 0); CHECK_EQ(winU(&a, &slow), 1);
+	CHECK_EQ((int)a.upNeed, 8);
+}
+
+// the case that was measured in the browser (a link of 3 Mb/s that is full at 30 frames a second, a queue of 160-180 ms every few seconds, quiet at 20): the patience of 4 and then 8 windows took the step
+// up after 5 s and 9 s and down again each time, 5 changes in 23 s. A scene of a minute at a time: in no 60 s more than 2 changes, the first step down is the link, the waits between the attempts do
+// not shrink, and in 10 minutes few changes
+static void test_link_trace(void)
+{
+	static const double lagPer2s[15] = { 98.1, 67.4, 66.6, 163.2, 164.7, 82, 67, 66.8, 67.4, 67.1, 51, 182.6, 58.3, 89.2, 58.5 };
+	kvm_auto a;
+	uint32_t tc[64], tu[64];
+	int nc = 0, nu = 0, firstLink = 0, i, j, c, mx = 0;
+	begin(&a, 1);
+	for (i = 0; i < 600; i++)
+	{
+		const int spike = lagPer2s[(i / 2) % 15] > 150.0;
+		const int step = a.step;
+		kvm_auto_win w;
+		if (step >= 2) { w = win_at(step, 26); }										// 20 frames a second and slower: the queue is gone
+		else if (spike) { w = win_at(step, 35); }										// the QP of the regulator over the ceiling: the link queues
+		else { w = win_at(step, 29); }													// between the spikes: nothing against staying, not enough room for the faster step
+		if (winU(&a, &w) && nc < 64)
+		{
+			tc[nc] = (uint32_t)i;
+			if (nc == 0) { firstLink = gD.reason == KVM_AUTO_R_LINK; }
+			if (gD.reason == KVM_AUTO_R_BACK && nu < 64) { tu[nu++] = (uint32_t)i; }
+			nc++;
+		}
+	}
+	CHECK(nc < 64);
+	CHECK(firstLink);
+	for (i = 0; i < nc; i++)
+	{
+		c = 0;
+		for (j = 0; j < nc; j++) { if (tc[j] >= tc[i] && tc[j] < tc[i] + 60u) { c++; } }
+		if (c > mx) { mx = c; }
+	}
+	CHECK(mx <= 2);
+	for (i = 2; i < nu; i++) { CHECK((int)(tu[i] - tu[i - 1]) >= (int)(tu[i - 1] - tu[i - 2]) - 15); }		// the wait does not shrink (64, then 120 windows)
+	CHECK(nc <= 14);
+	CHECK(nu >= 1 && tu[0] >= 64u);																				// the first attempt is not before the 64th window
+}
+
 // a ceiling from outside
 static void test_ceiling(void)
 {
@@ -1422,6 +1522,8 @@ int main(void)
 	test_up();
 	test_timing();
 	test_patience();
+	test_link_wait();
+	test_link_trace();
 	test_ceiling();
 	test_tick();
 	test_tick_decides();

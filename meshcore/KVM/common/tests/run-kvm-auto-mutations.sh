@@ -41,6 +41,12 @@ kvm_auto.c @@ if (env->maxFps > 0 && nfps > env->maxFps) { ok = 0; } @@ if (0) {
 kvm_auto.c @@ if (a->goodStreak >= a->upNeed && (!a->haveChange @@ if (a->goodStreak > a->upNeed && (!a->haveChange @@ up: one more window than the patience
 kvm_auto.c @@ uint32_t n = a->upNeed * 2u; @@ uint32_t n = a->upNeed * 3u; @@ patience: it triples
 kvm_auto.c @@ a->upNeed = n > (uint32_t)KVM_AUTO_UP_MAX ? (uint32_t)KVM_AUTO_UP_MAX : n; @@ a->upNeed = n; @@ patience: no maximum
+kvm_auto.c @@ if (reason == KVM_AUTO_R_LINK && a->upNeed < (uint32_t)KVM_AUTO_LINK_WAIT) @@ if (0 && a->upNeed < (uint32_t)KVM_AUTO_LINK_WAIT) @@ link: a step down for the link has no wait of its own
+kvm_auto.c @@ if (reason == KVM_AUTO_R_LINK && a->upNeed < (uint32_t)KVM_AUTO_LINK_WAIT) @@ if (a->upNeed < (uint32_t)KVM_AUTO_LINK_WAIT) @@ link: every step down waits, the CPU and a ceiling from outside too
+kvm_auto.c @@ if (reason == KVM_AUTO_R_LINK && a->upNeed < (uint32_t)KVM_AUTO_LINK_WAIT) @@ if (reason != KVM_AUTO_R_CPU && a->upNeed < (uint32_t)KVM_AUTO_LINK_WAIT) @@ link: the capture waits as the link does
+kvm_auto.c @@ if (reason == KVM_AUTO_R_LINK && a->upNeed < (uint32_t)KVM_AUTO_LINK_WAIT) @@ if (reason == KVM_AUTO_R_LINK) @@ link: the wait replaces a patience that is longer
+kvm_auto.c @@ if (reason == KVM_AUTO_R_LINK && a->upNeed < (uint32_t)KVM_AUTO_LINK_WAIT) { a->upNeed = (uint32_t)KVM_AUTO_LINK_WAIT; } @@ if (reason == KVM_AUTO_R_LINK && a->upNeed < (uint32_t)KVM_AUTO_LINK_WAIT) { a->upNeed = (uint32_t)KVM_AUTO_LINK_WAIT - 1u; } @@ link: the wait is one window short
+kvm_auto.h @@ #define KVM_AUTO_LINK_WAIT 64 @@ #define KVM_AUTO_LINK_WAIT 32 @@ link: the wait is 32 windows
 kvm_auto.c @@ 		a->haveUp = 0;\n		a->downs++; @@ 		a->downs++; @@ patience: a second down counts for the same up
 kvm_auto.c @@ if (pending == 0) { a->haveCap = 0; a->haveImage = 0; return; } @@ if (pending == 0) { a->haveCap = 0; return; } @@ images: a gap is measured across a break of the series
 kvm_auto.c @@ if (pending == 0) { a->haveCap = 0; a->haveImage = 0; return; } @@ if (pending == 0) { a->haveImage = 0; return; } @@ images: the capture of an image without motion is counted for the next one
