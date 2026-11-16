@@ -47,6 +47,8 @@ kvm_auto.c @@ if (reason == KVM_AUTO_R_LINK && a->upNeed < (uint32_t)KVM_AUTO_LI
 kvm_auto.c @@ if (reason == KVM_AUTO_R_LINK && a->upNeed < (uint32_t)KVM_AUTO_LINK_WAIT) @@ if (reason == KVM_AUTO_R_LINK) @@ link: the wait replaces a patience that is longer
 kvm_auto.c @@ if (reason == KVM_AUTO_R_LINK && a->upNeed < (uint32_t)KVM_AUTO_LINK_WAIT) { a->upNeed = (uint32_t)KVM_AUTO_LINK_WAIT; } @@ if (reason == KVM_AUTO_R_LINK && a->upNeed < (uint32_t)KVM_AUTO_LINK_WAIT) { a->upNeed = (uint32_t)KVM_AUTO_LINK_WAIT - 1u; } @@ link: the wait is one window short
 kvm_auto.h @@ #define KVM_AUTO_LINK_WAIT 64 @@ #define KVM_AUTO_LINK_WAIT 32 @@ link: the wait is 32 windows
+kvm_auto.c @@ if (reason == KVM_AUTO_R_LINK && a->upNeed < (uint32_t)KVM_AUTO_LINK_WAIT) @@ else if (reason == KVM_AUTO_R_LINK && a->upNeed < (uint32_t)KVM_AUTO_LINK_WAIT) @@ link: a step down that ends a failed attempt only doubles, the wait comes after the doubling
+kvm_auto.c @@ if (reason == KVM_AUTO_R_LINK && a->upNeed < (uint32_t)KVM_AUTO_LINK_WAIT) @@ if ((reason == KVM_AUTO_R_LINK || reason == KVM_AUTO_R_CPU) && a->upNeed < (uint32_t)KVM_AUTO_LINK_WAIT) @@ link: a step down for the CPU waits as the link does
 kvm_auto.c @@ 		a->haveUp = 0;\n		a->downs++; @@ 		a->downs++; @@ patience: a second down counts for the same up
 kvm_auto.c @@ if (pending == 0) { a->haveCap = 0; a->haveImage = 0; return; } @@ if (pending == 0) { a->haveCap = 0; return; } @@ images: a gap is measured across a break of the series
 kvm_auto.c @@ if (pending == 0) { a->haveCap = 0; a->haveImage = 0; return; } @@ if (pending == 0) { a->haveImage = 0; return; } @@ images: the capture of an image without motion is counted for the next one

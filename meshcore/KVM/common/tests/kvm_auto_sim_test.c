@@ -510,12 +510,14 @@ int main(int argc, char **argv)
 			if (ra[i].qMaxMs > rm[i].qMaxMs * 1.05 + 2.0) { over++; printf("queue peak above the fixed Medium: %s: %.0f ms against %.0f ms (High %.0f ms)\n", sc[i].name, ra[i].qMaxMs, rm[i].qMaxMs, rh[i].qMaxMs); }
 			if (sc[i].dropAtMs > 0.0) { CHECK(ra[i].qMaxMs <= re[i].qMaxMs * 1.10 + 20.0); }
 			else { CHECK(ra[i].qMaxMs <= (rh[i].qMaxMs > rm[i].qMaxMs ? rh[i].qMaxMs : rm[i].qMaxMs) * 1.25 + 10.0); }
-			//   (d) the scenes in which the link falls and stays low (L_DROP): after a step down for the link the next attempt waits 64 windows, so Auto stays at Medium to the end of the run (the link comes back
-			//       at 55 s, the wait is over at 92 s): at most the two changes of the start and of the drop (before the wait it was 5), and the time at the lower step is not an excess of the queue: the tails of
-			//       the queue (the seconds over 150 ms and the P95) are those of the seconds before the step down and of the re-probing of the rate control at the lower rate, which the step does not change;
-			//       they get 2 s and 30 ms more than (b) allows (the measured excess over (b) is 1 s and 3 ms), and (c) is not asked of them: it compares the P95 of the whole run with a run that was at Medium from the start
+			//   (d) the scenes in which the link falls (L_DROP): after a step down for the link the next attempt needs 64 good windows in a row (the series starts when the queue has settled, about 60 s into the
+			//       run, so the step up is not before about 125 s: Auto stays at Medium to the end of the run, also after the link is back at 55 s). At most the two changes of the start and of the drop (with the
+			//       patience of 4 and 8 windows it was 5), and the final step is Medium. The tails of the queue (the seconds over 150 ms and the P95) are 1 - 2 s and a few ms longer than (b) allows: the rate
+			//       control raises R about 10 % above the link each time the queue has drained (at 30 frames a second, QP 26, the heavy content is that much over 3 Mb/s) and the queue creeps for 3 - 5 s until R
+			//       falls again; the old patience cut that short by accident, with a failed step up at 35 s that overloaded the link and brought R down. They get 1.5 s and 10 ms more than (b) allows (the
+			//       measured excess over (b) is 1 s and 3 ms). (c) is not asked of these scenes: it compares the P95 of the whole run with a run that was at Medium from the start, and Auto was at 60 when the link fell
 			const int dropStay = (sc[i].dropAtMs > 0.0 && sc[i].linkKind == L_DROP) ? 1 : 0;
-			const double tailS = dropStay ? 2.0 : 0.0, tailMs = dropStay ? 30.0 : 0.0;
+			const double tailS = dropStay ? 1.5 : 0.0, tailMs = dropStay ? 10.0 : 0.0;
 			CHECK(ra[i].qOver150S <= rh[i].qOver150S * 1.15 + 0.5 + tailS);
 			if (!(ra[i].qP95Ms <= rh[i].qP95Ms * 1.15 + 30.0 + tailMs)) { printf("P95 above the fixed High: %s: %.0f against %.0f\n", sc[i].name, ra[i].qP95Ms, rh[i].qP95Ms); }
 			CHECK(ra[i].qP95Ms <= rh[i].qP95Ms * 1.15 + 30.0 + tailMs);

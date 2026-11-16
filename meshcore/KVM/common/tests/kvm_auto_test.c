@@ -888,7 +888,7 @@ static void test_patience(void)
 static void test_link_wait(void)
 {
 	kvm_auto a;
-	kvm_auto_win good, linkBad, slow;
+	kvm_auto_win good, linkBad, slow, w;
 	kvm_auto_env e;
 	int i;
 	CHECK_EQ(KVM_AUTO_LINK_WAIT, 64);
@@ -922,7 +922,7 @@ static void test_link_wait(void)
 	for (i = 0; i < KVM_AUTO_LINK_WAIT - 1; i++) { CHECK_EQ(winU(&a, &good), 0); }
 	CHECK_EQ(winU(&a, &good), 1); CHECK_EQ((int)a.step, 1);
 	{ kvm_auto_win held = win_at(1, 29); for (i = 0; i < 59; i++) { (void)winU(&a, &held); } CHECK_EQ((int)a.upNeed, KVM_AUTO_LINK_WAIT); (void)winU(&a, &held); CHECK_EQ((int)a.upNeed, KVM_AUTO_UP_WINDOWS); }
-	// the machine: a step down for the CPU or the capture keeps the first patience (4 windows), also in the same run that has the link in it
+	// the machine: a step down for the CPU or the capture keeps the first patience (4 windows)
 	begin(&a, 0);
 	CHECK_EQ(winU(&a, &slow), 0); CHECK_EQ(winU(&a, &slow), 1);
 	CHECK(gD.reason == KVM_AUTO_R_CPU || gD.reason == KVM_AUTO_R_CAPTURE); CHECK_EQ((int)a.upNeed, KVM_AUTO_UP_WINDOWS);
@@ -932,6 +932,23 @@ static void test_link_wait(void)
 	begin(&a, 0);
 	{ kvm_auto_win cap = win_at(0, 26); cap.capP75Ms = 30; cap.made = 50; cap.pendingIters = 50; cap.qpN = 50; cap.qpSum = 50u * 26u;
 	  CHECK_EQ(winU(&a, &cap), 0); CHECK_EQ(winU(&a, &cap), 1); CHECK_EQ(gD.reason, KVM_AUTO_R_CAPTURE); CHECK_EQ((int)a.upNeed, KVM_AUTO_UP_WINDOWS); }
+	// the order is the doubling first and the wait after it: an attempt with the first patience (4) that ends in a step down for the link ends at 64, not at the doubled 8
+	begin(&a, 1);
+	good = win_at(1, 24);
+	for (i = 0; i < KVM_AUTO_UP_WINDOWS - 1; i++) { CHECK_EQ(winU(&a, &good), 0); }
+	CHECK_EQ(winU(&a, &good), 1); CHECK_EQ((int)a.step, 0); CHECK_EQ((int)a.upNeed, KVM_AUTO_UP_WINDOWS);
+	linkBad = win_at(0, 35);															// the QP over the ceiling of 60 frames a second
+	CHECK_EQ(winU(&a, &linkBad), 0); CHECK_EQ(winU(&a, &linkBad), 1);
+	CHECK_EQ((int)a.step, 1); CHECK_EQ(gD.reason, KVM_AUTO_R_LINK); CHECK_EQ((int)a.upNeed, KVM_AUTO_LINK_WAIT);
+	// a step down for the CPU (the cost the budget of the encoder needs does not fit the interval) is a step down for the machine: the first patience stays, and the next attempt is the 4th good window
+	begin(&a, 0);
+	e = env_at(0); e.floorMs = 20;
+	w = win_at(0, 26);
+	CHECK_EQ(win(&a, &w, e), 0); CHECK_EQ(win(&a, &w, e), 1);
+	CHECK_EQ(gD.reason, KVM_AUTO_R_CPU); CHECK((int)a.step >= 1); CHECK_EQ((int)a.upNeed, KVM_AUTO_UP_WINDOWS);
+	good = win_at(a.step, 24);
+	for (i = 0; i < KVM_AUTO_UP_WINDOWS - 1; i++) { CHECK_EQ(winU(&a, &good), 0); }
+	CHECK_EQ(winU(&a, &good), 1); CHECK_EQ(gD.reason, KVM_AUTO_R_BACK);
 	// a ceiling from outside (the screen, the battery saver, the budget) is no link either
 	begin(&a, 0);
 	e = env_at(gT + 10); e.maxFps = 30; e.maxReason = KVM_AUTO_R_SCREEN;
