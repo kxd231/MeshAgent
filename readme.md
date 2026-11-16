@@ -56,9 +56,9 @@ software. The agent uses it when it can:
    same session and remembers the problem. After repeated problems it stops using the graphics card on that
    computer, so a bad driver is not tried again and again.
 
-Tested so far on AMD (a laptop) and NVIDIA (GeForce RTX 2060 SUPER) graphics. **Intel graphics have not been
-tested yet**: the self test decides there too, and the expected worst case is that the graphics card is not used
-and the software encoder does the work.
+Tested on AMD (a laptop) and NVIDIA (GeForce RTX 2060 SUPER) graphics. Intel graphics were tried on one computer
+and worked; they are less tested than the other two. The self test decides on every computer, and the worst case
+is that the graphics card is not used and the software encoder does the work.
 
 ### Auto frame rate
 
@@ -69,9 +69,9 @@ what it receives.
 
 ### Known limits
 
-- Intel graphics encoders are not tested (see above).
+- Intel graphics encoders are less tested than AMD and NVIDIA (see above).
 - On NVIDIA the first full picture after a pause can be large, so it takes a moment longer on a slow link.
-- After a short drop of the network, Auto can try a higher frame rate again a little too soon.
+- After a step down because of the link, Auto waits about a minute before it tries a higher frame rate again.
 - H.264 is only in the Windows x64 agent. Linux is planned; other agents keep JPEG.
 - Windows N editions need the Media Feature Pack for H.264.
 
