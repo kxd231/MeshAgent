@@ -16,7 +16,9 @@ Rules, for a window of one second that holds at least 300 ms of motion (a window
                frames held back"; the simulation shows why that cannot stand: the QP regulator raises the QP until the frames are no longer refused, so a QP above the ceiling and refusals do not
                coexist in a steady state (at 3 Mb/s the QP sits at 34 with nothing refused for a minute), and a fall of the link is seen after 5 s. Instead the refusals count as a prediction: the QP
                that the regulator is about to ask for (the frames that are due and refused would need that many more bytes, 11 % per QP step) is added to the QP of the moment (kvm_auto_pred).
-  up           `upNeed` (4, then 8, 16, 32, 64, 120 after a failed attempt, back to 4 when a step up has held for 60 s) evaluated windows in a row in which the QP of the motion is at most the ceiling of the
+  up           `upNeed` (4, then 8, 16, 32, 64, 120 after a failed attempt, back to 4 when a step up has held for 60 s; after a step down because of the link at least 64, so the next attempt
+               is no sooner than 64 evaluated windows and a failed one doubles from there to 120: the patience of 4 and 8 windows made 5 changes in 23 s on a link that queues at the faster step;
+               the steps down for the CPU and the capture keep the patience they had) evaluated windows in a row in which the QP of the motion is at most the ceiling of the
                faster step less 1 when the regulator is predicted to ask for that QP at the faster rate (its floor and the use of R count), under 5 % of the frames held back, under 100 ms in flight
                at the link, the machine does not limit, the frames of the current step are made (85 %), and the cost (capture, encode, the CPU budget) fits the faster step by the same rule as staying
                (4/3 of its interval, counted from 1000 / frames a second): one step. The attempt is judged by what it achieves: the achieved rate at the faster step. No step within 2 s of the previous
@@ -87,6 +89,9 @@ extern "C" {
 #endif
 #ifndef KVM_AUTO_UP_MAX
 #define KVM_AUTO_UP_MAX 120				// (T) the patience grows 4, 8, 16, 32, 64, 120 after a failed attempt
+#endif
+#ifndef KVM_AUTO_LINK_WAIT
+#define KVM_AUTO_LINK_WAIT 64			// (T) a step down because of the link is not tried again sooner than this many evaluated windows: a link that queued at that step queues again at once; a failed attempt doubles from here, to KVM_AUTO_UP_MAX
 #endif
 #ifndef KVM_AUTO_FAIL_MS
 #define KVM_AUTO_FAIL_MS 10000			// (T) a step down this soon after a step up is a failed attempt

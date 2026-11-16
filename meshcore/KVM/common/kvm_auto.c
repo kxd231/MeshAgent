@@ -248,6 +248,8 @@ static void set_step(kvm_auto *a, int to, int reason, uint32_t now, kvm_auto_dec
 			uint32_t n = a->upNeed * 2u;
 			a->upNeed = n > (uint32_t)KVM_AUTO_UP_MAX ? (uint32_t)KVM_AUTO_UP_MAX : n;
 		}
+		// the link queued at this step and queues again at once: the next attempt waits (the CPU and the capture keep the patience they had)
+		if (reason == KVM_AUTO_R_LINK && a->upNeed < (uint32_t)KVM_AUTO_LINK_WAIT) { a->upNeed = (uint32_t)KVM_AUTO_LINK_WAIT; }
 		a->haveUp = 0;
 		a->downs++;
 	}
