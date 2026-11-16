@@ -42,10 +42,7 @@ stays blurry. The aim is smooth motion on slow links at the same or lower bandwi
 - If anything goes wrong (the agent cannot encode, the browser cannot decode or keep up) the session continues
   in JPEG and the browser shows why.
 
-### The graphics card does the work
-
-Most graphics cards have a built-in video encoder that is much lighter on the processor than encoding in
-software. The agent uses it when it can:
+### Hardware Encoder
 
 1. The first time a computer is asked for video, the session starts with the software encoder and, in the
    background, the agent runs a short self test of the graphics card encoder in a separate process. Nobody sees
@@ -68,10 +65,6 @@ the link is the limit and goes up again carefully. With JPEG, or with an older a
 what it receives.
 
 ### Known limits
-
-- Intel graphics encoders are less tested than AMD and NVIDIA (see above).
-- On NVIDIA the first full picture after a pause can be large, so it takes a moment longer on a slow link.
-- After a step down because of the link, Auto waits about a minute before it tries a higher frame rate again.
 - H.264 is only in the Windows x64 agent. Linux is planned; other agents keep JPEG.
 - Windows N editions need the Media Feature Pack for H.264.
 
