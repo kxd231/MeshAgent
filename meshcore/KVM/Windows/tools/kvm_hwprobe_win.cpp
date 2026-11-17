@@ -1824,6 +1824,7 @@ static void qpmid_candidate(const Cand &c, bool full)
 
 struct BenchArg
 {
+	bool fineClock;		// the system clock had the resolution of 1 ms (timeBeginPeriod(1), as the KVM session has it) when the run was made
 	Cand c;
 	int w, h, content, qp;
 	bool d3d;
@@ -1831,6 +1832,19 @@ struct BenchArg
 	double endMs;
 	std::string label;
 };
+
+// The resolution of the system clock (winmm.dll is loaded at run time, nothing is added to the import table): the session has 1 ms (kvm.c: timeBeginPeriod(1) around its loop), the benchmark has it as well, and one
+// run of the first encoder at the default resolution (the tick of 15.6 ms) shows what the clock does to the latency of the encoder.
+static bool g_clockFine = false;
+static void probe_clock(bool fine)
+{
+	typedef unsigned int (WINAPI *tp_fn)(unsigned int);
+	HMODULE m = GetModuleHandleW(L"winmm.dll");
+	if (m == NULL) { m = LoadLibraryA("winmm.dll"); }
+	if (m == NULL) { return; }
+	if (fine && !g_clockFine) { tp_fn f = (tp_fn)GetProcAddress(m, "timeBeginPeriod"); if (f != NULL && f(1) == 0) { g_clockFine = true; } }
+	else if (!fine && g_clockFine) { tp_fn f = (tp_fn)GetProcAddress(m, "timeEndPeriod"); if (f != NULL) { f(1); } g_clockFine = false; }
+}
 
 static const char *content_label(int k) { return hw_content_name(k); }
 
@@ -1861,7 +1875,7 @@ static void stage_bench_run(void *p)
 	char sz[32], cz[32];
 	_snprintf(sz, sizeof(sz), "%dx%d", a->w, a->h);
 	_snprintf(cz, sizeof(cz), "%dx%d", cw, chh);
-	o.str("key", c.key).str("name", c.name).str("size", sz).str("coded", cz).str("content", content_label(a->content)).str("mode", mode_id(ch.mode)).b("mode_effective", ch.effective).b("d3d_manager", a->d3d).str("label", a->label);
+	o.str("key", c.key).str("name", c.name).str("size", sz).str("coded", cz).str("content", content_label(a->content)).str("mode", mode_id(ch.mode)).b("mode_effective", ch.effective).b("d3d_manager", a->d3d).str("clock", a->fineClock ? "1 ms (timeBeginPeriod)" : "default (system tick)").str("label", a->label);
 	if (gen == NULL) { o.str("error", "pictures"); g_doc.append("bench", o.done()); g_failed++; delete a; return; }
 	EncCfg cfg;
 	cfg.w = cw; cfg.h = chh; cfg.mode = ch.mode; cfg.qp = a->qp; cfg.d3d = a->d3d; cfg.level = mfh264_level_for_size(cw, chh);
@@ -1969,10 +1983,10 @@ static void bench_one(const Cand &c, int w, int h, int content, int qp, bool d3d
 		}
 	}
 	BenchArg *a = new BenchArg;
-	a->c = c; a->w = w; a->h = h; a->content = content; a->qp = qp; a->d3d = d3d; a->frames = g_cfg.frames;
+	a->c = c; a->w = w; a->h = h; a->content = content; a->qp = qp; a->d3d = d3d; a->frames = g_cfg.frames; a->fineClock = g_clockFine;
 	a->endMs = std::min(hw_now_ms() + 25000.0, benchEnd);
 	char lab[96];
-	_snprintf(lab, sizeof(lab), "%dx%d %s QP%d%s", w, h, content_label(content), qp, d3d ? " +D3D" : "");
+	_snprintf(lab, sizeof(lab), "%dx%d %s QP%d%s%s", w, h, content_label(content), qp, d3d ? " +D3D" : "", g_clockFine ? "" : " [default clock]");
 	a->label = lab;
 	char stage[128];
 	_snprintf(stage, sizeof(stage), "bench %s %s", c.key.c_str(), lab);
@@ -1993,6 +2007,13 @@ static void run_bench(double benchEnd)
 	for (size_t i = 0; i < list.size(); i++)
 	{
 		if (haveHw && !g_hwTainted) { bench_one(g_hwCands[(size_t)g_cfg.candidate], list[i].w, list[i].h, list[i].content, list[i].qp, false, benchEnd); }
+		if (i == 0 && haveHw && !g_hwTainted && g_clockFine)
+		{
+			// the same run once more with the default resolution of the clock (the first hardware encoder only)
+			probe_clock(false);
+			bench_one(g_hwCands[(size_t)g_cfg.candidate], list[i].w, list[i].h, list[i].content, list[i].qp, false, benchEnd);
+			probe_clock(true);
+		}
 		if (g_haveSw && !g_cfg.noSoftware) { bench_one(g_swCand, list[i].w, list[i].h, list[i].content, list[i].qp, false, benchEnd); }
 		if (i == 0 && haveHw && !g_hwTainted && !g_cfg.noD3d)
 		{
@@ -2248,11 +2269,13 @@ int hwprobe_main(int argc, char **argv)
 		hw_say("kvm_h264_check --hw: MFStartup failed\n%s\n", JObj().str("kind", "hwprobe").b("incomplete", true).str("error", "MFStartup failed").done().c_str());
 		return 2;
 	}
+	probe_clock(true);
 	CreateThread(NULL, 0, watchdog_thread, NULL, 0, NULL);
 	{
 		JObj m;
 		m.str("tool", "kvm_h264_check --hw").str("stages", stages).i("max_seconds", g_cfg.totalS).i("frames_per_run", g_cfg.frames).i("candidate", g_cfg.candidate).b("software_comparison", !g_cfg.noSoftware).b("d3d_variant", !g_cfg.noD3d);
 		m.str("note", "synthetic NV12 pictures in system memory, no capture, no desktop, no KVM session");
+		m.str("clock", g_clockFine ? "1 ms (timeBeginPeriod(1)) for every run, except one run of the first hardware encoder with the default resolution (label [default clock])" : "default (timeBeginPeriod was not available)");
 		g_doc.set("meta", m.done());
 	}
 	hw_say("kvm_h264_check --hw %s: total limit %d s, %d pictures per run, output in %s\n", stages.c_str(), g_cfg.totalS, g_cfg.frames, g_cfg.outDir.c_str());
