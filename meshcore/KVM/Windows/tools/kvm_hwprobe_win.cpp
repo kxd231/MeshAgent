@@ -928,6 +928,10 @@ struct RunRes
 	bool timedOut, drained, drainTimedOut;
 	double wallMs, cpuMs, sourceMs;
 	std::vector<HRESULT> changeHr;
+	int haveBeforeInput = 0;		// HaveOutput events that came before the first input
+	int scEvent = 0, scNoEvent = 0, scNeedWait = 0;	// stream changes followed by a new HaveOutput / by none within 500 ms (then one call without it); NeedInput events that came while it waited
+	double scWaitMax = 0;		// the longest wait for that HaveOutput, ms
+	HRESULT scSetHr = S_OK; int scTypeIdx = -1, scTypeN = 0; std::string scSubtype;	// what the last stream change chose and how SetOutputType answered
 	RunRes() : submitted(0), streamChanges(0), needInput(0), haveOutput(0), notAccepting(0), ptsMismatch(0), maxInflight(0), forceOutIndex(-1), err(S_OK), forceHr(S_OK), timedOut(false), drained(false), drainTimedOut(false), wallMs(0), cpuMs(0), sourceMs(0) {}
 };
 
@@ -943,6 +947,9 @@ public:
 	void run(const RunReq &rq, RunRes *res);
 	std::string steps_json() const;
 	std::string api_json() const;
+	HRESULT scSetHr = S_OK;		// the result of SetOutputType at the last stream change (E_FAIL: no H.264 type among the available ones)
+	int scTypeIdx = -1, scTypeN = 0;	// the available output type that was chosen (the first with the subtype H.264) and how many the MFT lists
+	std::string scSubtype;		// the subtype of the chosen type
 
 	IMFActivate *act; IMFTransform *mft; ICodecAPI *api; IMFMediaEventGenerator *gen; EventPump *pump;
 	ID3D11Device *dev; IMFDXGIDeviceManager *mgr;
@@ -1320,7 +1327,7 @@ void Enc::close()
 // ---------------------------------------------------------------------------------------------------------------------- driving the encoder
 
 // One call of ProcessOutput. *got = 1 and the access unit in *data when a sample came out (all parts of an incomplete output joined). MF_E_TRANSFORM_STREAM_CHANGE is followed here
-// (the new output type is taken from the encoder's first available type) and returned so that the caller counts it (an asynchronous MFT used the event of the output up for it: the caller waits for the next HaveOutput; a
+// (the new output type is the first available type with the subtype H.264) and returned so that the caller counts it (an asynchronous MFT used the event of the output up for it: the caller waits for the next HaveOutput; a
 // synchronous one is asked again); MF_E_TRANSFORM_NEED_MORE_INPUT means nothing is ready.
 HRESULT Enc::pull_one(std::vector<uint8_t> *data, OutRec *rec, bool *got)
 {
@@ -1353,10 +1360,22 @@ HRESULT Enc::pull_one(std::vector<uint8_t> *data, OutRec *rec, bool *got)
 		if (hr == MF_E_TRANSFORM_STREAM_CHANGE)
 		{
 			if (provides && db.pSample != NULL) { db.pSample->Release(); }
+			// the first available type with the subtype H.264 (an MFT may list another subtype first or as well)
 			IMFMediaType *t = NULL;
-			HRESULT h2 = mft->GetOutputAvailableType(outId, 0, &t);
-			if (SUCCEEDED(h2) && t != NULL) { h2 = mft->SetOutputType(outId, t, 0); t->Release(); }
-			steps.push_back(std::make_pair(std::string("STREAM_CHANGE: SetOutputType(first available type)"), h2));
+			HRESULT h2 = E_FAIL;
+			scTypeIdx = -1; scTypeN = 0; scSubtype.clear();
+			for (int ti = 0; ti < 32; ti++)
+			{
+				IMFMediaType *c = NULL;
+				GUID sub;
+				if (FAILED(mft->GetOutputAvailableType(outId, (DWORD)ti, &c)) || c == NULL) { break; }
+				scTypeN++;
+				if (t == NULL && SUCCEEDED(c->GetGUID(MF_MT_SUBTYPE, &sub)) && memcmp(&sub, &MFVideoFormat_H264, sizeof(GUID)) == 0) { t = c; scTypeIdx = ti; scSubtype = subtype_name(sub); }
+				else { c->Release(); }
+			}
+			if (t != NULL) { h2 = mft->SetOutputType(outId, t, 0); t->Release(); }
+			scSetHr = h2;
+			steps.push_back(std::make_pair(std::string(scTypeIdx >= 0 ? "STREAM_CHANGE: SetOutputType(first H.264 type)" : "STREAM_CHANGE: no H.264 output type"), h2));
 			read_output_type();
 			MFT_OUTPUT_STREAM_INFO osi;
 			memset(&osi, 0, sizeof(osi));
@@ -1434,15 +1453,15 @@ void Enc::run(const RunReq &rq, RunRes *res)
 			if (credits == 0 && pendingOut == 0) { pump->wait(25); }
 			while (pump->pop(&ev))
 			{
-				if (ev.type == METransformNeedInput) { credits++; res->needInput++; }
-				else if (ev.type == METransformHaveOutput) { pendingOut++; res->haveOutput++; scAt = 0; }
+				if (ev.type == METransformNeedInput) { credits++; res->needInput++; if (scAt != 0) { res->scNeedWait++; } }
+				else if (ev.type == METransformHaveOutput) { pendingOut++; res->haveOutput++; if (submitted == 0) { res->haveBeforeInput++; } if (scAt != 0) { res->scEvent++; const double w = hw_now_ms() - scAt; if (w > res->scWaitMax) { res->scWaitMax = w; } scAt = 0; } }
 				else if (ev.type == METransformDrainComplete) { res->drained = true; }
 				else if (ev.type == MEError) { res->err = FAILED(ev.status) ? ev.status : E_FAIL; res->errStage = "MEError event"; }
 				else if (ev.type == 0xFFFF) { if (!drainSent || !res->drained) { res->err = ev.status; res->errStage = "GetEvent (the event queue ended)"; } }
 			}
 			if (FAILED(res->err)) { break; }
 			// a stream change used the event of its output up: the next ProcessOutput waits for the next HaveOutput; an MFT that sends none gets one call without it after 500 ms
-			if (scAt != 0 && pendingOut == 0 && hw_now_ms() > scAt + 500.0) { pendingOut = 1; scAt = 0; }
+			if (scAt != 0 && pendingOut == 0 && hw_now_ms() > scAt + 500.0) { pendingOut = 1; res->scNoEvent++; if (500.0 > res->scWaitMax) { res->scWaitMax = 500.0; } scAt = 0; }
 		}
 		// submit
 		bool progressed = false;
@@ -1495,11 +1514,11 @@ void Enc::run(const RunReq &rq, RunRes *res)
 			{
 				bool got = false;
 				const HRESULT hr = pull_one(&au, &rec, &got);
-				if (hr == MF_E_TRANSFORM_STREAM_CHANGE) { res->streamChanges++; pendingOut--; scAt = hw_now_ms(); break; }
+				if (hr == MF_E_TRANSFORM_STREAM_CHANGE) { res->streamChanges++; res->scSetHr = scSetHr; res->scTypeIdx = scTypeIdx; res->scTypeN = scTypeN; res->scSubtype = scSubtype; pendingOut--; scAt = pendingOut == 0 ? hw_now_ms() : 0; break; }
 				pendingOut--;
 				if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) { continue; }
 				if (FAILED(hr)) { res->err = hr; res->errStage = "ProcessOutput"; break; }
-				if (got) { record_out(rq, res, au, rec); progressed = true; }
+				if (got) { record_out(rq, res, au, rec); progressed = true; scAt = 0; }
 			}
 		}
 		else
@@ -1898,7 +1917,9 @@ static void stage_bench_run(void *p)
 	o.raw("bytes", JObj().d("p_mean", pb.mean(), 0).d("p_p50", pb.pct(0.5), 0).d("p_max", pb.max(), 0).d("idr_first", idrb.count() > 0 ? idrb.v[0] : 0, 0).i("idr_count", (long long)idrb.count()).u("total", total)
 		.d("kbps_at_30fps", n > 0 ? (double)total * 8.0 * 30.0 / (double)n / 1000.0 : 0, 0).done());
 	o.raw("cpu", JObj().d("process_ms", rr.cpuMs, 0).d("source_ms", rr.sourceMs, 0).d("encode_estimate_ms", cpuEnc, 0).d("per_frame_ms", n > 0 ? cpuEnc / (double)n : 0, 2).d("pct_of_one_core", rr.wallMs > 0 ? 100.0 * cpuEnc / rr.wallMs : 0, 0).done());
-	o.raw("events", JObj().i("need_input", rr.needInput).i("have_output", rr.haveOutput).i("stream_changes", rr.streamChanges).i("not_accepting", rr.notAccepting).i("max_inflight", rr.maxInflight).i("pts_mismatch", rr.ptsMismatch).done());
+	o.raw("events", JObj().i("need_input", rr.needInput).i("have_output", rr.haveOutput).i("stream_changes", rr.streamChanges).i("not_accepting", rr.notAccepting).i("max_inflight", rr.maxInflight).i("pts_mismatch", rr.ptsMismatch)
+		.i("have_before_input", rr.haveBeforeInput).i("sc_event", rr.scEvent).i("sc_no_event", rr.scNoEvent).i("sc_need_wait", rr.scNeedWait).d("sc_wait_ms_max", rr.scWaitMax, 0)
+		.hex("sc_set_output_type_hr", (unsigned long)rr.scSetHr).i("sc_type_idx", rr.scTypeIdx).i("sc_type_n", rr.scTypeN).str("sc_subtype", rr.scSubtype).done());
 	if (n > 0)
 	{
 		unsigned long long q0 = 0, q1 = 0;
