@@ -48,6 +48,8 @@ struct knobs
 	int gopStuck;									/* the GOP reads 30 in the order A: 1 = the order B (a second encoder inside the open) holds it, 2 = it does not either (the open fails: GOP periodic) */
 	int rateLag;									/* a new bit rate reaches the sizes of the pictures this many pictures late */
 	int openRefuseRc;								/* the open refuses this rate control mode (MFH264_RC_*) with E_CODECAPI (0 = none) */
+	long encodeHr;									/* the HRESULT that the failed picture reports (0 = none) */
+	int scChanges;									/* the stream changes that the info reports (the counters of a hardware encoder) */
 	int latencyUs, slowEvery, slowUs, idrUs;		/* time of a P picture; every Nth picture takes slowUs; the key frame takes idrUs */
 };
 static struct knobs K;
@@ -187,7 +189,7 @@ static int f_encode(struct mfh264 *h, const uint8_t *bgra, int w, int hh, int st
 	if (gBrN < 512) { gBrHist[gBrN++] = gLastBitrate; }
 	memset(err, 0, sizeof(*err));
 	*len = 0; *idr = 0;
-	if (K.encodeRcAt == pic) { if (K.errOutput) { n = make_sps(out, 0); n = make_pps(out, n); n = make_slice(out, n, 1, 7, K.idrBytes); *len = n; *idr = 1; } err->code = K.encodeRc; err->stage = "fake encode"; return K.encodeRc; }
+	if (K.encodeRcAt == pic) { if (K.errOutput) { n = make_sps(out, 0); n = make_pps(out, n); n = make_slice(out, n, 1, 7, K.idrBytes); *len = n; *idr = 1; } err->code = K.encodeRc; err->hr = K.encodeHr; err->stage = "fake encode"; return K.encodeRc; }
 	isIdr = (pic == 0 && !K.firstNotIdr) || (gForcePending && !K.idrLateForced) || (K.idrLateForced && pic > 0 && gForcePending == 2) || (K.idrUnasked && pic == 7);
 	if (gForcePending == 1 && K.idrLateForced) { gForcePending = 2; }
 	else if (isIdr && gForcePending) { gForcePending = 0; }
@@ -218,7 +220,7 @@ static int f_encode_nv12(struct mfh264 *h, const uint8_t *nv12, size_t len, int6
 	else if (gPic == 0 && hi - lo < 40) { gNv12Bad++; }									/* the first picture is text: it has black and white in it */
 	return f_encode(h, NULL, g_w, g_h, 0, ts, out, cap, olen, idr, err);
 }
-static void f_info(const struct mfh264 *h, struct mfh264_info *info) { (void)h; memset(info, 0, sizeof(*info)); info->max_inflight = K.inflight; info->backend = 1; info->async = 1; snprintf(info->gop_trace, sizeof(info->gop_trace), "gop order=%c try=7fffffff:00000000:2147483647 rc set=0 read=-1", gGopB ? 'B' : 'A'); }
+static void f_info(const struct mfh264 *h, struct mfh264_info *info) { (void)h; memset(info, 0, sizeof(*info)); info->max_inflight = K.inflight; info->backend = 1; info->stream_changes = (unsigned)K.scChanges; info->sc_event = (unsigned)K.scChanges; info->sc_wait_ms_last = info->sc_wait_ms_max = K.scChanges ? 12u : 0u; info->async = 1; snprintf(info->gop_trace, sizeof(info->gop_trace), "gop order=%c try=7fffffff:00000000:2147483647 rc set=0 read=-1", gGopB ? 'B' : 'A'); }
 static int f_init(struct mfh264_err *e) { (void)e; return 0; }
 static void f_shutdown(void) {}
 static int f_faulted(void) { return 0; }
@@ -342,6 +344,15 @@ int main(void)
 	knobs_default(); K.idrBytes = 1500 * 1024; EXPECT(P, "");
 	/* 1:1 */
 	knobs_default(); K.encodeRcAt = 6; K.encodeRc = MFH264_E_STREAM_BROKEN; EXPECT(F, "encode14");
+	{
+		/* the diagnostics of a failed picture: the step, the picture, the HRESULT and the stage of the backend, then the counters of the stream changes */
+		char buf[8192]; size_t n;
+		gDiag = tmpfile(); knobs_default(); K.encodeRcAt = 6; K.encodeRc = MFH264_E_STREAM_BROKEN; K.encodeHr = (long)0x8000FFFFL; K.scChanges = 1; EXPECT(F, "encode14");
+		rewind(gDiag); n = fread(buf, 1, sizeof(buf) - 1, gDiag); buf[n] = 0;
+		CHECK(strstr(buf, "dq fail: step=encode frame=6 rc=-14 code=-14 hr=0x8000ffff stage=fake encode") != NULL);
+		CHECK(strstr(buf, "dq info: async=1") != NULL && strstr(buf, "stream_changes=1 sc_event=1 sc_no_event=0 sc_wait_ms last=12 max=12 out_fail=0") != NULL);
+		fclose(gDiag); gDiag = NULL;
+	}
 	knobs_default(); K.encodeRcAt = 0; K.encodeRc = MFH264_E_INPUT; EXPECT(F, "encode12");
 	knobs_default(); K.encodeRcAt = 9; K.encodeRc = MFH264_E_HANG; EXPECT(F, "hang");
 	knobs_default(); K.emptyAt = 4; EXPECT(F, "empty");

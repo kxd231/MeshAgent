@@ -70,6 +70,25 @@ static void diag_sizes(FILE *f, const char *tag, const unsigned *sz, const unsig
 	fflush(f);
 }
 
+// what failed, when a call of the encoder fails (stderr of the test process; the rule of the result only says the code): the step, the result, the HRESULT and the stage that the backend names
+static void diag_fail(FILE *f, const char *tag, const char *step, int frame, int rc, const struct mfh264_err *err)
+{
+	if (f == NULL) { return; }
+	fprintf(f, "%s fail: step=%s frame=%d rc=%d code=%d hr=0x%08lx stage=%s reason=%d\n", tag, step, frame, rc, err->code, (unsigned long)(unsigned)err->hr, err->stage != NULL ? err->stage : "-", err->reason);
+	fflush(f);
+}
+
+// the counters of the encoder that explain a failure of a hardware encoder: the events, the stream changes (and whether a new HaveOutput came after each, after how many ms), the failed ProcessOutput calls
+static void diag_info(FILE *f, const char *tag, const kvm_encbe *be, struct mfh264 *h)
+{
+	struct mfh264_info in;
+	if (f == NULL || h == NULL || be->get_info == NULL) { return; }
+	memset(&in, 0, sizeof(in));
+	be->get_info(h, &in);
+	fprintf(f, "%s info: async=%d provides=%d events need=%u have=%u other=%u flushes=%u stream_changes=%u sc_event=%u sc_no_event=%u sc_wait_ms last=%u max=%u out_fail=%u out_fail_hr=0x%08lx\n", tag, in.async, in.out_provides_samples, in.events_need, in.events_have, in.events_other, in.flushes, in.stream_changes, in.sc_event, in.sc_no_event, in.sc_wait_ms_last, in.sc_wait_ms_max, in.out_fail, (unsigned long)(unsigned)in.out_fail_hr);
+	fflush(f);
+}
+
 // the bit rate that stands for a "QP" of the plan in the pass "rate" (26: 8 Mb/s, 30: 4, 40: 1 at 1920x1088; scaled by the area, never above what the level allows)
 static int plan_bps(const kvm_hwt_cfg *c, int qp, int profile)
 {
@@ -159,15 +178,16 @@ static int run_pass(const kvm_encbe *be, const kvm_hwt_cfg *c, kvm_hwp_result *r
 		if (i == 0 || plan[i - 1].qp != p->qp)
 		{
 			dfl[nD] = i > 0 ? 2 : 0;
-			if ((rate ? be->set_bitrate(h, plan_bps(c, p->qp, c->profile != 0 ? c->profile : MFH264_PROFILE_HIGH), &err) : be->set_qp(h, p->qp, &err)) != 0) { char r[40]; snprintf(r, sizeof(r), rate ? "setbr%d" : "setqp%d", -err.code); set_rule(res, KVM_HWP_V_FAIL, r); goto done; }
+			if ((rate ? be->set_bitrate(h, plan_bps(c, p->qp, c->profile != 0 ? c->profile : MFH264_PROFILE_HIGH), &err) : be->set_qp(h, p->qp, &err)) != 0) { char r[40]; diag_fail(c->diag, rate ? "dr" : "dq", rate ? "set_bitrate" : "set_qp", i, err.code, &err); snprintf(r, sizeof(r), rate ? "setbr%d" : "setqp%d", -err.code); set_rule(res, KVM_HWP_V_FAIL, r); goto done; }
 		}
-		if (p->force && be->force_idr(h, &err) != 0) { char r[40]; snprintf(r, sizeof(r), "force%d", -err.code); set_rule(res, KVM_HWP_V_FAIL, r); goto done; }
+		if (p->force && be->force_idr(h, &err) != 0) { char r[40]; diag_fail(c->diag, rate ? "dr" : "dq", "force_idr", i, err.code, &err); snprintf(r, sizeof(r), "force%d", -err.code); set_rule(res, KVM_HWP_V_FAIL, r); goto done; }
 		kvm_synth_frame_bgra(&syn, p->kind, p->t, bgra, c->codedW * 4);
 		// the last two pictures (video) go as BGRA, the others as the view: both ways into the encoder are in the stream (the BGRA way is the one of MESH_KVM_NV12_FROZEN=0 and of a picture that is too big for the view)
 		rc = encode_frame(be, h, nv12 != NULL && i < nPlan - 2, bgra, nv12, c->codedW, c->codedH, (int64_t)(i + 1) * 333333, out, outCap, &len, &idr, &err, c->nowMs, &a, &b);
 		if (rc != 0)
 		{
 			char r[40];
+			diag_fail(c->diag, rate ? "dr" : "dq", "encode", i, rc, &err);
 			if (rc == MFH264_E_HANG) { snprintf(r, sizeof(r), "hang"); } else { snprintf(r, sizeof(r), "encode%d", -rc); }
 			set_rule(res, KVM_HWP_V_FAIL, r);
 			goto done;
@@ -224,6 +244,7 @@ static int run_pass(const kvm_encbe *be, const kvm_hwt_cfg *c, kvm_hwp_result *r
 	}
 done:
 	diag_sizes(c->diag, rate ? "dr" : "dq", dsz, dfl, nD);
+	diag_info(c->diag, rate ? "dr" : "dq", be, h);
 	if (h != NULL) { be->close(h); }
 	free(bgra); free(out); free(nv12);
 	kvm_synth_free(&syn);
@@ -259,7 +280,10 @@ static int diag_run(const kvm_encbe *be, struct mfh264 *h, const kvm_hwt_cfg *c,
 		fl[got] = 0;
 		if (qpAt > 0 && i == qpAt) { if (be->set_qp(h, 40, &err) != 0) { break; } fl[got] = 2; }
 		kvm_synth_frame_bgra(syn, K_SCROLL, i, bgra, c->codedW * 4);
-		if (encode_frame(be, h, nv12 != NULL, bgra, nv12, c->codedW, c->codedH, (int64_t)(i + 1) * 333333, out, outCap, &len, &idr, &err, c->nowMs, &a, &b) != 0) { break; }
+		{
+			const int rc = encode_frame(be, h, nv12 != NULL, bgra, nv12, c->codedW, c->codedH, (int64_t)(i + 1) * 333333, out, outCap, &len, &idr, &err, c->nowMs, &a, &b);
+			if (rc != 0) { diag_fail(c->diag, "diag", "encode", i, rc, &err); break; }
+		}
 		sz[got] = (unsigned)len; fl[got] = (unsigned char)(fl[got] | (idr ? 1 : 0)); got++;
 	}
 	return got;
@@ -304,6 +328,7 @@ void kvm_hwt_diag(const kvm_encbe *be, const kvm_hwt_cfg *c)
 		if (v == 3 && be->set_qp(h, 26, &err) != 0) { fprintf(c->diag, "%s=set_qp failed\n", tags[v]); be->close(h); continue; }
 		n = diag_run(be, h, c, &syn, bgra, nv12, out, outCap, 35, v == 3 ? 18 : 0, sz, fl);
 		diag_sizes(c->diag, tags[v], sz, fl, n);
+		diag_info(c->diag, tags[v], be, h);
 		be->close(h);
 	}
 done:
