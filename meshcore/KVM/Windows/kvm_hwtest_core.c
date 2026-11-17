@@ -85,7 +85,7 @@ static void diag_info(FILE *f, const char *tag, const kvm_encbe *be, struct mfh2
 	if (f == NULL || h == NULL || be->get_info == NULL) { return; }
 	memset(&in, 0, sizeof(in));
 	be->get_info(h, &in);
-	fprintf(f, "%s info: async=%d provides=%d events need=%u have=%u other=%u flushes=%u stream_changes=%u sc_event=%u sc_no_event=%u sc_wait_ms last=%u max=%u out_fail=%u out_fail_hr=0x%08lx\n", tag, in.async, in.out_provides_samples, in.events_need, in.events_have, in.events_other, in.flushes, in.stream_changes, in.sc_event, in.sc_no_event, in.sc_wait_ms_last, in.sc_wait_ms_max, in.out_fail, (unsigned long)(unsigned)in.out_fail_hr);
+	fprintf(f, "%s info: async=%d provides=%d events need=%u have=%u other=%u flushes=%u open_have=%u stream_changes=%u sc_unasked=%u sc_event=%u sc_no_event=%u sc_need_wait=%u sc_wait_ms last=%u max=%u sc_set_hr=0x%08lx sc_type=%d/%u sc_subtype=0x%08x out_fail=%u out_fail_hr=0x%08lx\n", tag, in.async, in.out_provides_samples, in.events_need, in.events_have, in.events_other, in.flushes, in.open_have, in.stream_changes, in.sc_unasked, in.sc_event, in.sc_no_event, in.sc_need_wait, in.sc_wait_ms_last, in.sc_wait_ms_max, (unsigned long)(unsigned)in.sc_set_hr, in.sc_type_idx, in.sc_type_n, in.sc_subtype, in.out_fail, (unsigned long)(unsigned)in.out_fail_hr);
 	fflush(f);
 }
 

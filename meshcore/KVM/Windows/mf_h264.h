@@ -271,6 +271,12 @@ struct mfh264_info
 	unsigned stream_changes;		/* hardware encoder: MF_E_TRANSFORM_STREAM_CHANGE answers of ProcessOutput (each one uses up its HaveOutput event) */
 	unsigned sc_event, sc_no_event;	/* of them: followed by a new HaveOutput within the deadline / by none (then one ProcessOutput without an event is tried) */
 	unsigned sc_wait_ms_last, sc_wait_ms_max;	/* the wait for the HaveOutput after a stream change (the last one, the longest) in milliseconds */
+	unsigned open_have;				/* HaveOutput events that came before the first input (counted at the end of the open) */
+	unsigned sc_unasked;			/* stream changes met by the call of ProcessOutput for an event that nobody waited for (before a frame) */
+	unsigned sc_need_wait;			/* NeedInput events that came while the wait after a stream change ran */
+	long sc_set_hr;					/* the result of SetOutputType at the last stream change (MF_E_NO_MORE_TYPES: no H.264 type among the available ones) */
+	int sc_type_idx;				/* the index of the available output type that was chosen at the last stream change (the first with the subtype H.264), -1 = none; valid when stream_changes > 0 */
+	unsigned sc_type_n, sc_subtype;	/* how many output types the MFT lists, and Data1 of the subtype GUID of the chosen one (0x34363248 = H264) */
 	unsigned out_fail;				/* ProcessOutput calls that failed (not NEED_MORE_INPUT, not a stream change) */
 	long out_fail_hr;				/* the HRESULT of the last of them (0 = none) */
 	char hw_name[48];				/* the name of the MFT */

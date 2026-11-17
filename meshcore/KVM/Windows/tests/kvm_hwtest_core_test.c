@@ -220,7 +220,7 @@ static int f_encode_nv12(struct mfh264 *h, const uint8_t *nv12, size_t len, int6
 	else if (gPic == 0 && hi - lo < 40) { gNv12Bad++; }									/* the first picture is text: it has black and white in it */
 	return f_encode(h, NULL, g_w, g_h, 0, ts, out, cap, olen, idr, err);
 }
-static void f_info(const struct mfh264 *h, struct mfh264_info *info) { (void)h; memset(info, 0, sizeof(*info)); info->max_inflight = K.inflight; info->backend = 1; info->stream_changes = (unsigned)K.scChanges; info->sc_event = (unsigned)K.scChanges; info->sc_wait_ms_last = info->sc_wait_ms_max = K.scChanges ? 12u : 0u; info->async = 1; snprintf(info->gop_trace, sizeof(info->gop_trace), "gop order=%c try=7fffffff:00000000:2147483647 rc set=0 read=-1", gGopB ? 'B' : 'A'); }
+static void f_info(const struct mfh264 *h, struct mfh264_info *info) { (void)h; memset(info, 0, sizeof(*info)); info->max_inflight = K.inflight; info->backend = 1; info->stream_changes = (unsigned)K.scChanges; info->sc_event = (unsigned)K.scChanges; info->sc_wait_ms_last = info->sc_wait_ms_max = K.scChanges ? 12u : 0u; info->open_have = 1; info->sc_unasked = 0; info->sc_need_wait = (unsigned)K.scChanges; info->sc_set_hr = 0; info->sc_type_idx = K.scChanges ? 1 : 0; info->sc_type_n = K.scChanges ? 2u : 0u; info->sc_subtype = K.scChanges ? 0x34363248u : 0u; info->async = 1; snprintf(info->gop_trace, sizeof(info->gop_trace), "gop order=%c try=7fffffff:00000000:2147483647 rc set=0 read=-1", gGopB ? 'B' : 'A'); }
 static int f_init(struct mfh264_err *e) { (void)e; return 0; }
 static void f_shutdown(void) {}
 static int f_faulted(void) { return 0; }
@@ -350,7 +350,7 @@ int main(void)
 		gDiag = tmpfile(); knobs_default(); K.encodeRcAt = 6; K.encodeRc = MFH264_E_STREAM_BROKEN; K.encodeHr = (long)0x8000FFFFL; K.scChanges = 1; EXPECT(F, "encode14");
 		rewind(gDiag); n = fread(buf, 1, sizeof(buf) - 1, gDiag); buf[n] = 0;
 		CHECK(strstr(buf, "dq fail: step=encode frame=6 rc=-14 code=-14 hr=0x8000ffff stage=fake encode") != NULL);
-		CHECK(strstr(buf, "dq info: async=1") != NULL && strstr(buf, "stream_changes=1 sc_event=1 sc_no_event=0 sc_wait_ms last=12 max=12 out_fail=0") != NULL);
+		CHECK(strstr(buf, "dq info: async=1") != NULL && strstr(buf, "open_have=1 stream_changes=1 sc_unasked=0 sc_event=1 sc_no_event=0 sc_need_wait=1 sc_wait_ms last=12 max=12 sc_set_hr=0x00000000 sc_type=1/2 sc_subtype=0x34363248 out_fail=0") != NULL);
 		fclose(gDiag); gDiag = NULL;
 	}
 	knobs_default(); K.encodeRcAt = 0; K.encodeRc = MFH264_E_INPUT; EXPECT(F, "encode12");
