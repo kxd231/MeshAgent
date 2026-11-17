@@ -48,12 +48,15 @@ struct knobs
 	int gopStuck;									/* the GOP reads 30 in the order A: 1 = the order B (a second encoder inside the open) holds it, 2 = it does not either (the open fails: GOP periodic) */
 	int rateLag;									/* a new bit rate reaches the sizes of the pictures this many pictures late */
 	int openRefuseRc;								/* the open refuses this rate control mode (MFH264_RC_*) with E_CODECAPI (0 = none) */
+	int coarseUs;									/* added to the time of a P picture while the clock has the default resolution (the 15.6 ms tick rounds the waits of the encoder up) */
 	long encodeHr;									/* the HRESULT that the failed picture reports (0 = none) */
 	int scChanges;									/* the stream changes that the info reports (the counters of a hardware encoder) */
 	int latencyUs, slowEvery, slowUs, idrUs;		/* time of a P picture; every Nth picture takes slowUs; the key frame takes idrUs */
 };
 static struct knobs K;
 static double gNow;
+static int gClockFine, gClockCalls, gClockDefaultCalls, gClockFirst = -1;
+static void fake_clock(int fine) { if (gClockFirst < 0) { gClockFirst = fine; } gClockCalls++; if (!fine) { gClockDefaultCalls++; } gClockFine = fine; }
 static double now_ms(void) { return gNow; }
 
 static int gOpenOrders[16], gNOrders, gGopB, gQpCalls;
@@ -201,7 +204,7 @@ static int f_encode(struct mfh264 *h, const uint8_t *bgra, int w, int hh, int st
 	else
 	{
 		{ int q = gLastQp; if (gLagLeft > 0 && K.qpLag) { q = gPrevQp; gLagLeft--; } n = make_slice(out, 0, 0, K.bSlice ? 6u : 5u, (K.rateEffective && gLastRc != MFH264_RC_QUALITY) ? gBrHist[gBrN - 1 - ((K.rateLag < gBrN - 1) ? K.rateLag : gBrN - 1)] / 8 / 30 : pbytes(q)); }
-		gNow += (double)((K.slowEvery > 0 && pic % K.slowEvery == 0) ? K.slowUs : K.latencyUs) / 1000.0;
+		gNow += (double)(((K.slowEvery > 0 && pic % K.slowEvery == 0) ? K.slowUs : K.latencyUs) + (gClockFine ? 0 : K.coarseUs)) / 1000.0;
 	}
 	if (K.emptyAt == pic) { n = 3; }
 	*len = n; *idr = isIdr;
@@ -238,7 +241,8 @@ static int run(kvm_hwp_result *res)
 {
 	kvm_hwt_cfg c;
 	memset(&c, 0, sizeof(c));
-	c.codedW = g_w; c.codedH = g_h; c.level = 42; c.maxLevel = 0; c.profile = MFH264_PROFILE_HIGH; c.rev = 7; c.key = "rev:7,test"; c.nowMs = now_ms; c.diag = gDiag;
+	c.codedW = g_w; c.codedH = g_h; c.level = 42; c.maxLevel = 0; c.profile = MFH264_PROFILE_HIGH; c.rev = 7; c.key = "rev:7,test"; c.nowMs = now_ms; c.clock = fake_clock; c.diag = gDiag;
+	gClockFine = gClockCalls = gClockDefaultCalls = 0; gClockFirst = -1;
 	gBgraCalls = gNv12Calls = gNv12Bad = gNv12FlatCalls = 0;
 	return kvm_hwt_run(gBe, &c, res);
 }
@@ -344,6 +348,26 @@ int main(void)
 	knobs_default(); K.idrBytes = 1500 * 1024; EXPECT(P, "");
 	/* 1:1 */
 	knobs_default(); K.encodeRcAt = 6; K.encodeRc = MFH264_E_STREAM_BROKEN; EXPECT(F, "encode14");
+	{
+		/* the clock: the test asks for 1 ms before the first picture and never gives it back by itself; a coarse clock would slow the encoder down (the verdict is the one of 1 ms) */
+		knobs_default(); K.coarseUs = 20000; CHECK(run(&r) == P && r.p50Us == 8000 && gClockFirst == 1 && gClockCalls == 1 && gClockDefaultCalls == 0 && gClockFine == 1);
+	}
+	{
+		/* the diagnostics of the clock: once more at the default resolution, both results on one line; the verdict stays the one of 1 ms, the clock is back at 1 ms */
+		char buf[8192]; size_t n; kvm_hwt_cfg c;
+		kvm_hwp_result fine;
+		gDiag = tmpfile(); knobs_default(); K.coarseUs = 20000;
+		CHECK(run(&fine) == P);
+		memset(&c, 0, sizeof(c)); c.codedW = g_w; c.codedH = g_h; c.level = 42; c.profile = MFH264_PROFILE_HIGH; c.nowMs = now_ms; c.clock = fake_clock; c.diag = gDiag;
+		gClockCalls = gClockDefaultCalls = 0;
+		kvm_hwt_diag_clock(&FAKE, &c, &fine);
+		rewind(gDiag); n = fread(buf, 1, sizeof(buf) - 1, gDiag); buf[n] = 0;
+		CHECK(strstr(buf, "lat default p50=28000 p95=28000 rule=latency | lat 1ms p50=8000 p95=8000 rule=-") != NULL);
+		CHECK(gClockDefaultCalls == 1 && gClockCalls == 2 && gClockFine == 1);
+		fclose(gDiag); gDiag = NULL;
+		memset(&c, 0, sizeof(c)); c.diag = stderr;	/* without a clock callback nothing is measured twice */
+		gClockCalls = 0; kvm_hwt_diag_clock(&FAKE, &c, &fine); CHECK(gClockCalls == 0);
+	}
 	{
 		/* the diagnostics of a failed picture: the step, the picture, the HRESULT and the stage of the backend, then the counters of the stream changes */
 		char buf[8192]; size_t n;

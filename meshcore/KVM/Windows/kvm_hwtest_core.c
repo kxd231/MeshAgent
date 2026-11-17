@@ -252,7 +252,7 @@ done:
 	return res->verdict;
 }
 
-int kvm_hwt_run(const kvm_encbe *be, const kvm_hwt_cfg *c, kvm_hwp_result *res)
+static int run_all(const kvm_encbe *be, const kvm_hwt_cfg *c, kvm_hwp_result *res)
 {
 	kvm_hwp_result r2;
 	run_pass(be, c, res, 0);
@@ -263,6 +263,23 @@ int kvm_hwt_run(const kvm_encbe *be, const kvm_hwt_cfg *c, kvm_hwp_result *res)
 		*res = r2;
 	}
 	return res->verdict;
+}
+
+int kvm_hwt_run(const kvm_encbe *be, const kvm_hwt_cfg *c, kvm_hwp_result *res)
+{
+	if (c->clock != NULL) { c->clock(1); }		// the session runs with timeBeginPeriod(1): the test measures the encoder in the same conditions (the default tick of 15.6 ms rounds every wait of the encoder up)
+	return run_all(be, c, res);
+}
+
+void kvm_hwt_diag_clock(const kvm_encbe *be, const kvm_hwt_cfg *c, const kvm_hwp_result *fine)
+{
+	kvm_hwp_result dflt;
+	if (c->diag == NULL || c->clock == NULL) { return; }
+	c->clock(0);
+	run_all(be, c, &dflt);
+	c->clock(1);
+	fprintf(c->diag, "lat default p50=%u p95=%u rule=%s | lat 1ms p50=%u p95=%u rule=%s\n", (unsigned)dflt.p50Us, (unsigned)dflt.p95Us, dflt.rule[0] ? dflt.rule : "-", (unsigned)fine->p50Us, (unsigned)fine->p95Us, fine->rule[0] ? fine->rule : "-");
+	fflush(c->diag);
 }
 
 // ---- the hardware self test diagnostics (see kvm_hwtest_core.h)

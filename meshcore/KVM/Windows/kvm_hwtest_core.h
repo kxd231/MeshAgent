@@ -56,6 +56,7 @@ typedef struct kvm_hwt_cfg
 	int rev;						// KVM_HW_SELFTEST_REV, goes into the result
 	const char *key;				// the key of the cache, goes into the result
 	double (*nowMs)(void);			// a clock in milliseconds
+	void (*clock)(int fine);		// the resolution of the system clock: 1 = 1 ms (timeBeginPeriod(1), as the session has it), 0 = the default (15.6 ms); NULL = nobody changes it. kvm_hwt_run asks for 1 before the first picture; the diagnostics ask for 0 and 1 again
 	FILE *diag;						// where the sizes of all pictures of both passes go (stderr of the test process; NULL = nowhere). Never the result: that is stdout, and the parent's buffer is 2048 bytes
 } kvm_hwt_cfg;
 
@@ -65,6 +66,10 @@ int kvm_hwt_run(const kvm_encbe *be, const kvm_hwt_cfg *cfg, kvm_hwp_result *res
 // the hardware self test diagnostics, only when the key of the test starts with "diag" (a diagnostics run): the sizes of 35 pictures of scroll to cfg->diag in five variants of the setting of the GOP (G1 the order A with only 0x7FFFFFFF,
 // G2 the order B (the codec API before the types) with only 0xFFFFFFFF, G3 B with 0x7FFFFFFF, G4 B in Quality mode with the QP 26 and 40, G5 A with MF_MT_MAX_KEYFRAME_SPACING), each with the line "gop ..." of the open. No verdict, no rules.
 void kvm_hwt_diag(const kvm_encbe *be, const kvm_hwt_cfg *cfg);
+
+// the diagnostics of the clock (a diagnostics run, after the result): the whole test once more with the default resolution of the clock (cfg->clock(0), then cfg->clock(1) again), and the line
+// "lat default p50=.. p95=.. rule=.. | lat 1ms p50=.. p95=.. rule=.." (microseconds) on cfg->diag: the latency of the encoder at both resolutions. fine = the result of kvm_hwt_run (made at 1 ms).
+void kvm_hwt_diag_clock(const kvm_encbe *be, const kvm_hwt_cfg *cfg, const kvm_hwp_result *fine);
 
 #ifdef __cplusplus
 }

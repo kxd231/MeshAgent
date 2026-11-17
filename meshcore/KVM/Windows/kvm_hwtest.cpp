@@ -11,6 +11,7 @@
 #include "kvm_hwtest.h"
 #include "kvm_hwtest_core.h"
 int mfp_os_build(void);	// mf_h264.cpp (the build number of Windows)
+HMODULE mfp_load_system_dll(const wchar_t *name);	// mf_h264.cpp (a system library from the system directory)
 
 // ------------------------------------------------------------------------------------------------------------------------ paths and files
 
@@ -391,6 +392,18 @@ static void put_result(const kvm_hwp_result *r)
 	if (n > 0 && out != INVALID_HANDLE_VALUE && out != NULL) { WriteFile(out, buf, (DWORD)n, &w, NULL); FlushFileBuffers(out); }
 }
 
+// The resolution of the system clock for the test: 1 ms like the session (kvm.c: timeBeginPeriod(1) around the loop that uses the encoder), 0 = the default. winmm.dll is loaded at run time (the self test adds no import).
+static int g_clockFine = 0;
+static void test_clock(int fine)
+{
+	typedef unsigned int (WINAPI *tp_fn)(unsigned int);
+	HMODULE m = GetModuleHandleW(L"winmm.dll");
+	if (m == NULL) { m = mfp_load_system_dll(L"winmm.dll"); }
+	if (m == NULL) { return; }
+	if (fine && !g_clockFine) { tp_fn f = (tp_fn)GetProcAddress(m, "timeBeginPeriod"); if (f != NULL && f(1) == 0) { g_clockFine = 1; } }
+	else if (!fine && g_clockFine) { tp_fn f = (tp_fn)GetProcAddress(m, "timeEndPeriod"); if (f != NULL) { f(1); } g_clockFine = 0; }
+}
+
 // -kvmhwtest W H level maxLevel profile luid rev key  ->  the result on stdout; exit code 0 PASS, 1 FAIL, 2 SLOW, 3 wrong arguments
 int kvm_hwtest_main(int argc, char **argv)
 {
@@ -410,6 +423,7 @@ int kvm_hwtest_main(int argc, char **argv)
 	SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
 	cfg.rev = KVM_HW_SELFTEST_REV;
 	cfg.nowMs = qpc_ms;
+	cfg.clock = test_clock;
 	cfg.diag = stderr;						// the sizes of the pictures (the parent sends this stream to NUL; a diagnostics run keeps it)
 	res.rev = KVM_HW_SELFTEST_REV;
 	if (rev != KVM_HW_SELFTEST_REV) { res.verdict = KVM_HWP_V_FAIL; snprintf(res.rule, sizeof(res.rule), "rev"); res.valid = 1; put_result(&res); return 1; }	// (the parent and the test are of different builds: the executable was replaced meanwhile)
@@ -425,8 +439,9 @@ int kvm_hwtest_main(int argc, char **argv)
 	kvm_hwt_run(&kvm_encbe_mfhw, &cfg, &res);
 	put_result(&res);
 	// a diagnostics run passes the key "diag...": the variants of the bit rate (to stderr, after the result, so a hang here costs nothing)
-	if (argc > 9 && strncmp(argv[9], "diag", 4) == 0 && strcmp(res.rule, "hang") != 0 && strncmp(res.rule, "open", 4) != 0) { kvm_hwt_diag(&kvm_encbe_mfhw, &cfg); }
+	if (argc > 9 && strncmp(argv[9], "diag", 4) == 0 && strcmp(res.rule, "hang") != 0 && strncmp(res.rule, "open", 4) != 0) { kvm_hwt_diag_clock(&kvm_encbe_mfhw, &cfg, &res); kvm_hwt_diag(&kvm_encbe_mfhw, &cfg); }
 	// no kvm_encbe_mfhw.shutdown() after a hang or an exception (the driver may be blocked: the process ends by itself)
 	if (res.verdict == KVM_HWP_V_PASS || res.verdict == KVM_HWP_V_SLOW) { kvm_encbe_mfhw.shutdown(); }
+	test_clock(0);
 	return res.verdict == KVM_HWP_V_PASS ? 0 : (res.verdict == KVM_HWP_V_SLOW ? 2 : 1);
 }
