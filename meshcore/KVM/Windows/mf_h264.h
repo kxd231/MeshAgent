@@ -268,6 +268,11 @@ struct mfh264_info
 	unsigned out_wait_us_last, out_wait_us_max;	/* ProcessInput to HaveOutput of the last frame and the longest of this encoder (the glue's enc_ms includes the conversion) */
 	unsigned events_need, events_have, events_other;	/* METransformNeedInput, METransformHaveOutput and the other events counted */
 	unsigned flushes;				/* flushes of the stream after a lost frame (credits and the event queue were cleared) */
+	unsigned stream_changes;		/* hardware encoder: MF_E_TRANSFORM_STREAM_CHANGE answers of ProcessOutput (each one uses up its HaveOutput event) */
+	unsigned sc_event, sc_no_event;	/* of them: followed by a new HaveOutput within the deadline / by none (then one ProcessOutput without an event is tried) */
+	unsigned sc_wait_ms_last, sc_wait_ms_max;	/* the wait for the HaveOutput after a stream change (the last one, the longest) in milliseconds */
+	unsigned out_fail;				/* ProcessOutput calls that failed (not NEED_MORE_INPUT, not a stream change) */
+	long out_fail_hr;				/* the HRESULT of the last of them (0 = none) */
 	char hw_name[48];				/* the name of the MFT */
 };
 

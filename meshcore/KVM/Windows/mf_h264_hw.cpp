@@ -795,9 +795,13 @@ static int hw_break(mfhw *h, struct mfh264_err *err, HRESULT hr, const char *sta
 }
 
 // One ProcessOutput after a HaveOutput: the access unit into h->raw. 1 = it has one, 0 = the encoder said NEED_MORE_INPUT (no output after all), -1 = error (err filled), -2 = the MFT gave no sample.
+// The caller has used up one HaveOutput event for this call. An asynchronous MFT allows one ProcessOutput per event: the answer MF_E_TRANSFORM_STREAM_CHANGE uses the event up (the Intel MFT answers a
+// second call without a new event with E_UNEXPECTED), so after the new output type the next HaveOutput is waited for (the deadline of an output) and only then is ProcessOutput called again. An MFT that
+// does not send a new event (the output was still owed) gets one ProcessOutput without an event after the deadline; when that fails too the encoder is given up (MFH264_E_HANG, the handle is dead).
 static int hw_pull(mfhw *h, struct mfh264_err *err, int *parts)
 {
 	int nparts = 0;
+	int noEventTry = 0;		// the stream change was not followed by an event: this ProcessOutput is the one try without it
 	h->rawLen = 0;
 	for (int attempt = 0; attempt < 16; attempt++)
 	{
@@ -810,6 +814,13 @@ static int hw_pull(mfhw *h, struct mfh264_err *err, int *parts)
 		HRESULT hr = h->mft->ProcessOutput(0, 1, &ob, &status);
 		if (ob.pEvents != NULL) { ob.pEvents->Release(); ob.pEvents = NULL; }
 		IMFSample *s = ob.pSample;
+		if (noEventTry && hr != MF_E_TRANSFORM_STREAM_CHANGE && FAILED(hr))
+		{
+			if (h->outProvides && s != NULL) { s->Release(); }
+			h->info.out_fail++; h->info.out_fail_hr = (long)hr;
+			h->dead = 1;
+			return mfp_fail(err, MFH264_E_HANG, hr, "no METransformHaveOutput after a stream change (ProcessOutput without an event failed)");
+		}
 		if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT)
 		{
 			if (h->outProvides && s != NULL) { s->Release(); }
@@ -826,11 +837,25 @@ static int hw_pull(mfhw *h, struct mfh264_err *err, int *parts)
 			h->st.stream_changes++;
 			if (setup_output(h, err) != MFH264_OK) { return err != NULL ? err->code : MFH264_E_ALLOC; }
 			refresh_seq_header(h);
-			continue;	// the output is still owed: ProcessOutput again. (By the contract of an asynchronous MFT every output has an event of its own, so a HaveOutput may be left over for this call; the AMD MFT does neither a stream change nor parts in the probe: not verified on hardware, a leftover event is only counted, see the start of hw_encode_impl.)
+			h->info.stream_changes++;
+			{
+				// the output is still owed: wait for its HaveOutput (the NeedInput events that come meanwhile are kept by hw_wait)
+				HRESULT whr = S_OK;
+				const double w0 = qpc_ms();
+				const int w = hw_wait(h, g_outMs, 0, 1, &whr);
+				const double dt = qpc_ms() - w0;
+				h->info.sc_wait_ms_last = (unsigned)(dt < 0.0 ? 0.0 : dt);
+				if (h->info.sc_wait_ms_last > h->info.sc_wait_ms_max) { h->info.sc_wait_ms_max = h->info.sc_wait_ms_last; }
+				if (w < 0) { h->dead = 1; return mfp_fail(err, MFH264_E_HANG, FAILED(whr) ? whr : E_FAIL, "event of the encoder after a stream change (error or end of the queue): the encoder is given up"); }
+				if (w > 0) { h->pendHave--; h->info.sc_event++; noEventTry = 0; }
+				else { h->info.sc_no_event++; noEventTry = 1; }
+			}
+			continue;
 		}
 		if (FAILED(hr))
 		{
 			if (h->outProvides && s != NULL) { s->Release(); }
+			h->info.out_fail++; h->info.out_fail_hr = (long)hr;
 			return mfp_fail(err, MFH264_E_OUTPUT, hr, "ProcessOutput");
 		}
 		if (s == NULL) { return -2; }
@@ -914,7 +939,8 @@ static int hw_encode_impl(struct mfh264 *hh, const uint8_t *nv12, size_t nv12_le
 		struct mfh264_err ignore;
 		int parts = 0, real = 0;
 		memset(&ignore, 0, sizeof(ignore));
-		while (h->pendHave > 0) { h->pendHave--; if (hw_pull(h, &ignore, &parts) != 0) { real = 1; } }
+		while (h->pendHave > 0) { h->pendHave--; if (hw_pull(h, &ignore, &parts) != 0) { real = 1; } if (h->dead) { break; } }
+		if (h->dead) { if (err != NULL) { *err = ignore; } return ignore.code; }	// the encoder did not answer after a stream change: given up
 		if (real) { return hw_break(h, err, S_OK, "an access unit that nobody asked for", MFH264_BROKEN_EXTRA_OUTPUT); }
 		h->info.events_other++;
 	}
@@ -958,6 +984,7 @@ static int hw_encode_impl(struct mfh264 *hh, const uint8_t *nv12, size_t nv12_le
 	if (r == -2) { return hw_break(h, err, S_OK, "ProcessOutput gave no sample", MFH264_BROKEN_NO_OUTPUT); }
 	if (r < 0)
 	{
+		if (h->dead) { return r; }	// the encoder did not answer after a stream change: given up (err says so)
 		// an error of ProcessOutput or of the copy, or an output that did not complete: the stream is started again (the cause stays in hr / stage; an INCOMPLETE reason is kept)
 		const int reason = (err != NULL && err->reason != 0) ? err->reason : MFH264_BROKEN_ERROR;
 		const long ehr = (err != NULL) ? err->hr : 0;
