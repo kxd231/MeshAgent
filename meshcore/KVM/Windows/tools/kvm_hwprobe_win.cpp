@@ -1320,7 +1320,8 @@ void Enc::close()
 // ---------------------------------------------------------------------------------------------------------------------- driving the encoder
 
 // One call of ProcessOutput. *got = 1 and the access unit in *data when a sample came out (all parts of an incomplete output joined). MF_E_TRANSFORM_STREAM_CHANGE is followed here
-// (the new output type is taken from the encoder's first available type) and returned so that the caller counts it and asks again; MF_E_TRANSFORM_NEED_MORE_INPUT means nothing is ready.
+// (the new output type is taken from the encoder's first available type) and returned so that the caller counts it (an asynchronous MFT used the event of the output up for it: the caller waits for the next HaveOutput; a
+// synchronous one is asked again); MF_E_TRANSFORM_NEED_MORE_INPUT means nothing is ready.
 HRESULT Enc::pull_one(std::vector<uint8_t> *data, OutRec *rec, bool *got)
 {
 	*got = false;
@@ -1416,6 +1417,7 @@ void Enc::run(const RunReq &rq, RunRes *res)
 	int submitted = 0, credits = 0, pendingOut = 0, notAcceptingRun = 0;
 	bool drainSent = false;
 	double drainAt = 0;
+	double scAt = 0;		// the time of a stream change that no HaveOutput has followed yet (0 = none)
 	std::vector<uint8_t> au;
 	OutRec rec;
 	res->submit.reserve((size_t)rq.frames);
@@ -1433,12 +1435,14 @@ void Enc::run(const RunReq &rq, RunRes *res)
 			while (pump->pop(&ev))
 			{
 				if (ev.type == METransformNeedInput) { credits++; res->needInput++; }
-				else if (ev.type == METransformHaveOutput) { pendingOut++; res->haveOutput++; }
+				else if (ev.type == METransformHaveOutput) { pendingOut++; res->haveOutput++; scAt = 0; }
 				else if (ev.type == METransformDrainComplete) { res->drained = true; }
 				else if (ev.type == MEError) { res->err = FAILED(ev.status) ? ev.status : E_FAIL; res->errStage = "MEError event"; }
 				else if (ev.type == 0xFFFF) { if (!drainSent || !res->drained) { res->err = ev.status; res->errStage = "GetEvent (the event queue ended)"; } }
 			}
 			if (FAILED(res->err)) { break; }
+			// a stream change used the event of its output up: the next ProcessOutput waits for the next HaveOutput; an MFT that sends none gets one call without it after 500 ms
+			if (scAt != 0 && pendingOut == 0 && hw_now_ms() > scAt + 500.0) { pendingOut = 1; scAt = 0; }
 		}
 		// submit
 		bool progressed = false;
@@ -1491,7 +1495,7 @@ void Enc::run(const RunReq &rq, RunRes *res)
 			{
 				bool got = false;
 				const HRESULT hr = pull_one(&au, &rec, &got);
-				if (hr == MF_E_TRANSFORM_STREAM_CHANGE) { res->streamChanges++; continue; }
+				if (hr == MF_E_TRANSFORM_STREAM_CHANGE) { res->streamChanges++; pendingOut--; scAt = hw_now_ms(); break; }
 				pendingOut--;
 				if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) { continue; }
 				if (FAILED(hr)) { res->err = hr; res->errStage = "ProcessOutput"; break; }
