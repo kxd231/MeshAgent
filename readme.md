@@ -53,9 +53,10 @@ stays blurry. The aim is smooth motion on slow links at the same or lower bandwi
    same session and remembers the problem. After repeated problems it stops using the graphics card on that
    computer, so a bad driver is not tried again and again.
 
-Tested on AMD (a laptop) and NVIDIA (GeForce RTX 2060 SUPER) graphics. Intel graphics were tried on one computer
-and worked; they are less tested than the other two. The self test decides on every computer, and the worst case
-is that the graphics card is not used and the software encoder does the work.
+Tested on AMD (a laptop) and NVIDIA (GeForce RTX 2060 SUPER) graphics. On Intel (UHD Graphics 770) the graphics
+card encoder passes the self test since the release h264-v3; with earlier releases Intel computers used the
+software encoder. The self test decides on every computer, and the worst case is that the graphics card is not
+used and the software encoder does the work.
 
 ### Auto frame rate
 
