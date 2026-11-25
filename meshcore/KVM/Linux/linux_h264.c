@@ -13,8 +13,9 @@ Licensed under the Apache License, Version 2.0 (same as the rest of the agent).
 #include <stdlib.h>
 #include <string.h>
 
-// The layouts of the structures that the library fills in or reads. They only grew at the end between the releases that are known (2.3 and 2.4, which added the PSNR fields), but
-// SLayerBSInfo is the element of an array inside SFrameBSInfo, so its size decides where the frame type is (it is bigger from 2.4, see KVML_LAYER_NEW). The structures that the library writes (SFrameBSInfo) or reads (SSourcePicture) are in zeroed buffers that are larger than either layout, and read through the offsets of the
+// The layouts of the structures that the library fills in or reads. They only grew at the end between the releases that are known (2.3 and 2.4 have the same layout, 2.6 and 2.7 have the
+// PSNR fields), but SLayerBSInfo is the element of an array inside SFrameBSInfo, so its size decides where the frame type is (see KVML_LAYER_NEW). Which of the two the loaded release
+// has is not taken from its version number (that guess was wrong for 2.4): the library writes the frame type at one of the two places, the buffer is zero at the other. The structures that the library writes (SFrameBSInfo) or reads (SSourcePicture) are in zeroed buffers that are larger than either layout, and read through the offsets of the
 // release that is loaded; the ones of the headers in openh264/ (2.3.1) are the prefix of both.
 #define KVML_BS_BYTES 16384
 // The sizes are computed for the platform from the structure of the headers in the tree (2.3.1: sizeof) and the three floats of the newer one, rounded to its alignment: 40 and 56 on
@@ -43,6 +44,7 @@ static struct
 	OpenH264Version ver;
 	char why[160];
 } gLib;
+static int gFail = -1;	// -1: the environment has not been read yet
 
 static int load_fail(int rc, const char *what, const char *detail)
 {
@@ -221,10 +223,12 @@ int kvml_h264_encode(kvml_h264 *e, const uint8_t *y, const uint8_t *u, const uin
 	SSourcePicture *src = &us.p;
 	size_t total = 0;
 	int l, rc, layers;
-	const size_t stride = (gLib.ver.uMinor >= 4) ? (size_t)KVML_LAYER_NEW : (size_t)KVML_LAYER_OLD;
+	size_t stride = (size_t)KVML_LAYER_OLD;
 	const unsigned char *frameType;
 	if (len != NULL) { *len = 0; }
 	if (isIdr != NULL) { *isIdr = 0; }
+	if (gFail < 0) { const char *f = getenv("MESH_KVM_H264_FAIL"); gFail = (f != NULL && f[0] != 0 && f[0] != '0') ? 1 : 0; }
+	if (gFail) { return KVML_H264_E_ENCODE; }	// MESH_KVM_H264_FAIL=1: the encoder fails at every frame (the tests of the way back to JPEG)
 	if (e == NULL || y == NULL || u == NULL || v == NULL || out == NULL) { return KVML_H264_E_PARAM; }
 	memset(&us, 0, sizeof(us));
 	memset(e->bs, 0, KVML_BS_BYTES);
@@ -243,10 +247,12 @@ int kvml_h264_encode(kvml_h264 *e, const uint8_t *y, const uint8_t *u, const uin
 	e->frame++;
 	// SFrameBSInfo: iLayerNum, the layers (sizeof depends on the release), then the frame type
 	memcpy(&layers, e->bs, sizeof(layers));
-	frameType = e->bs + offsetof(SFrameBSInfo, sLayerInfo) + ((size_t)MAX_LAYER_NUM_OF_FRAME * stride);
 	{
-		EVideoFrameType ft;
+		EVideoFrameType ft, ftNew;
+		frameType = e->bs + offsetof(SFrameBSInfo, sLayerInfo) + ((size_t)MAX_LAYER_NUM_OF_FRAME * stride);
 		memcpy(&ft, frameType, sizeof(ft));
+		memcpy(&ftNew, e->bs + offsetof(SFrameBSInfo, sLayerInfo) + ((size_t)MAX_LAYER_NUM_OF_FRAME * (size_t)KVML_LAYER_NEW), sizeof(ftNew));
+		if ((ft == videoFrameTypeInvalid) && (ftNew != videoFrameTypeInvalid)) { ft = ftNew; stride = (size_t)KVML_LAYER_NEW; }	// the layout with the PSNR fields
 		if (rc != cmResultSuccess || ft == videoFrameTypeInvalid || ft == videoFrameTypeSkip || layers < 1 || layers > MAX_LAYER_NUM_OF_FRAME) { return KVML_H264_E_ENCODE; }
 		if (isIdr != NULL) { *isIdr = (ft == videoFrameTypeIDR) ? 1 : 0; }
 	}

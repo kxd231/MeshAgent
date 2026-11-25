@@ -558,6 +558,33 @@ static void test_nolib(void)
 	CHECK_EQ(gLast242.video, 0); CHECK_EQ(gLast242.ack, 1); CHECK_EQ(gLast242.reason, KVM_REASON_NO_MF); CHECK_EQ(gLast242.caps & 1, 0);
 }
 
+// the encoder fails at every frame (MESH_KVM_H264_FAIL=1, a process of its own): three lost access units are an error of the encoder, 242 reason 4; the ACK stays and the picture goes on as JPEG
+static void test_encoder_fails(void)
+{
+	int k, x = 64;
+	unsigned j0;
+	begin_session(1024, 768);
+	op(KVM_OP_VIDEO_ON, KVM_PROFILE_CBP | KVM_PROFILE_MAIN | KVM_PROFILE_HIGH, 0);
+	for (k = 0; k < 20; k++) { x += 24; iteration(k, x); viewer_ack(); }
+	look_242();
+	CHECK(gHave242);
+	CHECK_EQ(gLast242.video, 0); CHECK_EQ(gLast242.ack, 1); CHECK_EQ(gLast242.reason, KVM_REASON_ERROR);
+	CHECK_EQ(st_state(), KVM_VS_OFF);
+	CHECK_EQ(st_frames(), 0);
+	CHECK_EQ(kvml_test_stream()->ackActive, 1);
+	CHECK_EQ(kvml_test_stream()->videoOn, 0);
+	CHECK_EQ(st_pending(), 0);
+	j0 = gJpegTiles;
+	for (k = 20; k < 40; k++) { x += 24; iteration(k, x); viewer_ack(); }			// the motion goes as JPEG now
+	CHECK(gJpegTiles > j0 + 100);
+	CHECK_EQ(kvml_test_stream()->ackActive, 1);
+	// after 60 s the video is tried again (a new generation), and fails again
+	kvml_test_now += 61000;
+	for (k = 40; k < 60; k++) { x += 24; iteration(k, x); viewer_ack(); }
+	CHECK(gCount242 >= 3);
+	CHECK_EQ(kvml_test_stream()->ackActive, 1);
+}
+
 static void test_off(void)
 {
 	begin_session(1024, 768);
@@ -648,6 +675,7 @@ int main(int argc, char **argv)
 {
 	if (argc > 1 && strcmp(argv[1], "nolib") == 0) { test_nolib(); }
 	else if (argc > 1 && strcmp(argv[1], "off") == 0) { test_off(); }
+	else if (argc > 1 && strcmp(argv[1], "fail") == 0) { test_encoder_fails(); }
 	else if (argc > 2 && strcmp(argv[1], "check") == 0) { (void)check_decoded(argv[2]); }
 	else
 	{

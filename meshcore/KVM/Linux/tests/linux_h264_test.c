@@ -160,9 +160,24 @@ static void test_sizes(void)
 	CHECK_EQ(n, sizeof(void *) == 8 ? 56 : 40);
 }
 
+// MESH_KVM_H264_FAIL=1: every frame fails, the encoder itself opens
+static void test_fail(void)
+{
+	uint8_t pic[64 * 64 * 3 / 2], out[4096];
+	size_t len = 7;
+	int isIdr = 1, err = 0;
+	kvml_h264 *e = kvml_h264_open(64, 64, 66, 31, 28, 30, &err);
+	CHECK(e != NULL);
+	memset(pic, 128, sizeof(pic));
+	CHECK_EQ(kvml_h264_encode(e, pic, pic + 4096, pic + 4096 + 1024, 0, out, sizeof(out), &len, &isIdr), KVML_H264_E_ENCODE);
+	CHECK_EQ(len, 0); CHECK_EQ(isIdr, 0);
+	kvml_h264_close(e);
+}
+
 int main(int argc, char **argv)
 {
-	if (argc > 1 && strcmp(argv[1], "sizes") == 0) { test_sizes(); }
+	if (argc > 1 && strcmp(argv[1], "fail") == 0) { test_fail(); }
+	else if (argc > 1 && strcmp(argv[1], "sizes") == 0) { test_sizes(); }
 	else if (argc > 1 && strcmp(argv[1], "nolib") == 0) { test_nolib(); }
 	else
 	{

@@ -6,15 +6,24 @@
 set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../../../.." && pwd)
-for DIST in bookworm:libopenh264-7 trixie:libopenh264-8; do
-IMG=kvm-h264test:${DIST%%:*}
+# name=image=package: openh264 2.3.1 (Debian 12), 2.4.1 (Ubuntu 24.04), 2.6.0 (Debian 13), 2.7.0 (Arch; no ffmpeg there: the decoding steps are left out)
+for DIST in bookworm=debian:bookworm-slim=libopenh264-7 noble=ubuntu:24.04=libopenh264-7 trixie=debian:trixie-slim=libopenh264-8 arch=archlinux:base=openh264; do
+NAME=${DIST%%=*}; REST=${DIST#*=}; BASE=${REST%%=*}; PKG=${REST#*=}
+IMG=kvm-h264test:$NAME
 if ! docker image inspect "$IMG" >/dev/null 2>&1; then
-    docker build -q -t "$IMG" - <<DOCKERFILE
-FROM debian:${DIST%%:*}-slim
-RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends gcc libc6-dev make ${DIST##*:} ffmpeg >/dev/null && rm -rf /var/lib/apt/lists/*
+    if [ "$NAME" = arch ]; then
+        docker build -q -t "$IMG" - <<DOCKERFILE
+FROM $BASE
+RUN pacman -Syu --noconfirm gcc make $PKG >/dev/null
 DOCKERFILE
+    else
+        docker build -q -t "$IMG" - <<DOCKERFILE
+FROM $BASE
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends gcc libc6-dev make $PKG ffmpeg >/dev/null && rm -rf /var/lib/apt/lists/*
+DOCKERFILE
+    fi
 fi
-echo "######## ${DIST%%:*}: $(docker run --rm --entrypoint sh "$IMG" -c 'ls /usr/lib/x86_64-linux-gnu | grep "^libopenh264.so\.[0-9]*\.[0-9.]*$"')"
+echo "######## $NAME: $(docker run --rm --entrypoint sh "$IMG" -c 'ls /usr/lib /usr/lib/x86_64-linux-gnu 2>/dev/null | grep "^libopenh264.so\.[0-9]*\.[0-9.]*$"')"
 docker run --rm --user "$(id -u):$(id -g)" -v "$ROOT/meshcore:/src/meshcore:ro" -w /tmp "$IMG" sh -c '
 set -eu
 cp -r /src/meshcore /tmp/meshcore
@@ -27,13 +36,17 @@ gcc -std=gnu99 -O2 -Wall -Wextra -Werror -DKVML_TEST -I/tmp -o linux_video_test 
 echo "== no library / switched off"
 MESH_KVM_OPENH264=/nonexistent/libopenh264.so.7 ./linux_video_test nolib
 MESH_KVM_VIDEO=0 ./linux_video_test off
+echo "== the encoder fails"
+MESH_KVM_H264_FAIL=1 ./linux_video_test fail
 echo "== AddressSanitizer + UndefinedBehaviorSanitizer"
 gcc -std=gnu99 -O1 -g -Wall -Wextra -Werror -DKVML_TEST -I/tmp -fsanitize=address,undefined -fno-sanitize-recover=undefined -o linux_video_test_asan $SRC -lm -ldl
 ./linux_video_test_asan
 echo "== the decoder reads the stream of the recorded scenario"
 mkdir -p /tmp/rec
 ./linux_video_test run /tmp/rec
-ffmpeg -v error -i /tmp/rec/stream.h264 -vsync 0 -pix_fmt rgb24 -f rawvideo /tmp/rec/decoded.rgb
-./linux_video_test check /tmp/rec
+if command -v ffmpeg >/dev/null; then
+    ffmpeg -v error -i /tmp/rec/stream.h264 -vsync 0 -pix_fmt rgb24 -f rawvideo /tmp/rec/decoded.rgb
+    ./linux_video_test check /tmp/rec
+else echo "(no ffmpeg in this image: the stream is not decoded)"; fi
 '
 done
