@@ -5,14 +5,16 @@
 set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../../../.." && pwd)
-IMG=kvm-h264test:local
+for DIST in bookworm:libopenh264-7 trixie:libopenh264-8; do
+IMG=kvm-h264test:${DIST%%:*}
 if ! docker image inspect "$IMG" >/dev/null 2>&1; then
-    docker build -q -t "$IMG" - <<'DOCKERFILE'
-FROM debian:bookworm-slim
-RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends gcc libc6-dev make libopenh264-7 ffmpeg >/dev/null && rm -rf /var/lib/apt/lists/*
+    docker build -q -t "$IMG" - <<DOCKERFILE
+FROM debian:${DIST%%:*}-slim
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends gcc libc6-dev make ${DIST##*:} ffmpeg >/dev/null && rm -rf /var/lib/apt/lists/*
 DOCKERFILE
 fi
-exec docker run --rm --user "$(id -u):$(id -g)" -v "$ROOT/meshcore:/src/meshcore:ro" -w /tmp "$IMG" sh -c '
+echo "######## ${DIST%%:*}: $(docker run --rm --entrypoint sh "$IMG" -c 'ls /usr/lib/x86_64-linux-gnu | grep "^libopenh264.so\.[0-9]*\.[0-9.]*$"')"
+docker run --rm --user "$(id -u):$(id -g)" -v "$ROOT/meshcore:/src/meshcore:ro" -w /tmp "$IMG" sh -c '
 set -eu
 cp -r /src/meshcore /tmp/meshcore
 cd /tmp/meshcore/KVM/Linux/tests
@@ -33,3 +35,4 @@ for f in /tmp/dump/*.h264; do
     echo "$(basename "$f"): $fr"
 done
 '
+done

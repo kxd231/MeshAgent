@@ -8,15 +8,25 @@ Licensed under the Apache License, Version 2.0 (same as the rest of the agent).
 #include "openh264/codec_api.h"
 
 #include <dlfcn.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+// The layouts of the structures that the library fills in or reads. They only grew at the end between the releases that are known (2.3 and 2.4, which added the PSNR fields), but
+// SLayerBSInfo is the element of an array inside SFrameBSInfo, so its size decides where the frame type is: 40 bytes up to 2.3, 56 from 2.4 (checked against the headers of 2.3.1 and
+// 2.6.0). The structures that the library writes (SFrameBSInfo) or reads (SSourcePicture) are in zeroed buffers that are larger than either layout, and read through the offsets of the
+// release that is loaded; the ones of the headers in openh264/ (2.3.1) are the prefix of both.
+#define KVML_BS_BYTES 16384
+#define KVML_LAYER_OLD 40
+#define KVML_LAYER_NEW 56
+#define KVML_SRC_BYTES 256
 struct kvml_h264
 {
 	ISVCEncoder *enc;
 	int w, h, qp;
 	long long frame;
+	unsigned char *bs;		// the SFrameBSInfo of the library
 };
 
 typedef int (*create_fn)(ISVCEncoder **);
@@ -63,9 +73,9 @@ int kvml_h264_load(char *why, size_t cap)
 		if (gLib.create == NULL || gLib.destroy == NULL || ver == NULL) { (void)load_fail(KVML_H264_E_SYMBOL, "libopenh264 lacks WelsCreateSVCEncoder, WelsDestroySVCEncoder or WelsGetCodecVersionEx", used); goto out; }
 		memset(&gLib.ver, 0, sizeof(gLib.ver));
 		ver(&gLib.ver);
-		// The structures of the headers (2.3.1) are the ones of every 2.x release that was looked at (the parameters are filled in by the library itself: GetDefaultParams, into a buffer
-		// that is larger than ours); a library of another major version, or older than 2.1, is not trusted with them
-		if (gLib.ver.uMajor != 2 || gLib.ver.uMinor < 1 || gLib.ver.uMinor > 6)
+		// The structures of the headers (2.3.1) are the prefix of those of 2.3 to 2.6 (see KVML_LAYER_NEW); the parameters are filled in by the library itself (GetDefaultParams, into a
+		// buffer that is larger than ours). Another major version, or an older minor one, is not trusted with them
+		if (gLib.ver.uMajor != 2 || gLib.ver.uMinor < 3 || gLib.ver.uMinor > 6)
 		{
 			char d[48];
 			snprintf(d, sizeof(d), "%u.%u.%u", gLib.ver.uMajor, gLib.ver.uMinor, gLib.ver.uRevision);
@@ -111,7 +121,9 @@ kvml_h264 *kvml_h264_open(int codedW, int codedH, int profile, int level, int qp
 	if (fps < 1) { fps = 1; } else if (fps > 60) { fps = 60; }
 	e = (kvml_h264 *)calloc(1, sizeof(*e));
 	if (e == NULL) { if (err != NULL) { *err = KVML_H264_E_MEMORY; } return NULL; }
-	if (gLib.create(&e->enc) != 0 || e->enc == NULL) { free(e); if (err != NULL) { *err = KVML_H264_E_PARAM; } return NULL; }
+	e->bs = (unsigned char *)calloc(1, KVML_BS_BYTES);
+	if (e->bs == NULL) { free(e); if (err != NULL) { *err = KVML_H264_E_MEMORY; } return NULL; }
+	if (gLib.create(&e->enc) != 0 || e->enc == NULL) { free(e->bs); free(e); if (err != NULL) { *err = KVML_H264_E_PARAM; } return NULL; }
 	{
 		int trace = 0;											// WELS_LOG_QUIET (before the parameters are checked): the library does not write to the stderr of the capture process
 		(void)(*e->enc)->SetOption(e->enc, ENCODER_OPTION_TRACE_LEVEL, &trace);
@@ -165,6 +177,7 @@ kvml_h264 *kvml_h264_open(int codedW, int codedH, int profile, int level, int qp
 	return e;
 fail:
 	gLib.destroy(e->enc);
+	free(e->bs);
 	free(e);
 	return NULL;
 }
@@ -173,6 +186,7 @@ void kvml_h264_close(kvml_h264 *e)
 {
 	if (e == NULL) { return; }
 	if (e->enc != NULL) { (*e->enc)->Uninitialize(e->enc); gLib.destroy(e->enc); }
+	free(e->bs);
 	free(e);
 }
 
@@ -195,40 +209,51 @@ int kvml_h264_set_qp(kvml_h264 *e, int qp)
 
 int kvml_h264_encode(kvml_h264 *e, const uint8_t *y, const uint8_t *u, const uint8_t *v, int forceIdr, uint8_t *out, size_t cap, size_t *len, int *isIdr)
 {
-	SSourcePicture src;
-	SFrameBSInfo info;
+	union { SSourcePicture p; unsigned char pad[KVML_SRC_BYTES]; } us;
+	SSourcePicture *src = &us.p;
 	size_t total = 0;
-	int l, rc;
+	int l, rc, layers;
+	const size_t stride = (gLib.ver.uMinor >= 4) ? KVML_LAYER_NEW : KVML_LAYER_OLD;
+	const unsigned char *frameType;
 	if (len != NULL) { *len = 0; }
 	if (isIdr != NULL) { *isIdr = 0; }
 	if (e == NULL || y == NULL || u == NULL || v == NULL || out == NULL) { return KVML_H264_E_PARAM; }
-	memset(&src, 0, sizeof(src));
-	memset(&info, 0, sizeof(info));
-	src.iColorFormat = videoFormatI420;
-	src.iPicWidth = e->w;
-	src.iPicHeight = e->h;
-	src.iStride[0] = e->w;
-	src.iStride[1] = e->w / 2;
-	src.iStride[2] = e->w / 2;
-	src.pData[0] = (unsigned char *)y;
-	src.pData[1] = (unsigned char *)u;
-	src.pData[2] = (unsigned char *)v;
-	src.uiTimeStamp = (long long)(e->frame * 33);
+	memset(&us, 0, sizeof(us));
+	memset(e->bs, 0, KVML_BS_BYTES);
+	src->iColorFormat = videoFormatI420;
+	src->iPicWidth = e->w;
+	src->iPicHeight = e->h;
+	src->iStride[0] = e->w;
+	src->iStride[1] = e->w / 2;
+	src->iStride[2] = e->w / 2;
+	src->pData[0] = (unsigned char *)y;
+	src->pData[1] = (unsigned char *)u;
+	src->pData[2] = (unsigned char *)v;
+	src->uiTimeStamp = (long long)(e->frame * 33);
 	if (forceIdr) { (void)(*e->enc)->ForceIntraFrame(e->enc, true); }
-	rc = (*e->enc)->EncodeFrame(e->enc, &src, &info);
+	rc = (*e->enc)->EncodeFrame(e->enc, src, (SFrameBSInfo *)(void *)e->bs);
 	e->frame++;
-	if (rc != cmResultSuccess || info.eFrameType == videoFrameTypeInvalid || info.eFrameType == videoFrameTypeSkip) { return KVML_H264_E_ENCODE; }
-	for (l = 0; l < info.iLayerNum; l++)
+	// SFrameBSInfo: iLayerNum, the layers (sizeof depends on the release), then the frame type
+	memcpy(&layers, e->bs, sizeof(layers));
+	frameType = e->bs + offsetof(SFrameBSInfo, sLayerInfo) + ((size_t)MAX_LAYER_NUM_OF_FRAME * stride);
 	{
-		const SLayerBSInfo *lay = &info.sLayerInfo[l];
+		EVideoFrameType ft;
+		memcpy(&ft, frameType, sizeof(ft));
+		if (rc != cmResultSuccess || ft == videoFrameTypeInvalid || ft == videoFrameTypeSkip || layers < 1 || layers > MAX_LAYER_NUM_OF_FRAME) { return KVML_H264_E_ENCODE; }
+		if (isIdr != NULL) { *isIdr = (ft == videoFrameTypeIDR) ? 1 : 0; }
+	}
+	for (l = 0; l < layers; l++)
+	{
+		SLayerBSInfo lay;
 		int n, bytes = 0;
-		for (n = 0; n < lay->iNalCount; n++) { bytes += lay->pNalLengthInByte[n]; }
-		if (bytes < 0 || total + (size_t)bytes > cap) { return KVML_H264_E_SIZE; }
-		memcpy(out + total, lay->pBsBuf, (size_t)bytes);
+		memcpy(&lay, e->bs + offsetof(SFrameBSInfo, sLayerInfo) + ((size_t)l * stride), sizeof(lay));	// (the prefix of the layer of any release)
+		if (lay.iNalCount < 0 || lay.iNalCount > 128 || lay.pNalLengthInByte == NULL || lay.pBsBuf == NULL) { if (isIdr != NULL) { *isIdr = 0; } return KVML_H264_E_ENCODE; }
+		for (n = 0; n < lay.iNalCount; n++) { bytes += lay.pNalLengthInByte[n]; }
+		if (bytes < 0 || total + (size_t)bytes > cap) { if (isIdr != NULL) { *isIdr = 0; } return KVML_H264_E_SIZE; }
+		memcpy(out + total, lay.pBsBuf, (size_t)bytes);
 		total += (size_t)bytes;
 	}
-	if (total == 0) { return KVML_H264_E_ENCODE; }
+	if (total == 0) { if (isIdr != NULL) { *isIdr = 0; } return KVML_H264_E_ENCODE; }
 	if (len != NULL) { *len = total; }
-	if (isIdr != NULL) { *isIdr = (info.eFrameType == videoFrameTypeIDR) ? 1 : 0; }
 	return KVML_H264_OK;
 }
