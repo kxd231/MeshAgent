@@ -4,10 +4,10 @@ KVM (Linux): the end-to-end ACK of the commands 240-243 in the capture process.
 The protocol and the window are in meshcore/KVM/common/kvm_stream.c (portable, tested in Docker); this is the glue of the Linux capture process (the "slave", X11 and DRM
 alike). The slave is one thread: the main loop reads the commands of the viewer, writes the pictures and the answers, so nothing here takes a lock. Every byte that the
 slave writes to the pipe goes through kvml_write (kvm_slave_send in linux_kvm.c), so that the byte counter of the window and the positions in its ring describe the same
-order. Only the JPEG picture is there: a viewer that asks for H.264 is told "no video in this build" (242 reason 1) and still gets the ACK window.
+order. A viewer that asks for H.264 is answered by linux_video.c (the video, or the reason why not: 2 no encoder library, 6 switched off) and gets the ACK window either way.
 
 Off with -DKVM_STREAM_DISABLE (then the agent eats 240 and 241 like an agent from before them and never sends 242) and, per process, with MESH_KVM_ACK=0 (caps 0,
-op 1 and op 4 are answered with reason 6, nothing is limited). MESH_KVM_STREAM_LOG=1 writes the commands, the answers and a line of statistics every 5 s to stderr.
+op 1 and op 4 are answered with reason 6, nothing is limited). MESH_KVM_STREAM_LOG=1 writes the commands, the answers and a line of statistics every 5 s to stderr (a path: to that file).
 
 Licensed under the Apache License, Version 2.0 (same as the rest of the agent).
 */

@@ -5,9 +5,14 @@ The clock is moved by hand (-DKVML_TEST) and the pipe is a buffer, so every scen
 
 #include "../linux_kvm_stream.h"
 #include "../../common/kvm_stream.h"
+#include "../linux_tileinfo.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+// the globals of the capture process that the glue reads (the tiles)
+int SCREEN_WIDTH = 0, SCREEN_HEIGHT = 0, TILE_WIDTH = 32, TILE_HEIGHT = 32, TILE_WIDTH_COUNT = 0, TILE_HEIGHT_COUNT = 0, FRAME_RATE_TIMER = 100;
+struct tileInfo_t **g_tileInfo = NULL;
 
 extern uint32_t kvml_test_now;
 extern const kvm_stream *kvml_test_stream(void);
@@ -339,6 +344,33 @@ static void test_scan_tiles(void)
 	kvml_session_end();
 }
 
+// The scan is deferred by the window while the coalescing has already marked tiles of the row below (new CRC, TILE_MARKED_NOT_SENT) to be sent later in the frame. The next frame sets
+// every flag to TODO and compares the CRC of the picture with the stored one: a tile that kept its new CRC would look unchanged and its change would be lost for good.
+static void test_deferred_scan_keeps_the_marked_tiles(void)
+{
+	struct tileInfo_t rows[3][3], *p[3];
+	int r, c;
+	const int crcA = 1111, crcB = 2222, crcC = 3333;
+	start();
+	TILE_HEIGHT_COUNT = 3; TILE_WIDTH_COUNT = 3;
+	for (r = 0; r < 3; r++) { p[r] = rows[r]; for (c = 0; c < 3; c++) { rows[r][c].crc = 100 + r * 3 + c; rows[r][c].flag = TILE_TODO; } }
+	g_tileInfo = p;
+	rows[0][0].crc = crcA; rows[0][0].flag = TILE_SENT;				// the seed, sent
+	rows[1][0].crc = crcB; rows[1][0].flag = TILE_MARKED_NOT_SENT;	// the row below: changed, did not join, to be sent later
+	rows[2][2].crc = crcC; rows[2][2].flag = TILE_MARKED_NOT_SENT;	// another one that the coalescing marked
+	rows[0][1].crc = 77; rows[0][1].flag = TILE_TODO;				// the tile that the window refused: not looked at, its CRC is the old one
+	kvml_scan_deferred(1);
+	CHECK_EQ(rows[1][0].crc, 0xFF);									// the next frame finds it different from the picture (crcB) and sends it
+	CHECK_EQ(rows[2][2].crc, 0xFF);
+	CHECK_EQ(rows[0][0].crc, crcA);									// what was sent keeps its CRC
+	CHECK_EQ(rows[0][1].crc, 77);									// what was not looked at is left alone
+	CHECK_EQ(rows[1][1].crc, 104);
+	CHECK(rows[1][0].crc != crcB);									// (the old code: equal, and the change was lost)
+	g_tileInfo = NULL;
+	kvml_scan_deferred(1);											// no tile table: nothing to do
+	kvml_session_end();
+}
+
 int main(void)
 {
 	test_announce_and_requests();
@@ -350,6 +382,7 @@ int main(void)
 	test_round_trip_is_measured_from_the_arrival();
 	test_a_blocked_write_stops_the_clocks();
 	test_scan_tiles();
+	test_deferred_scan_keeps_the_marked_tiles();
 	printf("%d checks, %d failed\n", gChecks, gFail);
 	return gFail ? 1 : 0;
 }

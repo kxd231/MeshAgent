@@ -6,6 +6,7 @@ Licensed under the Apache License, Version 2.0 (same as the rest of the agent).
 
 #include "linux_kvm_stream.h"
 #include "linux_video.h"
+#include "linux_tileinfo.h"
 
 int g_tileDeferred = 0;
 
@@ -233,7 +234,22 @@ int kvml_gate_sharpen(void)
 	return ok;
 }
 
-void kvml_scan_deferred(int tile) { gResumeTile = tile; }
+// The scan of the frame stops here because the window is full. The coalescing of a rectangle has already marked tiles further on (the row below, a tile of another class) as changed and
+// given them their new CRC, and they were to be sent later in this frame. The next frame sets every flag to TODO and compares the CRC with the one of the picture, so such a tile would
+// look unchanged and the viewer would keep the old picture for good. Their CRC becomes the one of a tile that was never sent (0xFF): the next frame sends them (as a picture).
+void kvml_scan_deferred(int tile)
+{
+	int r, c;
+	gResumeTile = tile;
+	if (g_tileInfo == NULL) { return; }
+	for (r = 0; r < TILE_HEIGHT_COUNT; r++)
+	{
+		for (c = 0; c < TILE_WIDTH_COUNT; c++)
+		{
+			if (g_tileInfo[r][c].flag == TILE_MARKED_NOT_SENT) { g_tileInfo[r][c].crc = 0xFF; }
+		}
+	}
+}
 
 int kvml_scan_start(int tiles)
 {

@@ -36,3 +36,20 @@ for f in /tmp/dump/*.h264; do
 done
 '
 done
+# the same sources for a 32 bit target (i686, armhf have the video too): the sizes of the structures of the library are the ones of that platform
+IMG=kvm-h264test:m32
+if ! docker image inspect "$IMG" >/dev/null 2>&1; then
+    docker build -q -t "$IMG" - <<DOCKERFILE
+FROM debian:bookworm-slim
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends gcc gcc-multilib libc6-dev make >/dev/null && rm -rf /var/lib/apt/lists/*
+DOCKERFILE
+fi
+echo "######## 32 bit"
+docker run --rm --user "$(id -u):$(id -g)" -v "$ROOT/meshcore:/src/meshcore:ro" -w /tmp "$IMG" sh -c '
+set -eu
+cp -r /src/meshcore /tmp/meshcore
+cd /tmp/meshcore/KVM/Linux/tests
+C=../../common
+gcc -m32 -std=gnu99 -O2 -Wall -Wextra -Werror -Wno-error=unused-variable -Wno-error=unused-but-set-variable -I/tmp -o linux_h264_test32 linux_h264_test.c ../linux_h264.c $C/kvm_annexb.c $C/kvm_video_core.c $C/kvm_yuv.c $C/kvm_stream.c -ldl
+./linux_h264_test32 sizes
+'

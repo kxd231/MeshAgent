@@ -150,14 +150,26 @@ static void test_qp_and_size(void)
 	free(i420); free(au);
 }
 
+// the sizes of the layer of the frame info follow the platform (64 bit: 40 and 56, 32 bit: 28 and 40); a process of its own for the 32 bit build, which has no library to load
+static void test_sizes(void)
+{
+	size_t o = 0, n = 0;
+	kvml_h264_layer_sizes(&o, &n);
+	printf("layer of the frame info: %zu and %zu bytes (pointers of %zu bytes)\n", o, n, sizeof(void *));
+	CHECK_EQ(o, sizeof(void *) == 8 ? 40 : 28);
+	CHECK_EQ(n, sizeof(void *) == 8 ? 56 : 40);
+}
+
 int main(int argc, char **argv)
 {
-	if (argc > 1 && strcmp(argv[1], "nolib") == 0) { test_nolib(); }
+	if (argc > 1 && strcmp(argv[1], "sizes") == 0) { test_sizes(); }
+	else if (argc > 1 && strcmp(argv[1], "nolib") == 0) { test_nolib(); }
 	else
 	{
 		test_streams(argc > 2 && strcmp(argv[1], "dump") == 0 ? argv[2] : NULL);
 		test_params();
 		test_qp_and_size();
+		test_sizes();
 	}
 	printf("%d checks, %d failed\n", gChecks, gFail);
 	return gFail == 0 ? 0 : 1;

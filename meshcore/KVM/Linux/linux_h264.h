@@ -28,7 +28,7 @@ extern "C" {
 #define KVML_H264_OK 0
 #define KVML_H264_E_NOLIB -1		// no libopenh264.so.7 / .8 (or the file of MESH_KVM_OPENH264 does not load)
 #define KVML_H264_E_SYMBOL -2		// the library lacks a function that is needed
-#define KVML_H264_E_VERSION -3		// a version whose structures are not the ones of the headers (major 2, minor 1 to 6 are known)
+#define KVML_H264_E_VERSION -3		// a version whose structures are not the ones of the headers (major 2, minor 3 to 7 are accepted)
 #define KVML_H264_E_PARAM -4		// the encoder does not accept the parameters (size, profile, level)
 #define KVML_H264_E_MEMORY -5
 #define KVML_H264_E_ENCODE -6		// the encoder failed or gave nothing for a frame
@@ -36,6 +36,8 @@ extern "C" {
 
 typedef struct kvml_h264 kvml_h264;
 
+// The sizes of the layer of the frame info that were computed for this platform (old = up to 2.3, new = from 2.4): tests
+void kvml_h264_layer_sizes(size_t *oldSize, size_t *newSize);
 // Loads the library once per process (later calls give the same answer). `why` (may be NULL) gets a line for the log. Returns KVML_H264_OK or a KVML_H264_E_* code.
 int kvml_h264_load(char *why, size_t cap);
 // The version of the loaded library (0 when it is not loaded)

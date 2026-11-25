@@ -18,10 +18,10 @@ cp -r /src/meshcore /tmp/meshcore
 cd /tmp/meshcore/KVM/Linux/tests
 SRC="linux_kvm_stream_test.c ../linux_kvm_stream.c ../../common/kvm_stream.c"
 echo "== plain build (-std=gnu99 -O2 -Wall -Wextra -Werror)"
-gcc -std=gnu99 -O2 -Wall -Wextra -Werror -DKVML_TEST -I/tmp -o linux_kvm_stream_test $SRC
+gcc -std=gnu99 -O2 -Wall -Wextra -Werror -DKVML_TEST -DKVM_VIDEO_DISABLE -I/tmp -o linux_kvm_stream_test $SRC
 ./linux_kvm_stream_test
 echo "== AddressSanitizer + UndefinedBehaviorSanitizer"
-gcc -std=gnu99 -O1 -g -Wall -Wextra -Werror -DKVML_TEST -I/tmp -fsanitize=address,undefined -fno-sanitize-recover=undefined -o linux_kvm_stream_test_asan $SRC
+gcc -std=gnu99 -O1 -g -Wall -Wextra -Werror -DKVML_TEST -DKVM_VIDEO_DISABLE -I/tmp -fsanitize=address,undefined -fno-sanitize-recover=undefined -o linux_kvm_stream_test_asan $SRC
 ./linux_kvm_stream_test_asan
 echo "== the glue is not compiled with -DKVM_STREAM_DISABLE"
 gcc -std=gnu99 -O2 -Wall -Wextra -Werror -DKVM_STREAM_DISABLE -I/tmp -c -o /tmp/off.o ../linux_kvm_stream.c

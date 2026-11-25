@@ -508,7 +508,7 @@ static int kvm_drm_send_dirty_tiles(const unsigned char *rgbBuffer, size_t rgbSi
 		getTileAt(width, height, &tilePacket, &tilePacketSize, *desktopBuffer, *desktopBufferSize, y, x);
 		if (g_tileDeferred)
 		{
-			// the window of the viewer is full: this and the tiles after it are looked at again in the next frame (their CRCs were not changed)
+			// the window of the viewer is full: this and the tiles after it are looked at again in the next frame (the tiles that were marked and not reached get the CRC of a tile that was never sent: kvml_scan_deferred)
 			g_tileDeferred = 0;
 			kvml_scan_deferred(tileIndex);
 			break;
@@ -3605,6 +3605,7 @@ void *kvm_server_mainloop_drm(void *parm)
 		kvml_iteration_end(); // rule M1: what this iteration wrote ends with a position the viewer can acknowledge
 	}
 
+	kvml_session_end(); // the last line of statistics, the encoder is closed
 	if (desktopBuffer != NULL)
 	{
 		free(desktopBuffer);

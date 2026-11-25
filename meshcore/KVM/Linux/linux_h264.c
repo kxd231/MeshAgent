@@ -14,12 +14,13 @@ Licensed under the Apache License, Version 2.0 (same as the rest of the agent).
 #include <string.h>
 
 // The layouts of the structures that the library fills in or reads. They only grew at the end between the releases that are known (2.3 and 2.4, which added the PSNR fields), but
-// SLayerBSInfo is the element of an array inside SFrameBSInfo, so its size decides where the frame type is: 40 bytes up to 2.3, 56 from 2.4 (checked against the headers of 2.3.1 and
-// 2.6.0). The structures that the library writes (SFrameBSInfo) or reads (SSourcePicture) are in zeroed buffers that are larger than either layout, and read through the offsets of the
+// SLayerBSInfo is the element of an array inside SFrameBSInfo, so its size decides where the frame type is (it is bigger from 2.4, see KVML_LAYER_NEW). The structures that the library writes (SFrameBSInfo) or reads (SSourcePicture) are in zeroed buffers that are larger than either layout, and read through the offsets of the
 // release that is loaded; the ones of the headers in openh264/ (2.3.1) are the prefix of both.
 #define KVML_BS_BYTES 16384
-#define KVML_LAYER_OLD 40
-#define KVML_LAYER_NEW 56
+// The sizes are computed for the platform from the structure of the headers in the tree (2.3.1: sizeof) and the three floats of the newer one, rounded to its alignment: 40 and 56 on
+// 64 bit, 28 and 40 on 32 bit (checked by compiling the headers of 2.3.1 and 2.6.0 for both).
+#define KVML_LAYER_OLD (sizeof(SLayerBSInfo))
+#define KVML_LAYER_NEW ((((sizeof(SLayerBSInfo) + (3u * sizeof(float))) + (__alignof__(SLayerBSInfo) - 1u)) / __alignof__(SLayerBSInfo)) * __alignof__(SLayerBSInfo))
 #define KVML_SRC_BYTES 256
 struct kvml_h264
 {
@@ -51,6 +52,12 @@ static int load_fail(int rc, const char *what, const char *detail)
 	return rc;
 }
 
+void kvml_h264_layer_sizes(size_t *oldSize, size_t *newSize)
+{
+	if (oldSize != NULL) { *oldSize = (size_t)KVML_LAYER_OLD; }
+	if (newSize != NULL) { *newSize = (size_t)KVML_LAYER_NEW; }
+}
+
 int kvml_h264_load(char *why, size_t cap)
 {
 	if (!gLib.done)
@@ -73,9 +80,10 @@ int kvml_h264_load(char *why, size_t cap)
 		if (gLib.create == NULL || gLib.destroy == NULL || ver == NULL) { (void)load_fail(KVML_H264_E_SYMBOL, "libopenh264 lacks WelsCreateSVCEncoder, WelsDestroySVCEncoder or WelsGetCodecVersionEx", used); goto out; }
 		memset(&gLib.ver, 0, sizeof(gLib.ver));
 		ver(&gLib.ver);
-		// The structures of the headers (2.3.1) are the prefix of those of 2.3 to 2.6 (see KVML_LAYER_NEW); the parameters are filled in by the library itself (GetDefaultParams, into a
+		// The structures of the headers (2.3.1) are the prefix of those of 2.3 to 2.7 (see KVML_LAYER_NEW; 2.4 to 2.7 have the same layout: checked for 2.6.0 by running, for 2.7.0 by the
+		// difference of the headers only). The upper limit is deliberate: a release that nobody has looked at may change a structure, and an unknown one answers with reason 2; the parameters are filled in by the library itself (GetDefaultParams, into a
 		// buffer that is larger than ours). Another major version, or an older minor one, is not trusted with them
-		if (gLib.ver.uMajor != 2 || gLib.ver.uMinor < 3 || gLib.ver.uMinor > 6)
+		if (gLib.ver.uMajor != 2 || gLib.ver.uMinor < 3 || gLib.ver.uMinor > 7)
 		{
 			char d[48];
 			snprintf(d, sizeof(d), "%u.%u.%u", gLib.ver.uMajor, gLib.ver.uMinor, gLib.ver.uRevision);
@@ -213,7 +221,7 @@ int kvml_h264_encode(kvml_h264 *e, const uint8_t *y, const uint8_t *u, const uin
 	SSourcePicture *src = &us.p;
 	size_t total = 0;
 	int l, rc, layers;
-	const size_t stride = (gLib.ver.uMinor >= 4) ? KVML_LAYER_NEW : KVML_LAYER_OLD;
+	const size_t stride = (gLib.ver.uMinor >= 4) ? (size_t)KVML_LAYER_NEW : (size_t)KVML_LAYER_OLD;
 	const unsigned char *frameType;
 	if (len != NULL) { *len = 0; }
 	if (isIdr != NULL) { *isIdr = 0; }
