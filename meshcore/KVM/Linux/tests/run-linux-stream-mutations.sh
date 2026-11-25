@@ -1,5 +1,5 @@
 #!/bin/sh
-# Mutations of linux_kvm_stream.c: each one changes a rule of the glue (the gate, the marker, the queue of the ACKs, the announcement, the veto, the switch-off, the scan row,
+# Mutations of linux_kvm_stream.c: each one changes a rule of the glue (the gate, the marker, the queue of the ACKs, the announcement, the veto, the switch-off, the scan tile,
 # the counting of the writes); the tests of linux_kvm_stream_test.c must fail for every one. Runs in a container like run-linux-stream-tests.sh.
 set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -36,9 +36,9 @@ mutate tick-missing            "s|if (kvm_stream_tick(&gStream, now, 0, &reply))
 mutate write-not-counted       "s|kvm_stream_note_write(&gStream, len, kind, t0);||"
 mutate blocked-not-noted       "s|if ((uint32_t)(t1 - t0) > KVML_BLOCKED_WRITE_MS) { kvm_stream_note_blocked(&gStream, t1); }||"
 mutate write-error-lost        "s|r = kvm_slave_write_raw(buffer, len);|r = kvm_slave_write_raw(buffer, len); r = 0;|"
-mutate scan-row-kept           "s|^	gResumeRow = 0;\$|	(void)0;|"
-mutate scan-row-ignored        "s|return (r > 0 \&\& r < rows) ? r : 0;|return 0;|"
-mutate scan-row-out-of-range   "s|return (r > 0 \&\& r < rows) ? r : 0;|return r;|"
+mutate scan-tile-kept          "s|^	gResumeTile = 0;\$|	(void)0;|"
+mutate scan-tile-ignored       "s|return (r > 0 \&\& r < tiles) ? r : 0;|return 0;|"
+mutate scan-tile-out-of-range  "s|return (r > 0 \&\& r < tiles) ? r : 0;|return r;|"
 mutate bad-input-accepted      "s|if (kvm_stream_parse_ctrl(it.b, KVM_CTRL_SIZE, \&c) != KVM_REJ_NONE) { kvml_input_bad(); return; }||"
 mutate state-not-written       "s|(void)kvml_write(b, KVM_CTRL_SIZE, KVM_W_STATE);||"
 cp /tmp/orig.c linux_kvm_stream.c

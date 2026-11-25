@@ -1602,38 +1602,39 @@ void* kvm_server_mainloop_x11(void* parm)
 			}
 			getScreenBuffer((char **)&desktop, &desktopsize, image);
 
-			// The scan starts where the last one stopped when the window of the viewer was full (kvml_scan_start): the top of the screen must not starve the rest
-			int scanStart = kvml_scan_start(TILE_HEIGHT_COUNT);
-			for (r = 0; r < TILE_HEIGHT_COUNT; r++) {
-				y = (scanStart + r) % TILE_HEIGHT_COUNT;
-				for (x = 0; x < TILE_WIDTH_COUNT; x++) {
-					height = TILE_HEIGHT * y;
-					width = TILE_WIDTH * x;
+			// The scan is one cyclic walk over the tiles and starts at the tile where the last one stopped when the window of the viewer was full (kvml_scan_start): neither the top of
+			// the screen nor the start of a row may starve what comes after it (a window smaller than a row of changing tiles would send the same first tiles of that row every frame)
+			int tileCount = TILE_HEIGHT_COUNT * TILE_WIDTH_COUNT;
+			int scanStart = kvml_scan_start(tileCount);
+			for (r = 0; r < tileCount; r++) {
+				int tileIndex = (scanStart + r) % tileCount;
+				y = tileIndex / TILE_WIDTH_COUNT;
+				x = tileIndex % TILE_WIDTH_COUNT;
+				height = TILE_HEIGHT * y;
+				width = TILE_WIDTH * x;
 
-					if (g_shutdown) { r = TILE_HEIGHT_COUNT; break; }
+				if (g_shutdown) { break; }
 
-					if (g_tileInfo[y][x].flag == TILE_SENT || g_tileInfo[y][x].flag == TILE_DONT_SEND) {
-						continue;
-					}
+				if (g_tileInfo[y][x].flag == TILE_SENT || g_tileInfo[y][x].flag == TILE_DONT_SEND) {
+					continue;
+				}
 
-					getTileAt(width, height, &buf, &tilesize, desktop, desktopsize, y, x);
+				getTileAt(width, height, &buf, &tilesize, desktop, desktopsize, y, x);
 
-					if (g_tileDeferred)
-					{
-						// the window of the viewer is full: this and the tiles after it are looked at again in the next frame (their CRCs were not changed)
-						g_tileDeferred = 0;
-						kvml_scan_deferred(y);
-						r = TILE_HEIGHT_COUNT;
-						break;
-					}
+				if (g_tileDeferred)
+				{
+					// the window of the viewer is full: this and the tiles after it are looked at again in the next frame (their CRCs were not changed)
+					g_tileDeferred = 0;
+					kvml_scan_deferred(tileIndex);
+					break;
+				}
 
-					if (buf && !g_shutdown)
-					{
-						// Write the reply to the pipe.
-						written = kvm_slave_send(buf, (size_t)tilesize);
-						free(buf);
-						if (written == -1) { /*ILIBMESSAGE("KVMBREAK-K2\r\n");*/ g_shutdown = 1; height = SCREEN_HEIGHT; width = SCREEN_WIDTH; r = TILE_HEIGHT_COUNT; break; }
-					}
+				if (buf && !g_shutdown)
+				{
+					// Write the reply to the pipe.
+					written = kvm_slave_send(buf, (size_t)tilesize);
+					free(buf);
+					if (written == -1) { /*ILIBMESSAGE("KVMBREAK-K2\r\n");*/ g_shutdown = 1; height = SCREEN_HEIGHT; width = SCREEN_WIDTH; break; }
 				}
 			}
 		}

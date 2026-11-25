@@ -35,7 +35,7 @@ static int gAckHead = 0, gAckCount = 0;
 static int gOn = 0;
 static int gLog = 0;
 static uint32_t gInputBad = 0, gAckDropped = 0, gStatsAt = 0;
-static int gResumeRow = 0;
+static int gResumeTile = 0;
 
 #ifdef KVML_TEST
 uint32_t kvml_test_now = 0;	// the tests (tests/linux_kvm_stream_test.c) move the clock by hand
@@ -87,7 +87,7 @@ void kvml_session_begin(void)
 	kvm_inbox_init(&gInbox, kvml_now());
 	gAckHead = gAckCount = 0;
 	gInputBad = gAckDropped = 0;
-	gResumeRow = 0;
+	gResumeTile = 0;
 	g_tileDeferred = 0;
 	gStatsAt = kvml_now();
 	gOn = 1;
@@ -204,13 +204,13 @@ int kvml_gate_big(void)
 	return ok;
 }
 
-void kvml_scan_deferred(int row) { gResumeRow = row; }
+void kvml_scan_deferred(int tile) { gResumeTile = tile; }
 
-int kvml_scan_start(int rows)
+int kvml_scan_start(int tiles)
 {
-	int r = gResumeRow;
-	gResumeRow = 0;
-	return (r > 0 && r < rows) ? r : 0;
+	int r = gResumeTile;
+	gResumeTile = 0;
+	return (r > 0 && r < tiles) ? r : 0;
 }
 
 #endif /* KVM_STREAM_ENABLED */

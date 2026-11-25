@@ -40,9 +40,9 @@ int kvml_gate_big(void);
 // One write to the pipe of the slave: counts it and writes it with kvm_slave_write_raw. kind: KVM_W_DATA / KVM_W_POSITION / KVM_W_STATE of kvm_stream.h; 0 = written, -1 = error
 int kvml_write(const void *buffer, size_t len, int kind);
 
-// The tile scan: a rectangle that the window refused leaves the scan of this frame, and the next frame starts where it stopped (the top of the screen must not starve the rest)
-void kvml_scan_deferred(int row);		// the scan stopped at this row
-int kvml_scan_start(int rows);			// the row where the next scan starts (0 after a scan that went to the end)
+// The tile scan: a rectangle that the window refused leaves the scan of this frame, and the next frame starts at the tile where it stopped (neither the top of the screen nor the start of a row must starve the rest)
+void kvml_scan_deferred(int tile);		// the scan stopped at this tile (index = row * tiles per row + column)
+int kvml_scan_start(int tiles);			// the tile where the next scan starts (0 after a scan that went to the end)
 
 #else
 
@@ -53,8 +53,8 @@ static inline void kvml_input_bad(void) {}
 static inline void kvml_poll(void) {}
 static inline void kvml_iteration_end(void) {}
 static inline int kvml_gate_big(void) { return 1; }
-static inline int kvml_scan_start(int rows) { (void)rows; return 0; }
-static inline void kvml_scan_deferred(int row) { (void)row; }
+static inline int kvml_scan_start(int tiles) { (void)tiles; return 0; }
+static inline void kvml_scan_deferred(int tile) { (void)tile; }
 
 #endif
 

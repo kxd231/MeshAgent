@@ -327,15 +327,15 @@ static void test_a_blocked_write_stops_the_clocks(void)
 	kvml_session_end();
 }
 
-static void test_scan_rows(void)
+static void test_scan_tiles(void)
 {
 	start();
-	CHECK_EQ(kvml_scan_start(40), 0);
-	kvml_scan_deferred(17);
-	CHECK_EQ(kvml_scan_start(40), 17);
-	CHECK_EQ(kvml_scan_start(40), 0);		// once: a scan that goes to the end starts at the top again
-	kvml_scan_deferred(55);
-	CHECK_EQ(kvml_scan_start(40), 0);		// a row beyond the screen (the size changed) is not used
+	CHECK_EQ(kvml_scan_start(400), 0);
+	kvml_scan_deferred(171);				// the tile index (row * tiles per row + column): resumes in the middle of a row
+	CHECK_EQ(kvml_scan_start(400), 171);
+	CHECK_EQ(kvml_scan_start(400), 0);		// once: a scan that goes to the end starts at the first tile again
+	kvml_scan_deferred(455);
+	CHECK_EQ(kvml_scan_start(400), 0);		// a tile beyond the screen (the size changed) is not used
 	kvml_session_end();
 }
 
@@ -349,7 +349,7 @@ int main(void)
 	test_write_errors_and_before_start();
 	test_round_trip_is_measured_from_the_arrival();
 	test_a_blocked_write_stops_the_clocks();
-	test_scan_rows();
+	test_scan_tiles();
 	printf("%d checks, %d failed\n", gChecks, gFail);
 	return gFail ? 1 : 0;
 }

@@ -483,41 +483,42 @@ static int kvm_drm_send_dirty_tiles(const unsigned char *rgbBuffer, size_t rgbSi
 		}
 	}
 
-	// The scan starts where the last one stopped when the window of the viewer was full (kvml_scan_start): the top of the screen must not starve the rest
-	int scanStart = kvml_scan_start(TILE_HEIGHT_COUNT);
-	for (r = 0; r < TILE_HEIGHT_COUNT; ++r)
+	// One cyclic walk over the tiles, from the tile where the last scan stopped when the window of the viewer was full (kvml_scan_start): neither the top of the screen nor the
+	// start of a row may starve what comes after it
+	int tileCount = TILE_HEIGHT_COUNT * TILE_WIDTH_COUNT;
+	int scanStart = kvml_scan_start(tileCount);
+	for (int i = 0; i < tileCount; ++i)
 	{
-		y = (scanStart + r) % TILE_HEIGHT_COUNT;
-		for (x = 0; x < TILE_WIDTH_COUNT; ++x)
+		void *tilePacket = NULL;
+		long long tilePacketSize = 0;
+		int tileIndex = (scanStart + i) % tileCount;
+
+		y = tileIndex / TILE_WIDTH_COUNT;
+		x = tileIndex % TILE_WIDTH_COUNT;
+		height = TILE_HEIGHT * y;
+		width = TILE_WIDTH * x;
+
+		if (g_tileInfo[y][x].flag == TILE_SENT || g_tileInfo[y][x].flag == TILE_DONT_SEND)
 		{
-			void *tilePacket = NULL;
-			long long tilePacketSize = 0;
+			continue;
+		}
 
-			height = TILE_HEIGHT * y;
-			width = TILE_WIDTH * x;
-
-			if (g_tileInfo[y][x].flag == TILE_SENT || g_tileInfo[y][x].flag == TILE_DONT_SEND)
+		getTileAt(width, height, &tilePacket, &tilePacketSize, *desktopBuffer, *desktopBufferSize, y, x);
+		if (g_tileDeferred)
+		{
+			// the window of the viewer is full: this and the tiles after it are looked at again in the next frame (their CRCs were not changed)
+			g_tileDeferred = 0;
+			kvml_scan_deferred(tileIndex);
+			return 0;
+		}
+		if (tilePacket != NULL && tilePacketSize > 0)
+		{
+			if (kvm_slave_send(tilePacket, (size_t)tilePacketSize) != 0)
 			{
-				continue;
-			}
-
-			getTileAt(width, height, &tilePacket, &tilePacketSize, *desktopBuffer, *desktopBufferSize, y, x);
-			if (g_tileDeferred)
-			{
-				// the window of the viewer is full: this and the tiles after it are looked at again in the next frame (their CRCs were not changed)
-				g_tileDeferred = 0;
-				kvml_scan_deferred(y);
-				return 0;
-			}
-			if (tilePacket != NULL && tilePacketSize > 0)
-			{
-				if (kvm_slave_send(tilePacket, (size_t)tilePacketSize) != 0)
-				{
-					free(tilePacket);
-					return -1;
-				}
 				free(tilePacket);
+				return -1;
 			}
+			free(tilePacket);
 		}
 	}
 
