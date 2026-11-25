@@ -90,9 +90,9 @@ static void vlog(const char *fmt, ...)
 	va_list ap;
 	if (!gV.log) { return; }
 	va_start(ap, fmt);
-	fputs("KVM video: ", stderr);
-	vfprintf(stderr, fmt, ap);
-	fputc('\n', stderr);
+	fputs("KVM video: ", kvml_logfile());
+	vfprintf(kvml_logfile(), fmt, ap);
+	fputc('\n', kvml_logfile());
 	va_end(ap);
 }
 
@@ -801,7 +801,11 @@ void kvml_video_emit(const void *desktop, long long desktopSize)
 	fp.seq = seq; fp.ts = now; fp.gen = s->gen;
 	if (isIdr) { kvm_stream_watch(s, seq); gV.idrWatchBytes = (uint32_t)total; }
 	if (kvm_stream_build_frame_header(gV.frame, hdr, &fp) != hdr) { (void)kvm_vtiles_abort(&gV.tiles, 0); video_error("243 header", 0); return; }
-	if (kvml_write(gV.frame, total, KVM_W_POSITION) != 0) { (void)kvm_vtiles_abort(&gV.tiles, 0); video_error("write of the frame", 0); return; }
+	t0 = mono_us();
+	rc = kvml_write(gV.frame, total, KVM_W_POSITION);
+	t1 = mono_us();
+	if (t1 - t0 > 100000u || encUs > 100000u) { vlog("slow frame bytes=%zu encode_ms=%u write_ms=%u idr=%d rects=%d", total, encUs / 1000u, (unsigned)((t1 - t0) / 1000u), isIdr, nRects); }
+	if (rc != 0) { (void)kvm_vtiles_abort(&gV.tiles, 0); video_error("write of the frame", 0); return; }
 	{
 		// the tiles that the frame painted: the sharpening waits the settle time after it, and they are VIDEO tiles now
 		int r, c;

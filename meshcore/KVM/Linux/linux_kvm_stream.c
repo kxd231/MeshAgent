@@ -35,6 +35,7 @@ static kvml_item gAckQ[KVML_ACK_QUEUE];
 static int gAckHead = 0, gAckCount = 0;
 static int gOn = 0;
 static int gLog = 0;
+static FILE *gLogFile = NULL;
 static uint32_t gInputBad = 0, gAckDropped = 0, gStatsAt = 0;
 static int gResumeTile = 0;
 
@@ -51,6 +52,7 @@ static uint32_t kvml_now(void)
 #endif
 
 uint32_t kvml_clock(void) { return kvml_now(); }
+FILE *kvml_logfile(void) { return gLogFile != NULL ? gLogFile : stderr; }
 kvm_stream *kvml_stream(void) { return &gStream; }
 
 static int kvml_env_off(const char *name)
@@ -77,7 +79,7 @@ void kvml_state(const kvm_state_msg *m)
 	uint8_t b[KVM_CTRL_SIZE];
 	kvm_stream_build_state(b, m);
 	(void)kvml_write(b, KVM_CTRL_SIZE, KVM_W_STATE);
-	if (gLog) { fprintf(stderr, "KVM stream: state video=%d ack=%d reason=%d caps=%d gen=%d veto=%d\n", (int)m->video, (int)m->ack, (int)m->reason, (int)m->caps, (int)m->gen, (int)gStream.vetoMask); }
+	if (gLog) { fprintf(kvml_logfile(), "KVM stream: state video=%d ack=%d reason=%d caps=%d gen=%d veto=%d\n", (int)m->video, (int)m->ack, (int)m->reason, (int)m->caps, (int)m->gen, (int)gStream.vetoMask); }
 }
 
 void kvml_session_begin(void)
@@ -85,6 +87,8 @@ void kvml_session_begin(void)
 	int capAck = 1;
 	const char *l = getenv("MESH_KVM_STREAM_LOG");
 	gLog = (l != NULL && l[0] != 0 && l[0] != '0') ? 1 : 0;
+	// "1": the log goes to stderr (a container shows it); a path: it is appended to that file (the capture process of a service has no stderr that anybody reads)
+	if (gLog && l[0] == '/') { gLogFile = fopen(l, "a"); if (gLogFile != NULL) { setvbuf(gLogFile, NULL, _IOLBF, 0); } }
 	if (kvml_env_off("MESH_KVM_ACK")) { capAck = 0; }
 	// is there an encoder (and is the video not switched off)? Else an op 1 is answered with the reason, the ACK window is on and the picture stays JPEG
 	int videoReason = KVM_REASON_NO_VIDEO_BUILD;
@@ -97,7 +101,7 @@ void kvml_session_begin(void)
 	g_tileDeferred = 0;
 	gStatsAt = kvml_now();
 	gOn = 1;
-	if (gLog) { fprintf(stderr, "KVM stream: start cap_ack=%d cap_video=%d video_reason=%d\n", capAck, capVideo, videoReason); }
+	if (gLog) { fprintf(kvml_logfile(), "KVM stream: start cap_ack=%d cap_video=%d video_reason=%d\n", capAck, capVideo, videoReason); }
 }
 
 static void kvml_stats(int final)
@@ -105,7 +109,7 @@ static void kvml_stats(int final)
 	uint32_t now = kvml_now();
 	const kvm_stream_stats *st = &gStream.st;
 	if (!gLog) { return; }
-	fprintf(stderr, "KVM stream: stats%s ack=%d want=%d veto=%d win_kb=%u inflight_kb=%llu rate_kbps=%llu min_rtt_ms=%u acks_ok=%u acks_off=%u acks_flood=%u acks_unknown=%u acks_stale=%u markers=%u probes=%u stalls=%u timeouts=%u gate_denied=%u ctrl_ok=%u input_bad=%u ctl_dropped=%u ack_dropped=%u\n",
+	fprintf(kvml_logfile(), "KVM stream: stats%s ack=%d want=%d veto=%d win_kb=%u inflight_kb=%llu rate_kbps=%llu min_rtt_ms=%u acks_ok=%u acks_off=%u acks_flood=%u acks_unknown=%u acks_stale=%u markers=%u probes=%u stalls=%u timeouts=%u gate_denied=%u ctrl_ok=%u input_bad=%u ctl_dropped=%u ack_dropped=%u\n",
 		final ? " final=1" : "", kvm_stream_ack_active(&gStream), (int)gStream.want, (int)gStream.vetoMask, (unsigned)(kvm_stream_window(&gStream, now) / 1024u),
 		(unsigned long long)(kvm_stream_inflight(&gStream) / 1024ull), (unsigned long long)(kvm_stream_rate(&gStream, now) * 8ull / 1000ull), (unsigned)gStream.minRtt,
 		st->acksOk, st->acksOff, st->acksFlood, st->acksUnknown, st->acksStale, st->markers, st->probes, st->stalls, st->timeouts, st->gateDenied, st->ctrlOk,
@@ -169,7 +173,7 @@ void kvml_poll(void)
 	{
 		kvm_ctrl c = ctl[i].c;
 		unsigned actions = 0;
-		if (gLog) { fprintf(stderr, "KVM stream: ctrl op=%d flags=%d\n", (int)c.op, (int)c.flags); }
+		if (gLog) { fprintf(kvml_logfile(), "KVM stream: ctrl op=%d flags=%d\n", (int)c.op, (int)c.flags); }
 		if (kvm_stream_on_ctrl(&gStream, &c, ctl[i].at, &reply, &actions)) { kvml_state(&reply); }
 #ifdef KVML_VIDEO_ENABLED
 		kvml_video_ctrl(&c, actions, ctl[i].at);

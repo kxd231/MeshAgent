@@ -16,6 +16,7 @@ Licensed under the Apache License, Version 2.0 (same as the rest of the agent).
 #define LINUX_KVM_STREAM_H_
 
 #include <stddef.h>
+#include <stdio.h>
 #include <stdint.h>
 
 #ifndef KVM_STREAM_DISABLE
@@ -46,6 +47,7 @@ int kvml_write(const void *buffer, size_t len, int kind);
 // What the video code (linux_video.c) needs of the glue: the clock of the process in milliseconds (wraps), the state of the stream layer (the caller does not take a lock: the slave is one
 // thread), and a 242 that goes to the viewer
 uint32_t kvml_clock(void);
+FILE *kvml_logfile(void);	// where the log of MESH_KVM_STREAM_LOG goes (stderr, or the file that the variable names)
 struct kvm_stream *kvml_stream(void);
 struct kvm_state_msg;
 void kvml_state(const struct kvm_state_msg *m);
