@@ -21,6 +21,7 @@ extern uint32_t kvml_test_now;
 extern const kvm_stream *kvml_test_stream(void);
 extern void kvml_video_test_state(int *state, unsigned *pending, unsigned *video, unsigned *inflight, unsigned long long *frames, unsigned long long *idrs, unsigned long long *held);
 extern int kvml_video_test_tile(int row, int col);
+extern unsigned long long kvml_video_test_sharp_bytes(void);
 
 // the globals of the capture process
 int SCREEN_WIDTH = 0, SCREEN_HEIGHT = 0, TILE_WIDTH = 32, TILE_HEIGHT = 32, TILE_WIDTH_COUNT = 0, TILE_HEIGHT_COUNT = 0, FRAME_RATE_TIMER = 100;
@@ -61,6 +62,7 @@ static int next_msg(msg *m)
 static int gW = 1024, gH = 768, gCW = 0, gCH = 0;
 static uint8_t *gDesk = NULL;
 static int32_t *gCrcNow = NULL;			// the CRC of the tiles of the picture now
+static int gNoise = 0;					// the moving window is noise (frames that are big)
 
 static void geometry(int w, int h)
 {
@@ -98,6 +100,7 @@ static void paint(int k, int movingX)
 		for (x = movingX; x < movingX + 256 && x < gCW; x++)
 		{
 			uint8_t *p = gDesk + (((size_t)y * (size_t)gCW) + (size_t)x) * 3u;
+			if (gNoise) { const uint32_t hh = ((uint32_t)(x - movingX) * 2654435761u) ^ ((uint32_t)y * 40503u) ^ ((uint32_t)movingX * 69069u); p[0] = (uint8_t)(hh >> 3); p[1] = (uint8_t)(hh >> 11); p[2] = (uint8_t)(hh >> 19); continue; }
 			p[0] = (uint8_t)(40 + ((x - movingX) % 200)); p[1] = (uint8_t)(90 + (y - 160) % 120); p[2] = (uint8_t)(200 - (x - movingX) % 100);
 		}
 	}
@@ -434,21 +437,97 @@ static void test_recorded(void)
 {
 	int k, x = 64;
 	begin_session(1024, 768);
-	gRecord = 1; gRecordN = 0;
+	gRecord = (gStream != NULL) ? 1 : 0; gRecordN = 0;
 	op(KVM_OP_VIDEO_ON, KVM_PROFILE_CBP | KVM_PROFILE_MAIN | KVM_PROFILE_HIGH, 0);
 	for (k = 0; k < 16; k++) { x += 24; iteration(k, x); viewer_ack(); }			// the window moves
 	{
-		const unsigned video0 = st_video(), jpeg0 = gJpegTiles;
+		const unsigned video0 = st_video();
+		unsigned jpeg0;
 		const unsigned long long frames0 = st_frames();
 		CHECK(video0 > 30);
-		for (k = 16; k < 28; k++) { iteration(k, x); viewer_ack(); }				// it stops: the tiles are sharpened as JPEG (after 150 ms), no more frames
-		CHECK(gJpegTiles > jpeg0 + 20);
-		CHECK(st_video() < video0 / 2);
+		CHECK_EQ(kvml_test_stream()->st.markers < st_frames() / 2, 1);			// a frame is a position: it needs no marker of its own
+		jpeg0 = gJpegTiles;
+		iteration(16, x); viewer_ack();										// 100 ms after the last frame: the tiles are not settled yet (150 ms)
+		CHECK_EQ(kvml_video_test_tile(7, (x + 128) / 32), KVM_VT_VIDEO);				// the middle of the window that the last frame painted
+		CHECK(st_video() >= 20);											// what the last frame painted (the window, 40 tiles) is still video: only the tiles that have been still for 150 ms are sharpened
+		iteration(17, x); viewer_ack();
+		iteration(18, x); viewer_ack();
+		CHECK(gJpegTiles > jpeg0 + 5);										// the sharpening has begun
+		for (k = 19; k < 60; k++) { iteration(k, x); viewer_ack(); }		// it stops: the tiles are sharpened as JPEG, no more frames
+		CHECK(gJpegTiles > jpeg0 + video0 / 2);
+		CHECK_EQ(st_video(), 0);											// every tile of the video is a JPEG again
 		CHECK(st_frames() <= frames0 + 1);
+		CHECK(kvml_video_test_sharp_bytes() > 1000);						// ... and the bytes of the sharpening were counted
 	}
-	for (k = 28; k < 40; k++) { x -= 30; iteration(k, x); viewer_ack(); }			// it moves back
-	CHECK(gRecordN > 8);
+	for (k = 60; k < 72; k++) { x -= 30; iteration(k, x); viewer_ack(); }			// it moves back
+	CHECK(gRecordN > 8 || gStream == NULL);
 	gRecord = 0;
+}
+
+// a window that is full of noise: the frames are big, the window of the ACK fills without acknowledgements and the video is held (the tiles stay pending); the ACK opens it
+static void test_window_gate(void)
+{
+	int k, x = 64;
+	unsigned long long f0, held0 = 0, held1 = 0, f1;
+	begin_session(1024, 768);
+	gNoise = 1;
+	op(KVM_OP_VIDEO_ON, KVM_PROFILE_CBP | KVM_PROFILE_MAIN | KVM_PROFILE_HIGH, 0);
+	for (k = 0; k < 10; k++) { x += 24; iteration(k, x); viewer_ack(); }
+	CHECK_EQ(st_state(), KVM_VS_ON);
+	f0 = st_frames();
+	for (k = 10; k < 40; k++) { x += 24; iteration(k, x); }								// no acknowledgements for 3 s
+	f1 = st_frames();
+	kvml_video_test_state(NULL, NULL, NULL, NULL, NULL, NULL, &held0);
+	printf("window gate: %llu frames before, %llu after 3 s without an ACK, held %llu times\n", f0, f1, held0);
+	CHECK(held0 > 0);
+	CHECK(f1 < f0 + 29);														// not a frame in every iteration
+	CHECK(st_pending() > 0);													// what moved waits for the frame that the window will let in
+	for (k = 40; k < 52; k++) { x += 24; iteration(k, x); viewer_ack(); }
+	CHECK(st_frames() > f1);
+	kvml_video_test_state(NULL, NULL, NULL, NULL, NULL, NULL, &held1);
+	CHECK(held1 >= held0);
+	gNoise = 0;
+}
+
+// a REFRESH: every tile is a picture again, the tiles near the motion do not go to the video
+static void test_refresh(void)
+{
+	int k, x = 64, r;
+	unsigned j0;
+	unsigned long long f0;
+	begin_session(1024, 768);
+	op(KVM_OP_VIDEO_ON, KVM_PROFILE_CBP | KVM_PROFILE_MAIN | KVM_PROFILE_HIGH, 0);
+	for (k = 0; k < 14; k++) { x += 24; iteration(k, x); viewer_ack(); }
+	CHECK_EQ(st_state(), KVM_VS_ON);
+	for (r = 0; r < TILE_HEIGHT_COUNT * TILE_WIDTH_COUNT; r++) { g_tileInfo[0][r].crc = 0xFF; g_tileInfo[0][r].flag = 0; }	// what the command does
+	kvml_video_refresh();
+	j0 = gJpegTiles;
+	f0 = st_frames();
+	x += 24; iteration(14, x);
+	CHECK(gJpegTiles - j0 > 100);												// the picture as JPEG (as much as the window lets in), none of it as video: no frame
+	CHECK_EQ(st_frames(), f0);
+}
+
+// the tiles that waited for a frame go back to JPEG when the video stops (their CRCs are reset so that the next scan sends them)
+static void test_pending_back(void)
+{
+	int k, x = 64;
+	begin_session(1024, 768);
+	op(KVM_OP_VIDEO_ON, KVM_PROFILE_CBP | KVM_PROFILE_MAIN | KVM_PROFILE_HIGH, 0);
+	for (k = 0; k < 10; k++) { x += 24; iteration(k, x); viewer_ack(); }
+	CHECK_EQ(st_state(), KVM_VS_ON);
+	kvml_test_now += 100;
+	kvml_video_frame_begin();
+	g_tileInfo[20][20].crc = 123;
+	CHECK_EQ(kvml_video_claim_rect(20, 20, 20, 21, 1), 1);						// two tiles wait for the next frame
+	CHECK_EQ(kvml_video_test_tile(20, 20), KVM_VT_PENDING);
+	op(KVM_OP_ACK_ONLY, 0, 0);													// the viewer wants JPEG
+	kvml_test_now += 100;
+	kvml_poll();
+	CHECK_EQ(st_state(), KVM_VS_OFF);
+	CHECK_EQ(kvml_video_test_tile(20, 20), KVM_VT_NONE);
+	CHECK_EQ(g_tileInfo[20][20].crc, 0xFF);
+	CHECK_EQ(g_tileInfo[20][21].crc, 0xFF);
 }
 
 static void test_nolib(void)
@@ -574,6 +653,10 @@ int main(int argc, char **argv)
 			test_veto_and_repair();
 			test_geometry();
 			test_limits();
+			test_recorded();
+			test_window_gate();
+			test_refresh();
+			test_pending_back();
 		}
 	}
 	printf("%d checks, %d failed\n", gChecks, gFail);

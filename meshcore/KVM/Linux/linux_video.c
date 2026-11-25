@@ -426,6 +426,7 @@ void kvml_video_test_state(int *state, unsigned *pending, unsigned *video, unsig
 	if (idrs != NULL) { *idrs = gV.sIdr; }
 	if (held != NULL) { *held = gV.sHeld; }
 }
+unsigned long long kvml_video_test_sharp_bytes(void) { return gV.sSharpBytes; }
 int kvml_video_test_tile(int row, int col) { return model_current() ? kvm_vtiles_get(&gV.tiles, row, col) : -1; }
 #endif
 
