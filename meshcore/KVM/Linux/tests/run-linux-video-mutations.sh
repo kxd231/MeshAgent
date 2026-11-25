@@ -29,6 +29,7 @@ mutate jpeg-not-a-tile-reset  "s|			kvm_vtiles_jpeg(&gV.tiles, r, c);.*|			(void
 mutate window-gate-ignored    "s|in.gateOpen = kvm_stream_window_allows(s, KVM_GATE_VIDEO, now);|in.gateOpen = 1;|"
 mutate frame-not-position     "s|kvml_write(gV.frame, total, KVM_W_POSITION)|kvml_write(gV.frame, total, KVM_W_DATA)|"
 mutate veto-not-stopping      "s|if (gV.ctl.state == KVM_VS_ON \\&\\& !s->videoOn) { stop_video(\"stream layer\"); }|if (0) { stop_video(\"stream layer\"); }|"
+mutate period-window-fixed   "s|uint32_t recent = gV.periodMs \* 5u / 2u;|uint32_t recent = 0;|"
 mutate geometry-ignored       "s|	if (model_current()) { return; }|	return;|"
 mutate pending-not-to-jpeg    "s|			if (map\\[((size_t)r \\* (size_t)gV.cols) + (size_t)c\\]) { g_tileInfo\\[r\\]\\[c\\].crc = 0xFF; }|			(void)map;|"
 mutate level-limit-ignored    "s|kvm_vcore_pick_level((unsigned)cw, (unsigned)ch, gV.ctl.maxLevel, \\&level, \\&fpsCap) != 0|kvm_vcore_pick_level((unsigned)cw, (unsigned)ch, 0, \\&level, \\&fpsCap) != 0|"

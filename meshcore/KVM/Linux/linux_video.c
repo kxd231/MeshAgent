@@ -56,6 +56,7 @@ static struct
 	uint8_t *map, *cover;				// scratch of rows * cols
 	uint32_t stamp;						// number of the frame (the scan) that is running
 	uint32_t now, lastFrameTick;		// the clock of the frame, and of the one before
+	uint32_t periodMs; int havePeriod;	// the time between two scans (moving average)
 	unsigned realChanged;				// tiles of this frame whose content really changed
 	// the encoder and its pictures
 	kvml_h264 *enc;
@@ -539,6 +540,14 @@ void kvml_video_frame_begin(void)
 	if (!model_current()) { return; }
 	gV.now = now;
 	gV.stamp++;
+	// The rules of the motion look at the last 250 ms: that is two iterations of a loop that runs at 10 or more frames a second. A capture that is slower (the DRM capture of a virtual
+	// machine, 2 frames a second) has no tile that changes twice in 250 ms, so the window is two and a half periods of the loop (at most 2 s): the time between two scans, moving average.
+	if (gV.havePeriod) { gV.periodMs = (uint32_t)(((uint64_t)gV.periodMs * 3u + (uint32_t)dms(now, gV.lastFrameTick) + 2u) / 4u); } else if ((uint32_t)dms(now, gV.lastFrameTick) > 0) { gV.periodMs = (uint32_t)dms(now, gV.lastFrameTick); gV.havePeriod = 1; }
+	{
+		uint32_t recent = gV.periodMs * 5u / 2u;
+		if (recent < KVM_MOTION_MS) { recent = KVM_MOTION_MS; } else if (recent > 2000u) { recent = 2000u; }
+		if (recent != gV.motion.recentMs) { kvm_motion_set(&gV.motion, recent, KVM_MOTION_STREAK, KVM_MOTION_TILES, KVM_MOTION_NEAR, KVM_MOTION_RECALL_MS); }
+	}
 	kvm_motion_frame(&gV.motion, gV.lastFrameTick, gV.realChanged);	// the frame of motion of the last 250 ms (the rule of the video looks at it instead of the frame before this one)
 	if (gV.realChanged >= KVM_MOTION_TILES) { kvm_sharp_motion(&gV.sharp, gV.lastFrameTick); }
 	gV.realChanged = 0;

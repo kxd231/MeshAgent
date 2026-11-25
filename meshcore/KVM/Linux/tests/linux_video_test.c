@@ -203,11 +203,12 @@ static void look_242(void)
 
 // ---- one iteration of the capture loop, as linux_kvm.c does it ----
 static unsigned gJpegTiles = 0;
+static uint32_t gStep = 100;				// the time between two iterations of the loop
 static int gGateOpenForced = -1;
 static void iteration(int k, int movingX)
 {
 	int r, c;
-	kvml_test_now += 100;
+	kvml_test_now += gStep;
 	kvml_poll();							// the commands of the viewer, the timers, the requests of the video
 	if (g_tileInfo == NULL || SCREEN_WIDTH == 0) { return; }
 	paint(k, movingX);
@@ -432,6 +433,20 @@ static void test_limits(void)
 	CHECK(st_frames() > 2);
 }
 
+// a slow capture (the DRM capture of a virtual machine: 2 frames a second): the motion is still recognised (the window of the rules follows the period of the loop)
+static void test_slow_loop(void)
+{
+	int k, x = 64;
+	begin_session(1024, 768);
+	gStep = 500;
+	op(KVM_OP_VIDEO_ON, KVM_PROFILE_CBP | KVM_PROFILE_MAIN | KVM_PROFILE_HIGH, 0);
+	for (k = 0; k < 30; k++) { x += 24; iteration(k, x); viewer_ack(); }
+	gStep = 100;
+	CHECK_EQ(st_state(), KVM_VS_ON);
+	printf("slow loop: %llu frames\n", st_frames());
+	CHECK(st_frames() > 8);
+}
+
 // the picture scenario that the decoder checks: the window moves, stops (the sharpening), a REFRESH comes, the window moves again
 static void test_recorded(void)
 {
@@ -653,6 +668,7 @@ int main(int argc, char **argv)
 			test_veto_and_repair();
 			test_geometry();
 			test_limits();
+			test_slow_loop();
 			test_recorded();
 			test_window_gate();
 			test_refresh();
