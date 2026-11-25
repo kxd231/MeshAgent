@@ -22,6 +22,7 @@ limitations under the License.
 #include "linux_compression.h"
 #include "linux_tile.h"
 #include "linux_kvm_stream.h"
+#include "linux_video.h"
 #include "meshcore/meshdefines.h"
 #include "microstack/ILibParsers.h"
 
@@ -487,6 +488,7 @@ static int kvm_drm_send_dirty_tiles(const unsigned char *rgbBuffer, size_t rgbSi
 	// start of a row may starve what comes after it
 	int tileCount = TILE_HEIGHT_COUNT * TILE_WIDTH_COUNT;
 	int scanStart = kvml_scan_start(tileCount);
+	kvml_video_frame_begin(); // the clock of the frame, the tiles that wait to be sharpened
 	for (int i = 0; i < tileCount; ++i)
 	{
 		void *tilePacket = NULL;
@@ -509,7 +511,7 @@ static int kvm_drm_send_dirty_tiles(const unsigned char *rgbBuffer, size_t rgbSi
 			// the window of the viewer is full: this and the tiles after it are looked at again in the next frame (their CRCs were not changed)
 			g_tileDeferred = 0;
 			kvml_scan_deferred(tileIndex);
-			return 0;
+			break;
 		}
 		if (tilePacket != NULL && tilePacketSize > 0)
 		{
@@ -522,6 +524,7 @@ static int kvm_drm_send_dirty_tiles(const unsigned char *rgbBuffer, size_t rgbSi
 		}
 	}
 
+	kvml_video_emit(*desktopBuffer, *desktopBufferSize); // the frame of the tiles that moved (after the JPEG rectangles of this iteration)
 	return 0;
 }
 

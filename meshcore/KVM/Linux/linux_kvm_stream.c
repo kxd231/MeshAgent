@@ -5,6 +5,7 @@ Licensed under the Apache License, Version 2.0 (same as the rest of the agent).
 */
 
 #include "linux_kvm_stream.h"
+#include "linux_video.h"
 
 int g_tileDeferred = 0;
 
@@ -49,6 +50,9 @@ static uint32_t kvml_now(void)
 }
 #endif
 
+uint32_t kvml_clock(void) { return kvml_now(); }
+kvm_stream *kvml_stream(void) { return &gStream; }
+
 static int kvml_env_off(const char *name)
 {
 	const char *v = getenv(name);
@@ -68,7 +72,7 @@ int kvml_write(const void *buffer, size_t len, int kind)
 	return r;
 }
 
-static void kvml_send_state(const kvm_state_msg *m)
+void kvml_state(const kvm_state_msg *m)
 {
 	uint8_t b[KVM_CTRL_SIZE];
 	kvm_stream_build_state(b, m);
@@ -82,8 +86,10 @@ void kvml_session_begin(void)
 	const char *l = getenv("MESH_KVM_STREAM_LOG");
 	gLog = (l != NULL && l[0] != 0 && l[0] != '0') ? 1 : 0;
 	if (kvml_env_off("MESH_KVM_ACK")) { capAck = 0; }
-	// no video code in this build: an op 1 is answered with reason 1 and the ACK window is on; the picture stays JPEG
-	kvm_stream_init(&gStream, 0, capAck, KVM_REASON_NO_VIDEO_BUILD, KVM_REASON_DISABLED);
+	// is there an encoder (and is the video not switched off)? Else an op 1 is answered with the reason, the ACK window is on and the picture stays JPEG
+	int videoReason = KVM_REASON_NO_VIDEO_BUILD;
+	int capVideo = kvml_video_session_begin(&videoReason);
+	kvm_stream_init(&gStream, capVideo, capAck, capVideo ? KVM_REASON_OK : videoReason, KVM_REASON_DISABLED);
 	kvm_inbox_init(&gInbox, kvml_now());
 	gAckHead = gAckCount = 0;
 	gInputBad = gAckDropped = 0;
@@ -91,7 +97,7 @@ void kvml_session_begin(void)
 	g_tileDeferred = 0;
 	gStatsAt = kvml_now();
 	gOn = 1;
-	if (gLog) { fprintf(stderr, "KVM stream: start cap_ack=%d\n", capAck); }
+	if (gLog) { fprintf(stderr, "KVM stream: start cap_ack=%d cap_video=%d video_reason=%d\n", capAck, capVideo, videoReason); }
 }
 
 static void kvml_stats(int final)
@@ -114,6 +120,7 @@ void kvml_session_end(void)
 {
 	if (!gOn) { return; }
 	kvml_stats(1);
+	kvml_video_session_end();
 	gOn = 0;
 }
 
@@ -122,7 +129,7 @@ void kvml_announce(void)
 	kvm_state_msg m;
 	if (!gOn) { return; }
 	kvm_stream_start_state(&gStream, &m);
-	kvml_send_state(&m);
+	kvml_state(&m);
 }
 
 void kvml_input_bad(void) { gInputBad++; }
@@ -163,7 +170,12 @@ void kvml_poll(void)
 		kvm_ctrl c = ctl[i].c;
 		unsigned actions = 0;
 		if (gLog) { fprintf(stderr, "KVM stream: ctrl op=%d flags=%d\n", (int)c.op, (int)c.flags); }
-		if (kvm_stream_on_ctrl(&gStream, &c, ctl[i].at, &reply, &actions)) { kvml_send_state(&reply); }
+		if (kvm_stream_on_ctrl(&gStream, &c, ctl[i].at, &reply, &actions)) { kvml_state(&reply); }
+#ifdef KVML_VIDEO_ENABLED
+		kvml_video_ctrl(&c, actions, ctl[i].at);
+#else
+		(void)actions;
+#endif
 	}
 	while (gAckCount > 0)
 	{
@@ -175,8 +187,9 @@ void kvml_poll(void)
 	}
 	now = kvml_now();
 	// A blocked write stops the clocks (kvml_write: kvm_stream_note_blocked); the loop itself is never "paused" for them
-	if (kvm_stream_tick(&gStream, now, 0, &reply)) { kvml_send_state(&reply); }
+	if (kvm_stream_tick(&gStream, now, 0, &reply)) { kvml_state(&reply); }
 	if (gLog && (uint32_t)(now - gStatsAt) >= KVML_STATS_MS) { gStatsAt = now; kvml_stats(0); }
+	kvml_video_poll();	// the requests that were queued above, the retry after an error, the rate control
 }
 
 void kvml_iteration_end(void)
@@ -201,6 +214,18 @@ int kvml_gate_big(void)
 	now = kvml_now();
 	ok = kvm_stream_window_allows(&gStream, KVM_GATE_BIG, now);
 	if (!ok) { (void)kvm_stream_note_link_held(&gStream, now); }	// a refused rectangle says that the link is the limit
+	return ok;
+}
+
+// The sharpening of a tile that the video painted: the smaller window of the sharpening (half of W), not the one of the big rectangles. A refusal says nothing about the link.
+int kvml_gate_sharpen(void)
+{
+	uint32_t now;
+	int ok;
+	if (!gOn) { return 1; }
+	now = kvml_now();
+	ok = kvm_stream_window_allows(&gStream, KVM_GATE_SHARPEN, now);
+	if (!ok) { kvm_stream_note_held_back(&gStream, now); }
 	return ok;
 }
 

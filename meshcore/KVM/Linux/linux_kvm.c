@@ -44,6 +44,7 @@ limitations under the License.
 #include "linux_events.h"
 #include "linux_compression.h"
 #include "linux_kvm_stream.h"
+#include "linux_video.h"
 #include "meshcore/KVM/common/kvm_stdin.h"
 #include "meshcore/KVM/common/kvm_stream.h"
 #include <poll.h>
@@ -1011,6 +1012,7 @@ int kvm_server_inputdata(char* block, int blocklen)
 					g_tileInfo[row][col].flag = 0;
 				}
 			}
+			kvml_video_refresh(); // every tile is a picture again (the video does not claim them)
 			break;
 		}
 	case MNG_KVM_PAUSE: // Pause
@@ -1606,6 +1608,7 @@ void* kvm_server_mainloop_x11(void* parm)
 			// the screen nor the start of a row may starve what comes after it (a window smaller than a row of changing tiles would send the same first tiles of that row every frame)
 			int tileCount = TILE_HEIGHT_COUNT * TILE_WIDTH_COUNT;
 			int scanStart = kvml_scan_start(tileCount);
+			kvml_video_frame_begin(); // the clock of the frame, the tiles that wait to be sharpened
 			for (r = 0; r < tileCount; r++) {
 				int tileIndex = (scanStart + r) % tileCount;
 				y = tileIndex / TILE_WIDTH_COUNT;
@@ -1637,6 +1640,7 @@ void* kvm_server_mainloop_x11(void* parm)
 					if (written == -1) { /*ILIBMESSAGE("KVMBREAK-K2\r\n");*/ g_shutdown = 1; height = SCREEN_HEIGHT; width = SCREEN_WIDTH; break; }
 				}
 			}
+			if (!g_shutdown) { kvml_video_emit(desktop, desktopsize); } // the frame of the tiles that moved (after the JPEG rectangles of this iteration)
 		}
 		
 		kvml_iteration_end(); // rule M1: what this iteration wrote ends with a position the viewer can acknowledge

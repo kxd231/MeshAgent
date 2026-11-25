@@ -16,6 +16,7 @@ Licensed under the Apache License, Version 2.0 (same as the rest of the agent).
 #define LINUX_KVM_STREAM_H_
 
 #include <stddef.h>
+#include <stdint.h>
 
 #ifndef KVM_STREAM_DISABLE
 #define KVM_STREAM_ENABLED 1
@@ -37,8 +38,17 @@ void kvml_poll(void);
 void kvml_iteration_end(void);
 // The window of the viewer: 1 = a rectangle may be written now (always 1 while ACK is not on). A refusal is counted as "the link is the limit".
 int kvml_gate_big(void);
+// The same for the sharpening of the tiles that the video painted (the smaller window of the sharpening)
+int kvml_gate_sharpen(void);
 // One write to the pipe of the slave: counts it and writes it with kvm_slave_write_raw. kind: KVM_W_DATA / KVM_W_POSITION / KVM_W_STATE of kvm_stream.h; 0 = written, -1 = error
 int kvml_write(const void *buffer, size_t len, int kind);
+
+// What the video code (linux_video.c) needs of the glue: the clock of the process in milliseconds (wraps), the state of the stream layer (the caller does not take a lock: the slave is one
+// thread), and a 242 that goes to the viewer
+uint32_t kvml_clock(void);
+struct kvm_stream *kvml_stream(void);
+struct kvm_state_msg;
+void kvml_state(const struct kvm_state_msg *m);
 
 // The tile scan: a rectangle that the window refused leaves the scan of this frame, and the next frame starts at the tile where it stopped (neither the top of the screen nor the start of a row must starve the rest)
 void kvml_scan_deferred(int tile);		// the scan stopped at this tile (index = row * tiles per row + column)
@@ -53,6 +63,7 @@ static inline void kvml_input_bad(void) {}
 static inline void kvml_poll(void) {}
 static inline void kvml_iteration_end(void) {}
 static inline int kvml_gate_big(void) { return 1; }
+static inline int kvml_gate_sharpen(void) { return 1; }
 static inline int kvml_scan_start(int tiles) { (void)tiles; return 0; }
 static inline void kvml_scan_deferred(int tile) { (void)tile; }
 

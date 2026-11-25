@@ -24,18 +24,7 @@ limitations under the License.
 #include <arpa/inet.h>
 #include "linux_compression.h"
 
-enum TILE_FLAGS_ENUM {
-	TILE_TODO,						//The tile CRC needs to be calculated.
-	TILE_SENT,						//CRC has been calculated and the tile has been sent.
-	TILE_MARKED_NOT_SENT,   		//CRC has been calculated, but the tile was not sent.
-	TILE_DONT_SEND		  //CRC has been calculated, tile need not be sent.
-	//TILE_SKIPPED		  //CRC has been calculated, tile need not be sent, but was skipped to include a greater region
-};
-
-struct tileInfo_t {
-	int crc;
-	enum TILE_FLAGS_ENUM flag;
-};
+#include "linux_tileinfo.h"
 
 extern int reset_tile_info(int old_height_count);
 extern int adjust_screen_size(int pixles);

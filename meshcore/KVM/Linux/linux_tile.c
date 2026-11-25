@@ -16,6 +16,7 @@ limitations under the License.
 
 #include "linux_tile.h"
 #include "linux_kvm_stream.h"
+#include "linux_video.h"
 #include "meshcore/meshdefines.h"
 #include "microstack/ILibParsers.h"
 
@@ -211,7 +212,7 @@ int reset_tile_info(int old_height_count) {
 //Fetches the encoded jpeg tile at the given location. The neighboring tiles are coalesced to form a larger jpeg before returning.
 int getTileAt(int x, int y, void** buffer, long long *bufferSize, void *desktop, long long desktopsize, int row, int col)
 {
-	int CRC, rcol, i, r, c;
+	int CRC, rcol, i, r, c, startClass;
 	int rightcol = col; //Used in coalescing. Indicates the rightmost column to be coalesced.
 	int botrow = row; //Used in coalescing. Indicates the bottom most row to be coalesced.
 	int r_x = x;
@@ -223,14 +224,22 @@ int getTileAt(int x, int y, void** buffer, long long *bufferSize, void *desktop,
 	*bufferSize = 0;
 
 	if (g_tileInfo[row][col].flag == TILE_TODO) { //First check whether the tile-crc needs to be calculated or not.
-		if ((CRC = util_crc(x, y, TILE_HEIGHT * TILE_WIDTH * 3, desktop, desktopsize, TILE_WIDTH, TILE_HEIGHT)) == g_tileInfo[row][col].crc) return 0;
+		CRC = util_crc(x, y, TILE_HEIGHT * TILE_WIDTH * 3, desktop, desktopsize, TILE_WIDTH, TILE_HEIGHT);
+		kvml_video_note_crc(row, col, CRC);	// the video looks at the content of the tile: its streak of changes
+		if (CRC == g_tileInfo[row][col].crc) return 0;
 		// The tile changed. While the window of the viewer (end-to-end ACK) is full it is not sent: the CRC stays as it was, so the next frame finds the change again,
-		// and the caller stops the scan of this frame (g_tileDeferred). Always open while ACK is not on.
-		if (!kvml_gate_big()) { g_tileDeferred = 1; return 0; }
+		// and the caller stops the scan of this frame (g_tileDeferred). Always open while ACK is not on. A change that goes to the video is no JPEG and the gate of the
+		// JPEG does not apply to it (the video has its own gate, the one of its frame); a tile that is only sharpened is waited for with the smaller window of the sharpening, and the scan goes on.
+		if (kvml_video_class(row, col) == 0)
+		{
+			if (kvml_video_tile_sharpening(row, col)) { if (!kvml_gate_sharpen()) { return 0; } }
+			else if (!kvml_gate_big()) { g_tileDeferred = 1; return 0; }
+		}
 		g_tileInfo[row][col].crc = CRC; //Update the tile CRC in the global data structure.
 	}
 
 	g_tileInfo[row][col].flag = TILE_MARKED_NOT_SENT;
+	startClass = kvml_video_class(row, col); // Only tiles of the same class are coalesced into one rectangle (video or JPEG)
 
 	//COALESCING SECTION
 
@@ -243,10 +252,19 @@ int getTileAt(int x, int y, void** buffer, long long *bufferSize, void *desktop,
 
 		if (g_tileInfo[row][rightcol].flag == TILE_TODO) {
 			CRC = util_crc(r_x, y, TILE_HEIGHT * TILE_WIDTH * 3, desktop, desktopsize, TILE_WIDTH, TILE_HEIGHT);
+			kvml_video_note_crc(row, rightcol, CRC);
 		}
 
 		if (CRC != g_tileInfo[row][rightcol].crc || g_tileInfo[row][rightcol].flag == TILE_MARKED_NOT_SENT) { //If the tile has changed, increment the capturewidth.
 			g_tileInfo[row][rightcol].crc = CRC;
+
+			if (kvml_video_class(row, rightcol) != startClass)
+			{
+				// Changed, but sent another way (video or JPEG): it is sent by itself later (marked, not "don't send": the change must not get lost)
+				g_tileInfo[row][rightcol].flag = TILE_MARKED_NOT_SENT;
+				--rightcol;
+				break;
+			}
 
 #if MAX_TILE_SIZE > 0
 			//Here we check whether the size of the coalesced bitmap is greater than the threshold (MAX_TILE_SIZE)
@@ -289,11 +307,22 @@ int getTileAt(int x, int y, void** buffer, long long *bufferSize, void *desktop,
 			CRC = g_tileInfo[botrow][rcol].crc;
 			if (g_tileInfo[botrow][rcol].flag == TILE_TODO) {
 				CRC = util_crc(r_x, r_y, TILE_HEIGHT * TILE_WIDTH * 3, desktop, desktopsize, TILE_WIDTH, TILE_HEIGHT);
+				kvml_video_note_crc(botrow, rcol, CRC);
 			}
 
 			if (CRC != g_tileInfo[botrow][rcol].crc || g_tileInfo[botrow][rcol].flag == TILE_MARKED_NOT_SENT) {
 				g_tileInfo[botrow][rcol].flag = TILE_MARKED_NOT_SENT;
 				g_tileInfo[botrow][rcol].crc = CRC;
+				if (kvml_video_class(botrow, rcol) != startClass)
+				{
+					// Changed, but sent another way: this row does not join the rectangle; the tile stays marked and is sent by itself later
+					fail = 1;
+					for (i = col; i < rcol; i++) {
+						g_tileInfo[botrow][i].flag = TILE_MARKED_NOT_SENT;
+					}
+					botrow--;
+					break;
+				}
 				r_x += TILE_WIDTH;
 			}
 			else {
@@ -335,6 +364,16 @@ int getTileAt(int x, int y, void** buffer, long long *bufferSize, void *desktop,
 		else {
 			break;
 		}
+	}
+
+	// while the H.264 video runs, a rectangle of the motion class is not sent as JPEG: its tiles wait in the video for the next frame (kvml_video_emit), which paints the sum of them.
+	// The tiles keep their new CRC (what the viewer will have once the frame is consumed); a tile that changes again meanwhile is looked at again as any other.
+	if (kvml_video_claim_rect(row, col, botrow, rightcol, startClass))
+	{
+		for (r = row; r <= botrow; r++) {
+			for (c = col; c <= rightcol; c++) { g_tileInfo[r][c].flag = TILE_SENT; }
+		}
+		return 0;
 	}
 
 	int retval = 0;
@@ -407,6 +446,7 @@ int getTileAt(int x, int y, void** buffer, long long *bufferSize, void *desktop,
 				g_tileInfo[r][c].flag = TILE_SENT;
 			}
 		}
+		kvml_video_jpeg_sent(row, col, botrow, rightcol, *bufferSize);	// these tiles are JPEG now (not pending for the video, not VIDEO tiles); the bytes of a sharpening are counted
 	}
 
 	return retval;
