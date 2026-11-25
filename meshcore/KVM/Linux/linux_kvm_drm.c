@@ -21,6 +21,7 @@ limitations under the License.
 #include "linux_kvm_wayland.h"
 #include "linux_compression.h"
 #include "linux_tile.h"
+#include "linux_kvm_stream.h"
 #include "meshcore/meshdefines.h"
 #include "microstack/ILibParsers.h"
 
@@ -482,8 +483,11 @@ static int kvm_drm_send_dirty_tiles(const unsigned char *rgbBuffer, size_t rgbSi
 		}
 	}
 
-	for (y = 0; y < TILE_HEIGHT_COUNT; ++y)
+	// The scan starts where the last one stopped when the window of the viewer was full (kvml_scan_start): the top of the screen must not starve the rest
+	int scanStart = kvml_scan_start(TILE_HEIGHT_COUNT);
+	for (r = 0; r < TILE_HEIGHT_COUNT; ++r)
 	{
+		y = (scanStart + r) % TILE_HEIGHT_COUNT;
 		for (x = 0; x < TILE_WIDTH_COUNT; ++x)
 		{
 			void *tilePacket = NULL;
@@ -498,9 +502,16 @@ static int kvm_drm_send_dirty_tiles(const unsigned char *rgbBuffer, size_t rgbSi
 			}
 
 			getTileAt(width, height, &tilePacket, &tilePacketSize, *desktopBuffer, *desktopBufferSize, y, x);
+			if (g_tileDeferred)
+			{
+				// the window of the viewer is full: this and the tiles after it are looked at again in the next frame (their CRCs were not changed)
+				g_tileDeferred = 0;
+				kvml_scan_deferred(y);
+				return 0;
+			}
 			if (tilePacket != NULL && tilePacketSize > 0)
 			{
-				if (kvm_drm_write_all(slave2master[1], (char *)tilePacket, (size_t)tilePacketSize) != 0)
+				if (kvm_slave_send(tilePacket, (size_t)tilePacketSize) != 0)
 				{
 					free(tilePacket);
 					return -1;
@@ -3076,6 +3087,7 @@ void *kvm_server_mainloop_drm(void *parm)
 	// Non-blocking for the slave's lifetime: kvm_drm_write_all() relies on it to multiplex tile
 	// writes against master2slave input drains, and every sender routes through there in DRM mode.
 	fcntl(slave2master[1], F_SETFL, fcntl(slave2master[1], F_GETFL, 0) | O_NONBLOCK);
+	kvml_session_begin(); // from here on every write of this process is counted by the ACK window
 	g_enableEvents = kvm_events_evdev_init();
 	if (!g_enableEvents)
 	{
@@ -3089,7 +3101,7 @@ void *kvm_server_mainloop_drm(void *parm)
 		((unsigned short*)ksbuf)[0] = (unsigned short)htons((unsigned short)MNG_KVM_KEYSTATE);
 		((unsigned short*)ksbuf)[1] = (unsigned short)htons((unsigned short)5);
 		ksbuf[4] = (char)kvm_events_evdev_lock_state();
-		ignore_result(kvm_drm_slave_write(ksbuf, sizeof(ksbuf)));
+		ignore_result(kvm_slave_send(ksbuf, sizeof(ksbuf)));
 	}
 	CURRENT_DISPLAY_ID = 0;
 	SCREEN_NUM = 0;
@@ -3217,6 +3229,7 @@ void *kvm_server_mainloop_drm(void *parm)
 	}
 	kvm_drm_publish_monitor_layout(outputs, outputCount, &layout);
 	kvm_drm_update_tile_geometry();
+	kvml_announce(); // 242 reason 11: a new process (also a new child after a session change): the viewer has to repeat its request
 
 	while (!g_shutdown)
 	{
@@ -3257,6 +3270,8 @@ void *kvm_server_mainloop_drm(void *parm)
 		// Also covers input drained into the buffer while a frame write was stalled: those bytes
 		// don't wake select() again, so parse whenever anything is pending.
 		kvm_drm_process_pending_input();
+		kvml_poll(); // 240 / 241 that were read, the timers of the window; the answers go out before the picture
+		kvml_iteration_end(); // bytes of the input handlers (REFRESH...) and the probe marker, also in the turns that make no picture
 
 		if (change_display)
 		{
@@ -3583,6 +3598,7 @@ void *kvm_server_mainloop_drm(void *parm)
 		{
 			g_shutdown = 1;
 		}
+		kvml_iteration_end(); // rule M1: what this iteration wrote ends with a position the viewer can acknowledge
 	}
 
 	if (desktopBuffer != NULL)

@@ -43,6 +43,10 @@ limitations under the License.
 
 #include "linux_events.h"
 #include "linux_compression.h"
+#include "linux_kvm_stream.h"
+#include "meshcore/KVM/common/kvm_stdin.h"
+#include "meshcore/KVM/common/kvm_stream.h"
+#include <poll.h>
 
 #define EXIT_SUCCESS 0
 #define EXIT_FAILURE 1
@@ -155,16 +159,42 @@ extern int gRemoteMouseRenderDefault;
 // sender must go through the draining writer in linux_kvm_drm.c: a raw write() could truncate a
 // message on a full pipe (desyncing the stream) or, blocking, re-arm the master<->slave pipe
 // deadlock that the draining writer exists to prevent.
-static void kvm_slave_send(const void *buffer, size_t len)
+// kvm_slave_write_raw is that choice without the counting of the ACK window; every sender calls kvm_slave_send, which counts.
+int kvm_slave_write_raw(const void *buffer, size_t len)
 {
+	const char *p = (const char *)buffer;
 	if (g_kvmBackendDRM != 0)
 	{
-		ignore_result(kvm_drm_slave_write(buffer, len));
+		return kvm_drm_slave_write(buffer, len);
 	}
-	else
+	while (len > 0)
 	{
-		ignore_result(write(slave2master[1], buffer, len));
+		ssize_t n = write(slave2master[1], p, len);
+		if (n < 0)
+		{
+			if (errno == EINTR) { continue; }
+			return -1;
+		}
+		p += n;
+		len -= (size_t)n;
 	}
+	return 0;
+}
+
+static uint32_t kvm_slave_now_ms(void)
+{
+	struct timespec ts;
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) { return 0; }
+	return (uint32_t)(((uint64_t)ts.tv_sec * 1000ULL) + ((uint64_t)ts.tv_nsec / 1000000ULL));
+}
+
+int kvm_slave_send(const void *buffer, size_t len)
+{
+#ifdef KVM_STREAM_ENABLED
+	return kvml_write(buffer, len, KVM_W_DATA);
+#else
+	return kvm_slave_write_raw(buffer, len);
+#endif
 }
 
 int remoteMouseX = 0, remoteMouseY = 0;
@@ -829,7 +859,7 @@ int kvm_init(int displayNo)
 		((unsigned short*)buffer)[1] = (unsigned short)htons((unsigned short)5);					// Write the size
 		buffer[4] = (((ptr.mods & 16) == 16) | (((ptr.mods & 32) == 32) << 1) | (((ptr.mods & 2) == 2) << 2));
 
-		ignore_result(write(slave2master[1], buffer, sizeof(buffer)));
+		ignore_result(kvm_slave_send(buffer, sizeof(buffer)));
 		if (logFile) { fprintf(logFile, "Keyboard Initial State: NUM[%d], SCROLL[%d], CAPS[%d]\n", (ptr.mods & 16) == 16, (ptr.mods & 32) == 32, (ptr.mods & 2) == 2); fflush(logFile); }
 	}
 
@@ -891,16 +921,30 @@ void CheckDesktopSwitch(int checkres)
 	}
 }
 
+static kvm_stdin_parser gStdinParser;	// the stdin of this process: the bytes of an oversized frame that are still to be thrown away
+
 int kvm_server_inputdata(char* block, int blocklen)
 {
 	unsigned short type, size;
+
+	// the rest of the body of an oversized frame is thrown away first, whatever the size of this read is (also less than 4 bytes)
+	if (blocklen > 0 && gStdinParser.discard > 0) { return (int)kvm_stdin_next(&gStdinParser, (const uint8_t*)block, (size_t)blocklen, NULL); }
 	CheckDesktopSwitch(0);
 
 	// Decode the block header
 	if (blocklen < 4) return 0;
 	type = ntohs(ILibUnaligned_Read16(block));
 	size = ntohs(ILibUnaligned_Read16(block + 2));
-	if (size > blocklen) return 0;
+
+	// One rule for every command (kvm_stdin.h): a command that is not complete yet waits; a size field below 4 is not a command (its 4 header bytes are consumed, nothing is
+	// dispatched: size 0 used to stop the parser for good, size 1-3 moved it into the middle of a header); a size above the input buffer can never be completed, so its
+	// header and then the whole declared length are thrown away, never read as commands.
+	{
+		int kind = 0;
+		size_t used = kvm_stdin_next(&gStdinParser, (const uint8_t*)block, (size_t)blocklen, &kind);
+		if (used == 0) return 0;
+		if (kind != KVM_STDIN_KIND_CMD) { kvml_input_bad(); return (int)used; }
+	}
 
 	switch (type)
 	{
@@ -986,6 +1030,12 @@ int kvm_server_inputdata(char* block, int blocklen)
 			kvm_send_display_list();
 			break;
 		}
+#ifdef KVM_STREAM_ENABLED
+	case MNG_KVM_VIDEO_CTRL: // 240 and 241 are exactly 16 bytes; they are queued and handled by the main loop (kvml_poll)
+	case MNG_KVM_STREAM_ACK:
+		if (size == KVM_CTRL_SIZE) { kvml_input(block, type); } else { kvml_input_bad(); }
+		break;
+#endif
 	case MNG_KVM_SET_DISPLAY:
 		{
 			unsigned short newval = ntohs(ILibUnaligned_Read16(block + 4));
@@ -1012,9 +1062,20 @@ int kvm_server_inputdata(char* block, int blocklen)
 }
 
 
+#ifdef KVM_STREAM_ENABLED
+// Parent process: the child can be restarted (a session change, the auto recovery), and a new child knows nothing of the veto that meshcore or the multiplexer set (op 5, op 6
+// of command 240) nor of the quality, scale and frame rate that the viewer chose. The parent keeps the mask of sources (kvm_veto_track follows the byte stream by the size
+// fields, across writes) while it passes the commands on, and gives it to every new child (kvm_relay_restart) before any other input.
+static kvm_veto_tracker gRelayVeto;
+#endif
+
 int kvm_relay_feeddata(char* buf, int len)
 {
 	ssize_t written = 0;
+#ifdef KVM_STREAM_ENABLED
+	// also while there is no child (it is being restarted): a veto that meshcore writes in that moment is given to the new child
+	kvm_veto_track(&gRelayVeto, (const uint8_t *)buf, (size_t)len);
+#endif
 	if (g_slavekvm <= 0 || master2slave[1] < 0) { return 0; }
 
 	// Write the reply to the pipe.
@@ -1184,10 +1245,35 @@ void kvm_server_sighandler(int signum, siginfo_t *info, void *context)
 	g_shutdown = 1;
 }
 
+// The input of the X11 slave: what the master sent and was not handled yet (a command can arrive in pieces)
+static char gX11In[KVM_STDIN_BUF];
+static size_t gX11InLen = 0;
+
+// Reads what the master sent (waiting up to timeoutMs for it) and handles every complete command. Returns -1 when the master is gone (the session ends).
+static int kvm_x11_pump_input(int timeoutMs)
+{
+	struct pollfd pfd;
+	ssize_t rd;
+	size_t ptr = 0;
+	int used;
+
+	pfd.fd = master2slave[0];
+	pfd.events = POLLIN;
+	pfd.revents = 0;
+	if (poll(&pfd, 1, timeoutMs) <= 0) { return 0; }	// nothing came (or a signal: the loop looks at g_shutdown)
+	if ((pfd.revents & (POLLIN | POLLHUP | POLLERR)) == 0) { return 0; }
+	rd = read(master2slave[0], gX11In + gX11InLen, sizeof(gX11In) - gX11InLen);
+	if (rd < 0 && (errno == EINTR || errno == EAGAIN)) { return 0; }
+	if (rd <= 0) { return -1; }
+	gX11InLen += (size_t)rd;
+	while ((used = kvm_server_inputdata(gX11In + ptr, (int)(gX11InLen - ptr))) != 0) { ptr += (size_t)used; }
+	gX11InLen = kvm_stdin_compact((uint8_t*)gX11In, gX11InLen, ptr);	// the start of a command that is not complete moves to the front of the buffer
+	return 0;
+}
+
 void* kvm_server_mainloop_x11(void* parm)
 {
 	int sessionUid = (int)(intptr_t)parm;
-	int maxsleep;
 	Window rr, cr;
 	int rx, ry, wx, wy, rs;
 	unsigned int mr;
@@ -1235,6 +1321,9 @@ void* kvm_server_mainloop_x11(void* parm)
 		}
 	}
 
+	kvml_session_begin(); // from here on every write of this process is counted by the ACK window
+	kvml_announce(); // 242 reason 11, before the first screen size: a new process (also a new child after a session change): the viewer has to repeat its request
+
 	if (logFile) { fprintf(logFile, "Checking $DISPLAY\n"); fflush(logFile); }
 	for (char **env = environ; *env; ++env)
 	{
@@ -1269,11 +1358,7 @@ void* kvm_server_mainloop_x11(void* parm)
 	//pthread_create(&kvmthread, NULL, kvm_mainloopinput, parm);
 	//fprintf(logFile, "Created the kvmthread.\n"); fflush(logFile);
 
-	int ptr = 0;
-	int ptr2 = 0;
-	int len = 0;
-	char pchRequest2[30000];
-	ssize_t cbBytesRead = 0;
+	gX11InLen = 0;
 
 	while (!g_shutdown) 
 	{
@@ -1318,28 +1403,12 @@ void* kvm_server_mainloop_x11(void* parm)
 		}
 
 
-		FD_ZERO(&readset);
-		FD_ZERO(&errorset);
-		FD_ZERO(&writeset);
-		tv.tv_sec = 0;
-		tv.tv_usec = 0;
-		FD_SET(master2slave[0], &readset);
-		if (select(FD_SETSIZE, &readset, &writeset, &errorset, &tv) > 0 && FD_ISSET(master2slave[0], &readset))
+		if (kvm_x11_pump_input(0) < 0 || g_shutdown)
 		{
-
-			//fprintf(logFile, "Reading from master in kvm_mainloopinput\n");
-			cbBytesRead = read(master2slave[0], pchRequest2 + len, 30000 - len);
-			//fprintf(logFile, "Read %d bytes from master in kvm_mainloopinput\n", cbBytesRead);
-			if (cbBytesRead == -1 || cbBytesRead == 0 || g_shutdown)
-			{
-				g_shutdown = 1;
-				break;
-			}
-			len += cbBytesRead;
-			ptr2 = 0;
-			while ((ptr2 = kvm_server_inputdata((char*)pchRequest2 + ptr, cbBytesRead - ptr)) != 0) { ptr += ptr2; }
-			if (ptr == len) { len = 0; ptr = 0; }
+			g_shutdown = 1;
+			break;
 		}
+		kvml_poll(); // 240 / 241 that were read, the timers of the window; the answers go out before the picture
 
 		if (cursordisplay == NULL)
 		{
@@ -1430,8 +1499,7 @@ void* kvm_server_mainloop_x11(void* parm)
 							((unsigned short*)buffer)[0] = (unsigned short)htons((unsigned short)MNG_KVM_MOUSE_CURSOR);	// Write the type
 							((unsigned short*)buffer)[1] = (unsigned short)htons((unsigned short)5);					// Write the size
 							buffer[4] = (char)curcursor;																// Cursor Type
-							written = write(slave2master[1], buffer, 5);
-							fsync(slave2master[1]);
+							written = kvm_slave_send(buffer, 5);
 						}
 					}
 					if (kbevent_base != 0 && XE.type == kbevent_base)
@@ -1445,7 +1513,7 @@ void* kvm_server_mainloop_x11(void* parm)
 							((unsigned short*)buffer)[1] = (unsigned short)htons((unsigned short)5);					// Write the size
 							buffer[4] = (((e->mods & 16) == 16) | (((e->mods & 32) == 32) << 1) | (((e->mods & 2) == 2) << 2));
 
-							ignore_result(write(slave2master[1], buffer, sizeof(buffer)));
+							ignore_result(kvm_slave_send(buffer, sizeof(buffer)));
 						}
 					}
 				}
@@ -1514,8 +1582,7 @@ void* kvm_server_mainloop_x11(void* parm)
 						((unsigned short*)tmpbuffer)[0] = (unsigned short)htons((unsigned short)MNG_KVM_MOUSE_CURSOR);	// Write the type
 						((unsigned short*)tmpbuffer)[1] = (unsigned short)htons((unsigned short)5);						// Write the size
 						tmpbuffer[4] = (char)KVM_MouseCursor_NONE;														// Cursor Type
-						written = write(slave2master[1], tmpbuffer, 5);
-						fsync(slave2master[1]);
+						written = kvm_slave_send(tmpbuffer, 5);
 					}
 					x11_exports->XFree(cimage);
 				}
@@ -1528,20 +1595,22 @@ void* kvm_server_mainloop_x11(void* parm)
 						((unsigned short*)tmpbuffer)[0] = (unsigned short)htons((unsigned short)MNG_KVM_MOUSE_CURSOR);	// Write the type
 						((unsigned short*)tmpbuffer)[1] = (unsigned short)htons((unsigned short)5);						// Write the size
 						tmpbuffer[4] = (char)curcursor;																	// Cursor Type
-						written = write(slave2master[1], tmpbuffer, 5);
-						fsync(slave2master[1]);
+						written = kvm_slave_send(tmpbuffer, 5);
 					}
 					sentHideCursor = 0;
 				}
 			}
 			getScreenBuffer((char **)&desktop, &desktopsize, image);
 
-			for (y = 0; y < TILE_HEIGHT_COUNT; y++) {
+			// The scan starts where the last one stopped when the window of the viewer was full (kvml_scan_start): the top of the screen must not starve the rest
+			int scanStart = kvml_scan_start(TILE_HEIGHT_COUNT);
+			for (r = 0; r < TILE_HEIGHT_COUNT; r++) {
+				y = (scanStart + r) % TILE_HEIGHT_COUNT;
 				for (x = 0; x < TILE_WIDTH_COUNT; x++) {
 					height = TILE_HEIGHT * y;
 					width = TILE_WIDTH * x;
 
-					if (g_shutdown) { x = TILE_WIDTH_COUNT; y = TILE_HEIGHT_COUNT; break; }
+					if (g_shutdown) { r = TILE_HEIGHT_COUNT; break; }
 
 					if (g_tileInfo[y][x].flag == TILE_SENT || g_tileInfo[y][x].flag == TILE_DONT_SEND) {
 						continue;
@@ -1549,20 +1618,28 @@ void* kvm_server_mainloop_x11(void* parm)
 
 					getTileAt(width, height, &buf, &tilesize, desktop, desktopsize, y, x);
 
+					if (g_tileDeferred)
+					{
+						// the window of the viewer is full: this and the tiles after it are looked at again in the next frame (their CRCs were not changed)
+						g_tileDeferred = 0;
+						kvml_scan_deferred(y);
+						r = TILE_HEIGHT_COUNT;
+						break;
+					}
+
 					if (buf && !g_shutdown)
 					{
 						// Write the reply to the pipe.
-						//fprintf(logFile, "Writing to master in kvm_server_mainloop\n");
-						written = write(slave2master[1], buf, tilesize);
-						fsync(slave2master[1]);
-						//fprintf(logFile, "Wrote %d bytes to master in kvm_server_mainloop\n", written);
+						written = kvm_slave_send(buf, (size_t)tilesize);
 						free(buf);
-						if (written == -1) { /*ILIBMESSAGE("KVMBREAK-K2\r\n");*/ g_shutdown = 1; height = SCREEN_HEIGHT; width = SCREEN_WIDTH; break; }
+						if (written == -1) { /*ILIBMESSAGE("KVMBREAK-K2\r\n");*/ g_shutdown = 1; height = SCREEN_HEIGHT; width = SCREEN_WIDTH; r = TILE_HEIGHT_COUNT; break; }
 					}
 				}
 			}
 		}
 		
+		kvml_iteration_end(); // rule M1: what this iteration wrote ends with a position the viewer can acknowledge
+
 		x11ext_exports->XShmDetach(imagedisplay, &shminfo);
 		XDestroyImage(image); image = NULL;
 		shmdt(shminfo.shmaddr);
@@ -1574,22 +1651,16 @@ void* kvm_server_mainloop_x11(void* parm)
 			imagedisplay = NULL;
 		}
 
-		// We can't go full speed here, we need to slow this down.
-		height = FRAME_RATE_TIMER;
-		while (!g_shutdown && height > 0)
+		// We can't go full speed here, we need to slow this down. The input of the viewer is read while we wait (an ACK is stamped when it arrives, not when the
+		// next frame starts), in slices of 50 ms so that g_shutdown is looked at.
 		{
-			if (height > 50)
+			uint32_t waitUntil = kvm_slave_now_ms() + (uint32_t)(FRAME_RATE_TIMER > 0 ? FRAME_RATE_TIMER : 0);
+			while (!g_shutdown)
 			{
-				height -= 50;
-				maxsleep = 50000;
+				int32_t left = (int32_t)(waitUntil - kvm_slave_now_ms());
+				if (left <= 0) { break; }
+				if (kvm_x11_pump_input(left > 50 ? 50 : (int)left) < 0) { g_shutdown = 1; }
 			}
-			else 
-			{
-				maxsleep = height * 1000;
-				height = 0;
-			}
-
-			usleep(maxsleep);
 		}
 	}
 
@@ -1896,6 +1967,24 @@ void* kvm_relay_restart(int paused, void *processPipeMgr, ILibKVM_WriteHandler w
 		close(master2slave[0]);
 		slave2master[0] = slave2master[1] = master2slave[0] = -1;
 		if (SLAVELOG != 0) { logFile = fopen("/tmp/master", "w"); }
+#ifdef KVM_STREAM_ENABLED
+		{
+			// The new child starts without the veto of meshcore / the multiplexer (two viewers must stay on JPEG) and with the default quality, scale and frame rate (the viewer
+			// does not repeat them): op 5 with the remembered sources, then the last commands 5 and 13, go in before any other input.
+			unsigned char rb[3 * KVM_CTRL_SIZE];
+			size_t rl = 0;
+			if (gRelayVeto.mask != 0)
+			{
+				kvm_ctrl c;
+				memset(&c, 0, sizeof(c));
+				c.ver = 1; c.op = KVM_OP_VETO; c.flags = (uint8_t)(gRelayVeto.mask & KVM_VETO_ALL);
+				kvm_stream_build_ctrl(rb, &c);
+				rl = KVM_CTRL_SIZE;
+			}
+			rl += kvm_veto_replay(&gRelayVeto, rb + rl, sizeof(rb) - rl);
+			if (rl > 0) { ignore_result(write(master2slave[1], rb, rl)); }
+		}
+#endif
 		char tmp[255];
 		sprintf_s(tmp, sizeof(tmp), "Child KVM (pid=%d)", g_slavekvm);
 
@@ -1913,6 +2002,9 @@ void* kvm_relay_setup(void *processPipeMgr, ILibKVM_WriteHandler writeHandler, v
 {
 	if (kvmthread != (pthread_t)NULL || g_slavekvm != 0) return 0;
 	g_restartcount = 0;
+#ifdef KVM_STREAM_ENABLED
+	memset(&gRelayVeto, 0, sizeof(gRelayVeto)); // a new session: no veto yet (meshcore sets it when a second viewer joins)
+#endif
 	return kvm_relay_restart(1, processPipeMgr, writeHandler, reserved, uid, authToken, dispid);
 }
 
@@ -1929,6 +2021,9 @@ void kvm_relay_reset()
 void kvm_cleanup()
 {
 	g_shutdown = 1;
+#ifdef KVM_STREAM_ENABLED
+	memset(&gRelayVeto, 0, sizeof(gRelayVeto));
+#endif
 	kvm_relay_stop_child(SIGTERM);
 	g_totalRestartCount = 0;
 }

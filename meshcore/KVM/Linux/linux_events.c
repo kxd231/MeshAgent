@@ -16,6 +16,7 @@ limitations under the License.
 
 #include "linux_events.h"
 #include "linux_kvm_drm.h"
+#include "linux_kvm_stream.h"
 #include "microstack/ILibParsers.h"
 #include "meshcore/meshdefines.h"
 
@@ -223,7 +224,7 @@ void KeyAction(unsigned char vk, int up, Display *display)
 			((unsigned short*)ksbuf)[0] = (unsigned short)htons((unsigned short)MNG_KVM_KEYSTATE);
 			((unsigned short*)ksbuf)[1] = (unsigned short)htons((unsigned short)5);
 			ksbuf[4] = (char)kvm_events_evdev_wait_lock_state(100);
-			ignore_result(kvm_drm_slave_write(ksbuf, sizeof(ksbuf)));
+			ignore_result(kvm_slave_send(ksbuf, sizeof(ksbuf)));
 		}
 		return;
 	}
@@ -251,7 +252,7 @@ void KeyAction(unsigned char vk, int up, Display *display)
 		((unsigned short*)buffer)[0] = (unsigned short)htons((unsigned short)MNG_KVM_KEYSTATE);		// Write the type
 		((unsigned short*)buffer)[1] = (unsigned short)htons((unsigned short)5);					// Write the size
 		buffer[4] = (((ptr.mods & 16) == 16) | (((ptr.mods & 32) == 32) << 1) | (((ptr.mods & 2) == 2) << 2));
-		ignore_result(write(slave2master[1], buffer, sizeof(buffer)));
+		ignore_result(kvm_slave_send(buffer, sizeof(buffer)));
 	}
 
 	if (change_display)

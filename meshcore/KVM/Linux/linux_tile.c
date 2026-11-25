@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 #include "linux_tile.h"
+#include "linux_kvm_stream.h"
 #include "meshcore/meshdefines.h"
 #include "microstack/ILibParsers.h"
 
@@ -223,6 +224,9 @@ int getTileAt(int x, int y, void** buffer, long long *bufferSize, void *desktop,
 
 	if (g_tileInfo[row][col].flag == TILE_TODO) { //First check whether the tile-crc needs to be calculated or not.
 		if ((CRC = util_crc(x, y, TILE_HEIGHT * TILE_WIDTH * 3, desktop, desktopsize, TILE_WIDTH, TILE_HEIGHT)) == g_tileInfo[row][col].crc) return 0;
+		// The tile changed. While the window of the viewer (end-to-end ACK) is full it is not sent: the CRC stays as it was, so the next frame finds the change again,
+		// and the caller stops the scan of this frame (g_tileDeferred). Always open while ACK is not on.
+		if (!kvml_gate_big()) { g_tileDeferred = 1; return 0; }
 		g_tileInfo[row][col].crc = CRC; //Update the tile CRC in the global data structure.
 	}
 

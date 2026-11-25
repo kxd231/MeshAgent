@@ -67,6 +67,7 @@ int gRemoteMouseRenderDefault = 0;
 			#ifndef __APPLE__
 				#include "KVM/Linux/linux_kvm.h"
 				#include "KVM/Linux/linux_kvm_wayland.h"
+				#include "KVM/Linux/linux_kvm_stream.h" // KVM_STREAM_ENABLED: the capture process of the Linux agent speaks the commands 240-243 (the ACK window)
 			#else
 				#include "KVM/MacOS/mac_kvm.h"
 			#endif
@@ -1348,9 +1349,9 @@ duk_ret_t ILibDuktape_MeshAgent_getRemoteDesktop(duk_context *ctx)
 
 	duk_push_object(ctx);															// [MeshAgent][RemoteDesktop]
 	ILibDuktape_WriteID(ctx, "MeshAgent.kvmSession");
-#if defined(_LINKVM) && defined(WIN32) && defined(KVM_STREAM_ENABLED)
+#if defined(_LINKVM) && defined(KVM_STREAM_ENABLED)
 	// This agent understands the commands 240-243 (end-to-end ACK, H.264 video): agents/meshcore.js only adds its input path, the veto and the key frames of recordings for an
-	// agent that says so. Builds without the stream layer (x86, ARM64, /DKVM_STREAM_DISABLE, other systems) leave the property out and keep the old path (pipe(kvm)).
+	// agent that says so. Builds without the stream layer (Windows x86 / ARM64, /DKVM_STREAM_DISABLE, macOS) leave the property out and keep the old path (pipe(kvm)).
 	duk_push_int(ctx, 1); duk_put_prop_string(ctx, -2, "kvmVideoProtocol");
 #endif
 	duk_dup(ctx, -1);																// [MeshAgent][RemoteDesktop][RemoteDesktop]
