@@ -1,10 +1,11 @@
-name: KVM perf build (Windows x64)
+name: KVM perf build (Windows x64 and Linux x64)
 
-# Builds MeshService64.exe with TurboJPEG from a tag and puts it into a DRAFT release of that tag. The owner checks the
-# hashes in the run summary, writes the notes and publishes the draft; published releases are immutable, so the files
-# cannot be replaced afterwards (docs/releases.md). Version tags (1.2.0, v1.2.0) belong to release.yml and do not start
-# this workflow. Started by hand without a tag, it is a test build: the files stay a workflow artifact, optionally built
-# with extra compiler options, and nothing is attached to a release.
+# Builds MeshService64.exe with TurboJPEG (Windows x64) and meshagent_x86-64 (Linux x64, ARCHID 6, in an AlmaLinux 8
+# container so that it needs glibc 2.28 at most) from a tag and puts them into a DRAFT release of that tag. The owner
+# checks the hashes in the run summary, writes the notes and publishes the draft; published releases are immutable, so the
+# files cannot be replaced afterwards (docs/releases.md). Version tags (1.2.0, v1.2.0) belong to release.yml and do not
+# start this workflow. Started by hand without a tag, it is a test build: the files stay workflow artifacts, the Windows
+# build optionally with extra compiler options, and nothing is attached to a release.
 on:
   push:
     tags:
@@ -18,7 +19,7 @@ on:
         required: false
         default: ''
       extra_cl:
-        description: 'Test builds only: extra compiler options for the x64 agent build (CL environment variable), e.g. /DKVM_DXGI_DISABLE for a GDI-only A/B binary'
+        description: 'Test builds only: extra compiler options for the Windows x64 agent build (CL environment variable), e.g. /DKVM_DXGI_DISABLE for a GDI-only A/B binary'
         required: false
         default: ''
 
@@ -30,19 +31,23 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  # The Linux build container: AlmaLinux 8 (glibc 2.28, gcc 8.5), pinned by the digest of the image index (almalinux:8 of
+  # 2026-11-16). The binary then needs glibc 2.28 at most and runs on RHEL 8, Debian 10+ and Ubuntu 20.04+. Change the
+  # digest only on purpose: the build is meant to give the same binary for the same commit.
+  EL8_IMAGE: almalinux@sha256:768bedc30fe0a536adb0a65d2eddb7caad364e514fbddd0ae9e026975f590342
   # Official libjpeg-turbo release asset and its published SHA-256 digest
   TURBOJPEG_URL: https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/3.2.0/libjpeg-turbo-3.2.0-vc-x64.exe
   TURBOJPEG_SHA256: 662761d8ba8dae04aec74023ebaeceb856c2b56b9b59cfd180759d26300dda42
 
 jobs:
-  build:
-    runs-on: windows-2022
+  # Checks the tag once for all the builds. An empty tag is a test build.
+  tag:
+    runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
     steps:
       - name: Release tag
         id: tag
-        shell: bash
         env:
           TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
           EXTRA_CL: ${{ inputs.extra_cl }}
@@ -53,10 +58,14 @@ jobs:
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
+  build:
+    needs: tag
+    runs-on: windows-2022
+    steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ steps.tag.outputs.tag && format('refs/tags/{0}', steps.tag.outputs.tag) || github.ref }}
+          ref: ${{ needs.tag.outputs.tag && format('refs/tags/{0}', needs.tag.outputs.tag) || github.ref }}
           persist-credentials: false
 
       - name: Install libjpeg-turbo (verified)
@@ -98,7 +107,7 @@ jobs:
         shell: pwsh
         env:
           EXTRA_CL: ${{ inputs.extra_cl }}
-          TAG: ${{ steps.tag.outputs.tag }}
+          TAG: ${{ needs.tag.outputs.tag }}
         run: |
           $commit = git rev-parse HEAD
           $f = Get-ChildItem -Recurse -Filter MeshService64.exe | Sort-Object LastWriteTime -Descending | Select-Object -First 1
@@ -119,10 +128,118 @@ jobs:
           name: MeshService64
           path: out/
 
-  # The only job with write access: it never runs the build, it only puts the built files into a draft release.
+  # Linux x64 agent (ARCHID 6). The build runs in an AlmaLinux 8 container, so the binary needs glibc 2.28 at most. The
+  # steps are plain shell and docker; the packages are the ones named in the header of the makefile (openh264 is not one of
+  # them: the agent loads it with dlopen).
+  build-linux:
+    needs: tag
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.tag.outputs.tag && format('refs/tags/{0}', needs.tag.outputs.tag) || github.ref }}
+          persist-credentials: false
+
+      - name: Build and check meshagent_x86-64 (AlmaLinux 8)
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/linux-out"
+          cat > "$RUNNER_TEMP/build-linux.sh" <<'SCRIPT'
+          set -euo pipefail
+          dnf -y install --setopt=install_weak_deps=False \
+              gcc make git binutils pkgconf diffutils findutils \
+              libX11-devel libXtst-devel libXext-devel libjpeg-turbo-devel libXrandr-devel \
+              mesa-libEGL-devel mesa-libGLES-devel libdrm-devel wayland-devel
+          # The makefile writes the commit date and hash of HEAD into the agent. The tree is copied with its git directory so
+          # that the source stays untouched. SOURCE_DATE_EPOCH is the commit time: gcc then puts the same __DATE__ and
+          # __TIME__ into every build of this commit.
+          git config --global --add safe.directory '*'
+          mkdir /tmp/b
+          tar -C /src -cf - . | tar -C /tmp/b -xf -
+          cd /tmp/b
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          export SOURCE_DATE_EPOCH
+          make -j"$(nproc)" linux ARCHID=6
+          test -x meshagent_x86-64
+
+          # The binary must run on glibc 2.28 and link nothing beyond the base libraries
+          gccver=$(gcc -dumpfullversion)
+          case $gccver in 8.*) ;; *) echo "gcc $gccver: expected the gcc 8 of AlmaLinux 8" >&2; exit 1 ;; esac
+          # An empty result (objdump failed, static binary) must not pass: the checks need a glibc symbol and libc in the list
+          max_glibc=$(objdump -T meshagent_x86-64 | grep -o 'GLIBC_[0-9][0-9.]*' | sort -uV | tail -n 1 || true)
+          if [ -z "$max_glibc" ]; then echo "The binary has no glibc symbol versions (objdump failed or the binary is static)" >&2; exit 1; fi
+          newest=$(printf '%s\n' GLIBC_2.28 "$max_glibc" | sort -V | tail -n 1)
+          if [ "$newest" != GLIBC_2.28 ]; then echo "The binary needs $max_glibc, the limit is GLIBC_2.28" >&2; exit 1; fi
+          needed=$(objdump -p meshagent_x86-64 | awk '/NEEDED/ {print $2}' | sort | tr '\n' ' ')
+          case " $needed " in *' libc.so.6 '*) ;; *) echo "libc.so.6 is not in the list of libraries ($needed)" >&2; exit 1 ;; esac
+          for lib in $needed; do
+              case $lib in
+                  libpthread.so.0|libutil.so.1|libm.so.6|libdl.so.2|librt.so.1|libc.so.6) ;;
+                  *) echo "The binary links $lib, which is not in the list of base libraries" >&2; exit 1 ;;
+              esac
+          done
+          symtab=$(readelf -S meshagent_x86-64 | grep -c ' \.symtab' || true)
+          if [ "$symtab" != 0 ]; then echo "The binary is not stripped" >&2; exit 1; fi
+
+          cp meshagent_x86-64 /out/meshagent_x86-64
+          {
+              echo "gcc=$gccver"
+              echo "max_glibc=$max_glibc"
+              echo "needed=$needed"
+              echo "packages=$(rpm -q gcc binutils glibc libjpeg-turbo-devel wayland-devel libdrm-devel | tr '\n' ' ')"
+          } > /out/build-info.txt
+          chown -R "$HOST_UID:$HOST_GID" /out
+          SCRIPT
+          docker run --rm -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            -v "$GITHUB_WORKSPACE:/src:ro" -v "$RUNNER_TEMP/linux-out:/out" -v "$RUNNER_TEMP/build-linux.sh:/build.sh:ro" \
+            "$EL8_IMAGE" bash /build.sh
+
+      - name: Size and hashes
+        shell: bash
+        env:
+          TAG: ${{ needs.tag.outputs.tag }}
+        run: |
+          mkdir -p out-linux
+          cp "$RUNNER_TEMP/linux-out/meshagent_x86-64" out-linux/
+          commit=$(git rev-parse HEAD)
+          size=$(stat -c %s out-linux/meshagent_x86-64)
+          sha384=$(sha384sum out-linux/meshagent_x86-64 | cut -d' ' -f1)
+          sha256=$(sha256sum out-linux/meshagent_x86-64 | cut -d' ' -f1)
+          info() { sed -n "s/^$1=//p" "$RUNNER_TEMP/linux-out/build-info.txt"; }
+          {
+            echo "meshagent_x86-64 size=$size"
+            echo "sha384=$sha384"
+            echo "sha256=$sha256"
+            echo "commit=$commit"
+            echo "gcc=$(info gcc)"
+            echo "max_glibc=$(info max_glibc)"
+          } | tee out-linux/meshagent_x86-64.txt
+          {
+            echo "## meshagent_x86-64 (Linux x64, ARCHID 6)"
+            echo
+            echo "- tag: $TAG"
+            echo "- commit: $commit"
+            echo "- size: $size"
+            echo "- sha384: $sha384"
+            echo "- sha256: $sha256"
+            echo "- gcc: $(info gcc), highest glibc symbol: $(info max_glibc)"
+            echo "- libraries: $(info needed)"
+            echo "- packages: $(info packages)"
+            echo "- image: $EL8_IMAGE"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: meshagent-x86-64
+          path: out-linux/
+          if-no-files-found: error
+
+  # The only job with write access: it never runs a build, it only puts the built files into a draft release.
   release:
-    needs: build
-    if: needs.build.outputs.tag != ''
+    needs: [tag, build, build-linux]
+    if: needs.tag.outputs.tag != ''
     runs-on: ubuntu-latest
     permissions:
       contents: write # create the draft release and upload the files
@@ -133,12 +250,18 @@ jobs:
           name: MeshService64
           path: out
 
+      - name: Download the Linux build
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: meshagent-x86-64
+          path: out-linux
+
       - name: Draft release with the files
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.build.outputs.tag }}
+          TAG: ${{ needs.tag.outputs.tag }}
         run: |
-          files=(out/MeshService64.exe out/MeshService64.exe.txt out/kvm-dxgi-check.exe)
+          files=(out/MeshService64.exe out/MeshService64.exe.txt out/kvm-dxgi-check.exe out-linux/meshagent_x86-64 out-linux/meshagent_x86-64.txt)
           state=$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || echo none)
           if [ "$state" = false ]; then
             echo "Release $TAG is already published; its files cannot be replaced." >&2; exit 1
@@ -148,12 +271,16 @@ jobs:
             gh release create "$TAG" "${files[@]}" --draft --verify-tag --title "$TAG" \
               --notes "Draft made by the KVM perf build. Check the hashes in the run summary, write the notes and publish." -R "$GITHUB_REPOSITORY"
           fi
-          echo "Draft release $TAG: MeshService64.exe sha384 $(sha384sum out/MeshService64.exe | cut -d' ' -f1)" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "Draft release $TAG:"
+            echo "- MeshService64.exe sha384 $(sha384sum out/MeshService64.exe | cut -d' ' -f1)"
+            echo "- meshagent_x86-64 sha384 $(sha384sum out-linux/meshagent_x86-64 | cut -d' ' -f1)"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # Build check only: the DXGI capture is x64 only, the other platforms must still compile and behave as before.
   # Nothing is uploaded. Builds the same commit as the main job.
   other-platforms:
-    needs: build
+    needs: [tag, build]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -167,7 +294,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.build.outputs.tag && format('refs/tags/{0}', needs.build.outputs.tag) || github.ref }}
+          ref: ${{ needs.tag.outputs.tag && format('refs/tags/{0}', needs.tag.outputs.tag) || github.ref }}
           persist-credentials: false
 
       - name: Build Release ${{ matrix.platform }}

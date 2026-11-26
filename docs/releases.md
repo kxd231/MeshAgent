@@ -28,28 +28,40 @@ the release job. Build jobs need only read access. Public release downloads do
 not require a personal access token. MeshCentral requires a token to download
 Actions artifacts, including PR builds.
 
-## Windows x64 KVM builds
+## KVM perf builds (Windows x64 and Linux x64)
 
 The Windows x64 agent with DXGI capture and TurboJPEG (`MeshService64.exe`, for
-example the `dxgi` release) is built by **KVM perf build (Windows x64)**, from a
-tag that is not a version tag:
+example the `dxgi` release) and the Linux x64 agent (`meshagent_x86-64`, ARCHID 6)
+are built by **KVM perf build (Windows x64 and Linux x64)**, from a tag that is
+not a version tag:
 
-1. Push the tag, for example `git tag dxgi-2 <commit>` and `git push origin dxgi-2`.
+1. Push the tag, for example `git tag h264-v4 <commit>` and `git push origin h264-v4`.
    Tags cannot be moved or deleted afterwards, so a corrected build needs a new tag.
 2. The workflow builds the tag and puts `MeshService64.exe`, `MeshService64.exe.txt`
-   (size and hashes) and `kvm-dxgi-check.exe` into a draft release of that tag.
-   The run summary shows the commit, size, SHA-384 and SHA-256.
+   (size and hashes), `kvm-dxgi-check.exe`, `meshagent_x86-64` and
+   `meshagent_x86-64.txt` (size, hashes, commit, gcc, highest glibc symbol) into a
+   draft release of that tag, once both builds have succeeded. The run summary
+   shows the commit, size, SHA-384 and SHA-256 of both agents.
 3. Check the files, write the notes and publish the draft. Published releases are
    immutable; a rerun stops with an error instead of replacing their files.
-4. To make MeshCentral use the new file, pin its size and SHA-384 in MeshCentral's
-   `agents/agent-defaults.json`.
+4. To make MeshCentral use the new files, pin their sizes and SHA-384 hashes in
+   MeshCentral's `agents/agent-defaults.json`.
+
+The Linux agent is built in an AlmaLinux 8 container (glibc 2.28, gcc 8.5), pinned
+by the digest of the image, so that it runs on RHEL 8, Debian 10+ and Ubuntu 20.04+.
+The build fails if the binary needs a glibc symbol newer than 2.28 or links a
+library other than libc, libm, libdl, libpthread, librt and libutil, or if
+it is not stripped (still has symbols). openh264 is
+not linked: the agent loads it at run time. The packages come from the AlmaLinux 8
+repositories at build time; the summary lists their versions. Changing the image
+means changing the digest in the workflow on purpose.
 
 To retry a failed run for a tag whose release is not published yet, use
-**Actions > KVM perf build (Windows x64) > Run workflow** and enter the tag. Run
-without a tag, the workflow is a test build of the selected branch: the files stay
-a workflow artifact, `extra_cl` may add compiler options, and no release is touched.
-The build jobs have read access only; the job that creates the draft does not run
-the build.
+**Actions > KVM perf build (Windows x64 and Linux x64) > Run workflow** and enter
+the tag. Run without a tag, the workflow is a test build of the selected branch:
+the files stay workflow artifacts, `extra_cl` may add compiler options to the
+Windows build, and no release is touched. The build jobs have read access only;
+the job that creates the draft does not run a build.
 
 ## Existing MeshCentral binaries
 
