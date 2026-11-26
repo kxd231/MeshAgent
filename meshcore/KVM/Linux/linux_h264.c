@@ -82,7 +82,7 @@ int kvml_h264_load(char *why, size_t cap)
 		if (gLib.create == NULL || gLib.destroy == NULL || ver == NULL) { (void)load_fail(KVML_H264_E_SYMBOL, "libopenh264 lacks WelsCreateSVCEncoder, WelsDestroySVCEncoder or WelsGetCodecVersionEx", used); goto out; }
 		memset(&gLib.ver, 0, sizeof(gLib.ver));
 		ver(&gLib.ver);
-		// The structures of the headers (2.3.1) are the prefix of those of 2.3 to 2.7 (see KVML_LAYER_NEW; 2.4 to 2.7 have the same layout: checked for 2.6.0 by running, for 2.7.0 by the
+		// The structures of the headers (2.3.1) are the prefix of those of 2.3 to 2.7 (see KVML_LAYER_NEW for the two layouts of SLayerBSInfo among them: checked for 2.6.0 by running, for 2.7.0 by the
 		// difference of the headers only). The upper limit is deliberate: a release that nobody has looked at may change a structure, and an unknown one answers with reason 2; the parameters are filled in by the library itself (GetDefaultParams, into a
 		// buffer that is larger than ours). Another major version, or an older minor one, is not trusted with them
 		if (gLib.ver.uMajor != 2 || gLib.ver.uMinor < 3 || gLib.ver.uMinor > 7)
